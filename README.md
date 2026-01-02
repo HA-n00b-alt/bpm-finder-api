@@ -4,31 +4,40 @@ A Google Cloud Run microservice that computes BPM (beats per minute) from 30-sec
 
 ## Features
 
-- 🎵 BPM computation from audio preview URLs (Apple, Spotify, Deezer)
-- 🔒 Private Cloud Run service with IAM authentication
-- 🛡️ SSRF protection with host whitelisting
-- ⚡ Fast processing with Essentia and ffmpeg
-- 📊 Returns BPM, raw BPM, confidence, and source host
+- BPM computation from audio preview URLs (Apple, Spotify, Deezer)
+- Private Cloud Run service with IAM authentication
+- SSRF protection with host whitelisting
+- Fast processing with Essentia and ffmpeg
+- Returns BPM, raw BPM, confidence, and source host
 
 ## Architecture
 
 - **Runtime**: Python 3 + FastAPI + Uvicorn
 - **Audio Processing**: Essentia (RhythmExtractor2013) + ffmpeg
 - **Container**: MTG Essentia base image (`ghcr.io/mtg/essentia`)
-- **Deployment**: Google Cloud Run (Frankfurt region: `europe-west3`)
+- **Deployment**: Google Cloud Run
 - **Authentication**: Cloud Run IAM (Identity Tokens)
 
 ## Prerequisites
 
 - Google Cloud SDK (`gcloud`) installed and authenticated
-- GCP project: `bpm-api-microservice`
-- Billing enabled on the GCP project
+- A GCP project with billing enabled
 - **Owner or Editor role** on the GCP project, OR the following IAM roles:
   - `roles/cloudbuild.builds.editor` (Cloud Build Editor)
   - `roles/artifactregistry.writer` (Artifact Registry Writer)
   - `roles/run.admin` (Cloud Run Admin)
   - `roles/iam.serviceAccountUser` (Service Account User)
   - `roles/iam.serviceAccountAdmin` (Service Account Admin) - for creating service accounts
+
+## Configuration
+
+Before deployment, configure the following variables in `deploy.sh` or set them as environment variables:
+
+- `PROJECT_ID`: Your GCP project ID (default: `bpm-api-microservice`)
+- `REGION`: Cloud Run region (default: `europe-west3`)
+- `SERVICE_NAME`: Cloud Run service name (default: `bpm-service`)
+- `ARTIFACT_REPO`: Artifact Registry repository name (default: `bpm-repo`)
+- `SERVICE_ACCOUNT`: Service account name for external callers (default: `vercel-bpm-invoker`)
 
 ## One-Time Setup
 
@@ -37,31 +46,34 @@ A Google Cloud Run microservice that computes BPM (beats per minute) from 30-sec
 If you're not a project Owner/Editor, grant yourself the required roles:
 
 ```bash
+# Set your project ID
+PROJECT_ID="your-project-id"
+
 # Get your email
 YOUR_EMAIL=$(gcloud config get-value account)
 
 # Grant Cloud Build Editor
-gcloud projects add-iam-policy-binding bpm-api-microservice \
+gcloud projects add-iam-policy-binding ${PROJECT_ID} \
     --member="user:${YOUR_EMAIL}" \
     --role="roles/cloudbuild.builds.editor"
 
 # Grant Artifact Registry Writer
-gcloud projects add-iam-policy-binding bpm-api-microservice \
+gcloud projects add-iam-policy-binding ${PROJECT_ID} \
     --member="user:${YOUR_EMAIL}" \
     --role="roles/artifactregistry.writer"
 
 # Grant Cloud Run Admin
-gcloud projects add-iam-policy-binding bpm-api-microservice \
+gcloud projects add-iam-policy-binding ${PROJECT_ID} \
     --member="user:${YOUR_EMAIL}" \
     --role="roles/run.admin"
 
 # Grant Service Account User
-gcloud projects add-iam-policy-binding bpm-api-microservice \
+gcloud projects add-iam-policy-binding ${PROJECT_ID} \
     --member="user:${YOUR_EMAIL}" \
     --role="roles/iam.serviceAccountUser"
 
 # Grant Service Account Admin (to create service accounts)
-gcloud projects add-iam-policy-binding bpm-api-microservice \
+gcloud projects add-iam-policy-binding ${PROJECT_ID} \
     --member="user:${YOUR_EMAIL}" \
     --role="roles/iam.serviceAccountAdmin"
 ```
@@ -71,57 +83,67 @@ gcloud projects add-iam-policy-binding bpm-api-microservice \
 ### 1. Enable Required APIs
 
 ```bash
+PROJECT_ID="your-project-id"
+REGION="your-region"  # e.g., europe-west3, us-central1
+
 gcloud services enable \
     run.googleapis.com \
     cloudbuild.googleapis.com \
     artifactregistry.googleapis.com \
-    --project=bpm-api-microservice
+    --project=${PROJECT_ID}
 ```
 
 ### 2. Create Artifact Registry Repository
 
 ```bash
-gcloud artifacts repositories create bpm-repo \
+PROJECT_ID="your-project-id"
+REGION="your-region"
+ARTIFACT_REPO="bpm-repo"
+
+gcloud artifacts repositories create ${ARTIFACT_REPO} \
     --repository-format=docker \
-    --location=europe-west3 \
+    --location=${REGION} \
     --description="BPM service Docker images" \
-    --project=bpm-api-microservice
+    --project=${PROJECT_ID}
 ```
 
-### 3. Create Service Account for Vercel
+### 3. Create Service Account for External Callers
 
 ```bash
+PROJECT_ID="your-project-id"
+SERVICE_ACCOUNT="bpm-invoker"  # Change to your preferred name
+
 # Create service account
-gcloud iam service-accounts create vercel-bpm-invoker \
-    --display-name="Vercel BPM Invoker" \
-    --project=bpm-api-microservice
-
-# Grant Cloud Run Invoker role (will be bound to specific service after deployment)
-# This is done automatically by deploy.sh, but you can also do it manually:
-# gcloud run services add-iam-policy-binding bpm-service \
-#     --region=europe-west3 \
-#     --member="serviceAccount:vercel-bpm-invoker@bpm-api-microservice.iam.gserviceaccount.com" \
-#     --role="roles/run.invoker" \
-#     --project=bpm-api-microservice
+gcloud iam service-accounts create ${SERVICE_ACCOUNT} \
+    --display-name="BPM Service Invoker" \
+    --project=${PROJECT_ID}
 ```
 
-### 4. Download Service Account Key (for Vercel)
+The `deploy.sh` script will automatically grant the `roles/run.invoker` permission to this service account after deployment.
+
+### 4. Download Service Account Key
 
 ```bash
+PROJECT_ID="your-project-id"
+SERVICE_ACCOUNT="bpm-invoker"
+
 # Create and download service account key
-gcloud iam service-accounts keys create vercel-bpm-invoker-key.json \
-    --iam-account=vercel-bpm-invoker@bpm-api-microservice.iam.gserviceaccount.com \
-    --project=bpm-api-microservice
+gcloud iam service-accounts keys create ${SERVICE_ACCOUNT}-key.json \
+    --iam-account=${SERVICE_ACCOUNT}@${PROJECT_ID}.iam.gserviceaccount.com \
+    --project=${PROJECT_ID}
 ```
 
-**⚠️ Security Note**: Store this JSON key securely in Vercel environment variables (see Vercel Integration section below).
+**Security Note**: Store this JSON key securely. You'll need it to authenticate external applications calling the service.
 
 ## Deployment
 
 ### Deploy to Cloud Run
 
 ```bash
-# Default region (europe-west3)
+# Set your project ID
+export PROJECT_ID="your-project-id"
+
+# Deploy with default region (europe-west3)
 ./deploy.sh
 
 # Or override region
@@ -132,7 +154,7 @@ The `deploy.sh` script will:
 1. Build the Docker image using Cloud Build
 2. Push to Artifact Registry
 3. Deploy to Cloud Run **without public access** (`--no-allow-unauthenticated`)
-4. Create/verify the `vercel-bpm-invoker` service account
+4. Create/verify the service account
 5. Grant `roles/run.invoker` permission to the service account
 
 ### Get Service URL
@@ -140,10 +162,14 @@ The `deploy.sh` script will:
 After deployment, get the service URL:
 
 ```bash
-gcloud run services describe bpm-service \
-    --region=europe-west3 \
+PROJECT_ID="your-project-id"
+REGION="your-region"
+SERVICE_NAME="bpm-service"
+
+gcloud run services describe ${SERVICE_NAME} \
+    --region=${REGION} \
     --format="value(status.url)" \
-    --project=bpm-api-microservice
+    --project=${PROJECT_ID}
 ```
 
 ## Testing
@@ -155,7 +181,7 @@ gcloud run services describe bpm-service \
 TOKEN=$(gcloud auth print-identity-token)
 
 # Replace with your actual service URL
-SERVICE_URL="https://bpm-service-xxxxx-ew.a.run.app"
+SERVICE_URL="https://your-service-url.run.app"
 
 # Test health endpoint
 curl -H "Authorization: Bearer $TOKEN" "${SERVICE_URL}/health"
@@ -173,7 +199,7 @@ Expected response:
 TOKEN=$(gcloud auth print-identity-token)
 
 # Replace with your actual service URL and a valid preview URL
-SERVICE_URL="https://bpm-service-xxxxx-ew.a.run.app"
+SERVICE_URL="https://your-service-url.run.app"
 PREVIEW_URL="https://audio-ssl.itunes.apple.com/..."
 
 curl -X POST \
@@ -193,16 +219,18 @@ Expected response:
 }
 ```
 
-### Test with Service Account (Simulating Vercel)
+### Test with Service Account
+
+To test authentication from an external application:
 
 ```bash
 # Authenticate as service account
 gcloud auth activate-service-account \
-    vercel-bpm-invoker@bpm-api-microservice.iam.gserviceaccount.com \
-    --key-file=vercel-bpm-invoker-key.json
+    your-service-account@your-project.iam.gserviceaccount.com \
+    --key-file=your-service-account-key.json
 
 # Get identity token (audience is the service URL)
-SERVICE_URL="https://bpm-service-xxxxx-ew.a.run.app"
+SERVICE_URL="https://your-service-url.run.app"
 TOKEN=$(gcloud auth print-identity-token --audience="${SERVICE_URL}")
 
 # Test endpoint
@@ -255,26 +283,28 @@ Compute BPM from audio preview URL.
 
 The service implements strict SSRF protection:
 
-- ✅ Only `https://` URLs allowed
-- ✅ Host whitelist:
+- Only `https://` URLs allowed
+- Host whitelist:
   - `.mzstatic.com` (Apple previews)
   - `.scdn.co` (Spotify previews)
   - `.deezer.com`, `.dzcdn.net` (Deezer previews)
-- ✅ Redirect validation (rejects redirects to non-allowed hosts)
-- ✅ Download limits:
+- Redirect validation (rejects redirects to non-allowed hosts)
+- Download limits:
   - Connect timeout: 5 seconds
   - Total timeout: 20 seconds
   - Max file size: 10MB
 
-## Vercel Integration
+## Using the API from External Applications
 
-To call this private Cloud Run service from Vercel, you need to:
+Since the Cloud Run service is private (requires authentication), external applications must authenticate using Google Cloud Identity Tokens. The general process is:
 
-1. **Store the service account key** in Vercel environment variables (as JSON string)
+1. **Obtain a service account key** from your GCP project
 2. **Mint an Identity Token** with the Cloud Run service URL as the audience
 3. **Send the token** in the `Authorization: Bearer` header
 
-### Node.js Example (Vercel Serverless Function)
+### Example: Vercel Serverless Function (Node.js)
+
+This example shows how to call the BPM service from a Vercel serverless function:
 
 ```javascript
 const { GoogleAuth } = require('google-auth-library');
@@ -286,7 +316,7 @@ export default async function handler(req, res) {
   );
   
   // Cloud Run service URL
-  const cloudRunUrl = process.env.BPM_SERVICE_URL; // e.g., https://bpm-service-xxx-ew.a.run.app
+  const cloudRunUrl = process.env.BPM_SERVICE_URL;
   
   // Create auth client
   const auth = new GoogleAuth({
@@ -320,18 +350,15 @@ export default async function handler(req, res) {
 }
 ```
 
-### Vercel Environment Variables
+**Vercel Environment Variables:**
+- `GCP_SERVICE_ACCOUNT_KEY`: Full JSON content of your service account key file
+- `BPM_SERVICE_URL`: Your Cloud Run service URL
 
-Set these in your Vercel project settings:
-
-- `GCP_SERVICE_ACCOUNT_KEY`: Full JSON content of `vercel-bpm-invoker-key.json`
-- `BPM_SERVICE_URL`: Your Cloud Run service URL (e.g., `https://bpm-service-xxxxx-ew.a.run.app`)
-
-### Python Example (Alternative)
+### Example: Python Application
 
 ```python
 from google.auth.transport.requests import Request
-from google.oauth2 import service_account
+from google.oauth2 import id_token
 import json
 import os
 import requests
@@ -341,22 +368,17 @@ service_account_info = json.loads(os.environ['GCP_SERVICE_ACCOUNT_KEY'])
 cloud_run_url = os.environ['BPM_SERVICE_URL']
 
 # Create credentials
+from google.oauth2 import service_account
 credentials = service_account.Credentials.from_service_account_info(
     service_account_info,
     scopes=['https://www.googleapis.com/auth/cloud-platform']
 )
 
-# Refresh to get access token (for ID token, use google-auth library)
-credentials.refresh(Request())
-
-# For ID token, use:
-from google.auth.transport.requests import Request
-from google.oauth2 import id_token
-
 # Get ID token with audience
-id_token_obj = id_token.fetch_id_token(Request(), cloud_run_url)
+request = Request()
+id_token_obj = id_token.fetch_id_token(request, cloud_run_url)
 
-# Call Cloud Run
+# Call Cloud Run service
 response = requests.post(
     f"{cloud_run_url}/bpm",
     headers={
@@ -365,7 +387,18 @@ response = requests.post(
     },
     json={"url": preview_url}
 )
+
+data = response.json()
 ```
+
+### Example: Other Platforms
+
+The same pattern applies to any platform:
+
+1. Store the service account JSON key securely (environment variables, secrets manager, etc.)
+2. Use the Google Auth library for your language to mint an Identity Token
+3. Set the audience to your Cloud Run service URL
+4. Include the token in the `Authorization: Bearer` header
 
 ## Local Development
 
@@ -414,12 +447,12 @@ curl http://localhost:8080/health
 
 ## Security Notes
 
-- ✅ Cloud Run IAM authentication (no public access)
-- ✅ SSRF protection with host whitelisting
-- ✅ Download size and timeout limits
-- ✅ Redirect validation
-- ✅ No audio persistence (temp files deleted immediately)
-- ✅ Minimal logging (URLs with tokens are not logged)
+- Cloud Run IAM authentication (no public access)
+- SSRF protection with host whitelisting
+- Download size and timeout limits
+- Redirect validation
+- No audio persistence (temp files deleted immediately)
+- Minimal logging (URLs with tokens are not logged)
 
 ## Troubleshooting
 
@@ -428,11 +461,16 @@ curl http://localhost:8080/health
 Ensure the service account has `roles/run.invoker` permission:
 
 ```bash
-gcloud run services add-iam-policy-binding bpm-service \
-    --region=europe-west3 \
-    --member="serviceAccount:vercel-bpm-invoker@bpm-api-microservice.iam.gserviceaccount.com" \
+PROJECT_ID="your-project-id"
+REGION="your-region"
+SERVICE_NAME="bpm-service"
+SERVICE_ACCOUNT="your-service-account"
+
+gcloud run services add-iam-policy-binding ${SERVICE_NAME} \
+    --region=${REGION} \
+    --member="serviceAccount:${SERVICE_ACCOUNT}@${PROJECT_ID}.iam.gserviceaccount.com" \
     --role="roles/run.invoker" \
-    --project=bpm-api-microservice
+    --project=${PROJECT_ID}
 ```
 
 ### "Host not allowed" errors
@@ -452,13 +490,16 @@ Ensure the audio file is a valid format. The service supports common audio forma
 The service is configured with 2GB memory. For very large files or high concurrency, consider increasing:
 
 ```bash
-gcloud run services update bpm-service \
-    --region=europe-west3 \
+PROJECT_ID="your-project-id"
+REGION="your-region"
+SERVICE_NAME="bpm-service"
+
+gcloud run services update ${SERVICE_NAME} \
+    --region=${REGION} \
     --memory 4Gi \
-    --project=bpm-api-microservice
+    --project=${PROJECT_ID}
 ```
 
 ## License
 
 GNU General Public License v3.0
-
