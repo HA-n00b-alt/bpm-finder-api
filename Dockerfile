@@ -7,16 +7,24 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
+# Create a non-root user
+RUN useradd -m -u 1000 appuser && \
+    mkdir -p /app /tmp && \
+    chown -R appuser:appuser /app /tmp
+
 # Set working directory
 WORKDIR /app
 
-# Copy requirements and install Python dependencies
+# Copy requirements and install Python dependencies as root (needed for system-wide install)
 COPY requirements.txt .
-RUN python3 -m pip install --no-cache-dir --upgrade pip && \
-    python3 -m pip install --no-cache-dir -r requirements.txt
+RUN python3 -m pip install --no-cache-dir --upgrade pip --root-user-action=ignore && \
+    python3 -m pip install --no-cache-dir -r requirements.txt --root-user-action=ignore
 
 # Copy application code
 COPY main.py .
+
+# Switch to non-root user
+USER appuser
 
 # Expose port 8080 (Cloud Run requirement)
 EXPOSE 8080
