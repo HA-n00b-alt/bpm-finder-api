@@ -4,9 +4,9 @@ A Google Cloud Run microservice that computes BPM (beats per minute) from 30-sec
 
 ## Features
 
-- BPM computation from audio preview URLs (Apple, Spotify, Deezer)
+- BPM computation from audio preview URLs
 - Private Cloud Run service with IAM authentication
-- SSRF protection with host whitelisting
+- SSRF protection through HTTPS-only requirement
 - Fast processing with Essentia and ffmpeg
 - Returns BPM, raw BPM, confidence, and source host
 
@@ -276,23 +276,21 @@ Compute BPM from audio preview URL.
 - `source_url_host`: Hostname of the source URL
 
 **Error Responses:**
-- `400`: Invalid URL, non-allowed host, file too large, or redirect to non-allowed host
+- `400`: Invalid URL, non-HTTPS URL, file too large, or redirect to non-HTTPS URL
 - `500`: Processing error (download, conversion, or BPM computation failed)
 
 ## SSRF Protection
 
-The service implements strict SSRF protection:
+The service implements SSRF protection through:
 
 - Only `https://` URLs allowed
-- Host whitelist:
-  - `.mzstatic.com` (Apple previews)
-  - `.scdn.co` (Spotify previews)
-  - `.deezer.com`, `.dzcdn.net` (Deezer previews)
-- Redirect validation (rejects redirects to non-allowed hosts)
+- Redirect validation (ensures redirects stay on HTTPS)
 - Download limits:
   - Connect timeout: 5 seconds
   - Total timeout: 20 seconds
   - Max file size: 10MB
+
+**Note**: Host/domain restrictions are handled through authentication. Only authenticated callers can access the service.
 
 ## Using the API from External Applications
 
@@ -448,9 +446,8 @@ curl http://localhost:8080/health
 ## Security Notes
 
 - Cloud Run IAM authentication (no public access)
-- SSRF protection with host whitelisting
+- SSRF protection through HTTPS-only requirement and redirect validation
 - Download size and timeout limits
-- Redirect validation
 - No audio persistence (temp files deleted immediately)
 - Minimal logging (URLs with tokens are not logged)
 
@@ -473,13 +470,11 @@ gcloud run services add-iam-policy-binding ${SERVICE_NAME} \
     --project=${PROJECT_ID}
 ```
 
-### "Host not allowed" errors
+### "Invalid URL" errors
 
-Check that the preview URL host ends with one of the allowed suffixes:
-- `.mzstatic.com`
-- `.scdn.co`
-- `.deezer.com`
-- `.dzcdn.net`
+Ensure the URL:
+- Starts with `https://`
+- Is a valid, accessible URL
 
 ### ffmpeg conversion errors
 

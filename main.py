@@ -14,14 +14,6 @@ import essentia.standard as es
 
 app = FastAPI(title="BPM Finder API")
 
-# Allowed host suffixes for SSRF protection
-ALLOWED_HOST_SUFFIXES = [
-    ".mzstatic.com",  # Apple previews
-    ".scdn.co",  # Spotify previews
-    ".deezer.com",
-    ".dzcdn.net",  # Deezer previews
-]
-
 # Download limits
 CONNECT_TIMEOUT = 5.0  # seconds
 TOTAL_TIMEOUT = 20.0  # seconds
@@ -34,21 +26,10 @@ class BPMRequest(BaseModel):
     @field_validator("url")
     @classmethod
     def validate_url(cls, v):
-        """Validate URL scheme and host."""
+        """Validate URL scheme."""
         url_str = str(v)
         if not url_str.startswith("https://"):
             raise ValueError("Only HTTPS URLs are allowed")
-        
-        parsed = urlparse(url_str)
-        host = parsed.hostname or ""
-        
-        # Check if host ends with any allowed suffix
-        allowed = any(host.endswith(suffix) for suffix in ALLOWED_HOST_SUFFIXES)
-        if not allowed:
-            raise ValueError(
-                f"Host must end with one of: {', '.join(ALLOWED_HOST_SUFFIXES)}"
-            )
-        
         return v
 
 
@@ -60,10 +41,8 @@ class BPMResponse(BaseModel):
 
 
 def validate_redirect_url(url: str) -> bool:
-    """Validate that a redirect URL is allowed."""
-    parsed = urlparse(url)
-    host = parsed.hostname or ""
-    return any(host.endswith(suffix) for suffix in ALLOWED_HOST_SUFFIXES)
+    """Validate that a redirect URL uses HTTPS."""
+    return url.startswith("https://")
 
 
 def download_audio(url: str, output_path: str) -> None:
@@ -99,16 +78,10 @@ def download_audio(url: str, output_path: str) -> None:
                     redirect_url = f"{parsed.scheme}://{parsed.netloc}/{redirect_url.lstrip('/')}"
                 
                 # Validate redirect URL
-                if not redirect_url.startswith("https://"):
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Redirect to non-HTTPS URL not allowed"
-                    )
-                
                 if not validate_redirect_url(redirect_url):
                     raise HTTPException(
                         status_code=400,
-                        detail="Redirect to non-allowed host detected"
+                        detail="Redirect to non-HTTPS URL not allowed"
                     )
                 
                 current_url = redirect_url
@@ -122,12 +95,12 @@ def download_audio(url: str, output_path: str) -> None:
                     detail=f"Download failed: HTTP {response.status_code}"
                 )
             
-            # Check final URL
+            # Check final URL uses HTTPS
             final_url = str(response.url)
             if not validate_redirect_url(final_url):
                 raise HTTPException(
                     status_code=400,
-                    detail="Final URL host not allowed"
+                    detail="Final URL must use HTTPS"
                 )
             
             # Check content length
