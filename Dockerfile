@@ -1,9 +1,9 @@
 # Use MTG Essentia base image
 FROM ghcr.io/mtg/essentia:latest
 
-# Install ffmpeg if not present
+# Install ffmpeg and ensure pip is available
 RUN apt-get update && \
-    apt-get install -y ffmpeg && \
+    apt-get install -y ffmpeg python3-pip && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -12,7 +12,8 @@ WORKDIR /app
 
 # Copy requirements and install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python3 -m pip install --no-cache-dir --upgrade pip && \
+    python3 -m pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY main.py .

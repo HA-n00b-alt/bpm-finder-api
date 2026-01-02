@@ -23,9 +23,50 @@ A Google Cloud Run microservice that computes BPM (beats per minute) from 30-sec
 - Google Cloud SDK (`gcloud`) installed and authenticated
 - GCP project: `bpm-api-microservice`
 - Billing enabled on the GCP project
-- Permissions to create Cloud Run services, Artifact Registry repos, and IAM bindings
+- **Owner or Editor role** on the GCP project, OR the following IAM roles:
+  - `roles/cloudbuild.builds.editor` (Cloud Build Editor)
+  - `roles/artifactregistry.writer` (Artifact Registry Writer)
+  - `roles/run.admin` (Cloud Run Admin)
+  - `roles/iam.serviceAccountUser` (Service Account User)
+  - `roles/iam.serviceAccountAdmin` (Service Account Admin) - for creating service accounts
 
 ## One-Time Setup
+
+### 0. Grant Required IAM Permissions (if needed)
+
+If you're not a project Owner/Editor, grant yourself the required roles:
+
+```bash
+# Get your email
+YOUR_EMAIL=$(gcloud config get-value account)
+
+# Grant Cloud Build Editor
+gcloud projects add-iam-policy-binding bpm-api-microservice \
+    --member="user:${YOUR_EMAIL}" \
+    --role="roles/cloudbuild.builds.editor"
+
+# Grant Artifact Registry Writer
+gcloud projects add-iam-policy-binding bpm-api-microservice \
+    --member="user:${YOUR_EMAIL}" \
+    --role="roles/artifactregistry.writer"
+
+# Grant Cloud Run Admin
+gcloud projects add-iam-policy-binding bpm-api-microservice \
+    --member="user:${YOUR_EMAIL}" \
+    --role="roles/run.admin"
+
+# Grant Service Account User
+gcloud projects add-iam-policy-binding bpm-api-microservice \
+    --member="user:${YOUR_EMAIL}" \
+    --role="roles/iam.serviceAccountUser"
+
+# Grant Service Account Admin (to create service accounts)
+gcloud projects add-iam-policy-binding bpm-api-microservice \
+    --member="user:${YOUR_EMAIL}" \
+    --role="roles/iam.serviceAccountAdmin"
+```
+
+**Note**: If you don't have permission to grant yourself these roles, ask a project Owner/Editor to grant them.
 
 ### 1. Enable Required APIs
 

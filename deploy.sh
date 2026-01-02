@@ -20,15 +20,48 @@ echo ""
 # Set GCP project
 gcloud config set project "${PROJECT_ID}"
 
+# Check if user has necessary permissions
+echo "🔍 Checking permissions..."
+CURRENT_USER=$(gcloud config get-value account)
+if [ -z "${CURRENT_USER}" ]; then
+    echo "❌ Error: No active gcloud account. Run 'gcloud auth login' first."
+    exit 1
+fi
+echo "Authenticated as: ${CURRENT_USER}"
+echo ""
+
 # Build and push image using Cloud Build
 echo "📦 Building and pushing Docker image..."
-gcloud builds submit \
+if ! gcloud builds submit \
     --tag "${IMAGE_TAG}" \
-    --region "${REGION}"
+    --region "${REGION}"; then
+    echo ""
+    echo "❌ Error: Cloud Build failed. You may need additional permissions."
+    echo ""
+    echo "Required IAM roles:"
+    echo "  - roles/cloudbuild.builds.editor (Cloud Build Editor)"
+    echo "  - roles/artifactregistry.writer (Artifact Registry Writer)"
+    echo "  - roles/iam.serviceAccountUser (Service Account User)"
+    echo ""
+    echo "To grant yourself these roles, run:"
+    echo "  gcloud projects add-iam-policy-binding ${PROJECT_ID} \\"
+    echo "    --member=\"user:${CURRENT_USER}\" \\"
+    echo "    --role=\"roles/cloudbuild.builds.editor\""
+    echo ""
+    echo "  gcloud projects add-iam-policy-binding ${PROJECT_ID} \\"
+    echo "    --member=\"user:${CURRENT_USER}\" \\"
+    echo "    --role=\"roles/artifactregistry.writer\""
+    echo ""
+    echo "  gcloud projects add-iam-policy-binding ${PROJECT_ID} \\"
+    echo "    --member=\"user:${CURRENT_USER}\" \\"
+    echo "    --role=\"roles/iam.serviceAccountUser\""
+    echo ""
+    exit 1
+fi
 
 # Deploy to Cloud Run (without public access)
 echo "🚢 Deploying to Cloud Run..."
-gcloud run deploy "${SERVICE_NAME}" \
+if ! gcloud run deploy "${SERVICE_NAME}" \
     --image "${IMAGE_TAG}" \
     --region "${REGION}" \
     --platform managed \
@@ -38,7 +71,20 @@ gcloud run deploy "${SERVICE_NAME}" \
     --cpu 2 \
     --timeout 60s \
     --max-instances 10 \
-    --project "${PROJECT_ID}"
+    --project "${PROJECT_ID}"; then
+    echo ""
+    echo "❌ Error: Cloud Run deployment failed. You may need additional permissions."
+    echo ""
+    echo "Required IAM role:"
+    echo "  - roles/run.admin (Cloud Run Admin)"
+    echo ""
+    echo "To grant yourself this role, run:"
+    echo "  gcloud projects add-iam-policy-binding ${PROJECT_ID} \\"
+    echo "    --member=\"user:${CURRENT_USER}\" \\"
+    echo "    --role=\"roles/run.admin\""
+    echo ""
+    exit 1
+fi
 
 # Get service URL
 SERVICE_URL=$(gcloud run services describe "${SERVICE_NAME}" \
