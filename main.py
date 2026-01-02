@@ -48,7 +48,12 @@ def validate_redirect_url(url: str) -> bool:
 def download_audio(url: str, output_path: str) -> None:
     """Download audio file with SSRF protection and size limits."""
     with httpx.Client(
-        timeout=httpx.Timeout(connect=CONNECT_TIMEOUT, read=TOTAL_TIMEOUT),
+        timeout=httpx.Timeout(
+            connect=CONNECT_TIMEOUT,
+            read=TOTAL_TIMEOUT,
+            write=TOTAL_TIMEOUT,
+            pool=CONNECT_TIMEOUT
+        ),
         follow_redirects=False,  # Manual redirect handling for validation
         max_redirects=10,
     ) as client:
