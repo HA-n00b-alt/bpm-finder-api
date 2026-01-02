@@ -30,6 +30,29 @@ fi
 echo "Authenticated as: ${CURRENT_USER}"
 echo ""
 
+# Check if Artifact Registry repository exists, create if not
+echo "📦 Checking Artifact Registry repository..."
+if ! gcloud artifacts repositories describe "${ARTIFACT_REPO}" \
+    --location="${REGION}" \
+    --project="${PROJECT_ID}" &>/dev/null; then
+    echo "Creating Artifact Registry repository: ${ARTIFACT_REPO}"
+    if ! gcloud artifacts repositories create "${ARTIFACT_REPO}" \
+        --repository-format=docker \
+        --location="${REGION}" \
+        --description="BPM service Docker images" \
+        --project="${PROJECT_ID}"; then
+        echo ""
+        echo "❌ Error: Failed to create Artifact Registry repository."
+        echo "You may need to enable the Artifact Registry API:"
+        echo "  gcloud services enable artifactregistry.googleapis.com --project=${PROJECT_ID}"
+        exit 1
+    fi
+    echo "✅ Repository created successfully"
+else
+    echo "Repository already exists: ${ARTIFACT_REPO}"
+fi
+echo ""
+
 # Build and push image using Cloud Build
 echo "📦 Building and pushing Docker image..."
 if ! gcloud builds submit \
