@@ -2,8 +2,10 @@
 FROM ghcr.io/mtg/essentia:latest
 
 # Install ffmpeg and ensure pip is available
+# Set DEBIAN_FRONTEND=noninteractive to suppress debconf warnings
+ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && \
-    apt-get install -y ffmpeg python3-pip && \
+    apt-get install -y --no-install-recommends ffmpeg python3-pip && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -17,8 +19,10 @@ WORKDIR /app
 
 # Copy requirements and install Python dependencies as root (needed for system-wide install)
 COPY requirements.txt .
-RUN python3 -m pip install --no-cache-dir --upgrade pip --root-user-action=ignore && \
-    python3 -m pip install --no-cache-dir -r requirements.txt --root-user-action=ignore
+# Upgrade pip first (without the flag since old pip doesn't support it)
+RUN python3 -m pip install --no-cache-dir --upgrade pip
+# Now install dependencies (newer pip supports --root-user-action to suppress warning)
+RUN python3 -m pip install --no-cache-dir -r requirements.txt --root-user-action=ignore
 
 # Copy application code
 COPY main.py .
