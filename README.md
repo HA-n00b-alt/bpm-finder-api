@@ -17,7 +17,7 @@ A Google Cloud Run microservice that computes BPM (beats per minute) and musical
 
 - **Runtime**: Python 3 + FastAPI + Uvicorn
 - **Audio Processing**: Essentia (HPSS for source separation, RhythmExtractor2013 for BPM, KeyExtractor for key detection) + ffmpeg
-- **Container**: MTG Essentia base image (`ghcr.io/mtg/essentia`)
+- **Container**: MTG Essentia base image (`ghcr.io/mtg/essentia:latest`, requires Essentia >= 2.1b6 for HPSS support)
 - **Deployment**: Google Cloud Run
 - **Authentication**: Cloud Run IAM (Identity Tokens)
 

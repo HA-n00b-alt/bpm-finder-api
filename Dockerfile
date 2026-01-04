@@ -1,4 +1,4 @@
-# Use MTG Essentia base image
+# Use MTG Essentia base image (requires Essentia >= 2.1b6 for HPSS support)
 FROM ghcr.io/mtg/essentia:latest
 
 # Install ffmpeg and ensure pip is available
