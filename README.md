@@ -283,12 +283,15 @@ Compute BPM and key from audio preview URL.
 ```
 
 **Field Descriptions:**
-- `bpm`: Normalized BPM (70-200 range, doubled/halved as needed)
-- `bpm_raw`: Raw BPM value from Essentia
-- `confidence`: BPM confidence score (0.0-1.0)
+- `bpm`: Normalized BPM (integer, rounded from normalized value). Only extreme outliers are corrected:
+  - If raw BPM < 40: multiplied by 2
+  - If raw BPM > 220: divided by 2
+  - Otherwise: returned unchanged
+- `bpm_raw`: Raw BPM value from Essentia (before normalization, rounded to 2 decimal places)
+- `confidence`: BPM confidence score (0.0-1.0, rounded to 2 decimal places). Higher value indicates more reliable BPM detection.
 - `key`: Detected musical key (e.g., "C", "D", "E", "F", "G", "A", "B")
 - `scale`: Detected scale ("major" or "minor")
-- `key_confidence`: Key detection confidence score (0.0-1.0)
+- `key_confidence`: Key detection confidence score (0.0-1.0, rounded to 2 decimal places). Higher value indicates more reliable key detection.
 - `source_url_host`: Hostname of the source URL
 
 **Error Responses:**
