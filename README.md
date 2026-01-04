@@ -11,7 +11,7 @@ A Google Cloud Run microservice that computes BPM (beats per minute) and musical
 - Private Cloud Run service with IAM authentication
 - SSRF protection through HTTPS-only requirement
 - Fast processing with Essentia and ffmpeg
-- Returns BPM, raw BPM, confidence, key, scale, key confidence, and source host
+- Returns BPM, raw BPM, BPM confidence, key, scale, key confidence, and source host
 
 ## Architecture
 
@@ -221,7 +221,7 @@ Expected response:
 {
   "bpm": 128,
   "bpm_raw": 64.0,
-  "confidence": 0.73,
+  "bpm_confidence": 0.73,
   "key": "C",
   "scale": "major",
   "key_confidence": 0.85,
@@ -274,7 +274,7 @@ Compute BPM and key from audio preview URL.
 {
   "bpm": 128,
   "bpm_raw": 64.0,
-  "confidence": 0.73,
+  "bpm_confidence": 0.73,
   "key": "C",
   "scale": "major",
   "key_confidence": 0.85,
@@ -288,7 +288,7 @@ Compute BPM and key from audio preview URL.
   - If raw BPM > 220: divided by 2
   - Otherwise: returned unchanged
 - `bpm_raw`: Raw BPM value from Essentia (before normalization, rounded to 2 decimal places)
-- `confidence`: BPM confidence score (0.0-1.0, rounded to 2 decimal places). Higher value indicates more reliable BPM detection.
+- `bpm_confidence`: BPM confidence score (0.0-1.0, rounded to 2 decimal places). Higher value indicates more reliable BPM detection.
 - `key`: Detected musical key (e.g., "C", "D", "E", "F", "G", "A", "B")
 - `scale`: Detected scale ("major" or "minor")
 - `key_confidence`: Key detection confidence score (0.0-1.0, rounded to 2 decimal places). Higher value indicates more reliable key detection.

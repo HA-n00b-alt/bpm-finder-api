@@ -37,7 +37,7 @@ class BPMRequest(BaseModel):
 class BPMResponse(BaseModel):
     bpm: int
     bpm_raw: float
-    confidence: float
+    bpm_confidence: float
     key: str
     scale: str
     key_confidence: float
@@ -317,7 +317,7 @@ async def compute_bpm_from_url(request: BPMRequest):
         return BPMResponse(
             bpm=int(round(bpm_normalized)),
             bpm_raw=round(bpm_raw, 2),
-            confidence=round(confidence, 2),
+            bpm_confidence=round(confidence, 2),
             key=key,
             scale=scale,
             key_confidence=round(key_confidence, 2),
