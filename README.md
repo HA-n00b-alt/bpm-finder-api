@@ -1,19 +1,20 @@
 # BPM Finder API
 
-A Google Cloud Run microservice that computes BPM (beats per minute) from 30-second audio preview URLs. The service is deployed as a **private** Cloud Run service, requiring Google Cloud IAM authentication.
+A Google Cloud Run microservice that computes BPM (beats per minute) and musical key from 30-second audio preview URLs. The service is deployed as a **private** Cloud Run service, requiring Google Cloud IAM authentication.
 
 ## Features
 
 - BPM computation from audio preview URLs
+- Musical key detection (key and scale)
 - Private Cloud Run service with IAM authentication
 - SSRF protection through HTTPS-only requirement
 - Fast processing with Essentia and ffmpeg
-- Returns BPM, raw BPM, confidence, and source host
+- Returns BPM, raw BPM, confidence, key, scale, key confidence, and source host
 
 ## Architecture
 
 - **Runtime**: Python 3 + FastAPI + Uvicorn
-- **Audio Processing**: Essentia (RhythmExtractor2013) + ffmpeg
+- **Audio Processing**: Essentia (RhythmExtractor2013 for BPM, KeyExtractor for key detection) + ffmpeg
 - **Container**: MTG Essentia base image (`ghcr.io/mtg/essentia`)
 - **Deployment**: Google Cloud Run
 - **Authentication**: Cloud Run IAM (Identity Tokens)
@@ -215,6 +216,9 @@ Expected response:
   "bpm": 128,
   "bpm_raw": 64.0,
   "confidence": 0.73,
+  "key": "C",
+  "scale": "major",
+  "key_confidence": 0.85,
   "source_url_host": "audio-ssl.itunes.apple.com"
 }
 ```
@@ -250,7 +254,7 @@ Health check endpoint.
 
 ### `POST /bpm`
 
-Compute BPM from audio preview URL.
+Compute BPM and key from audio preview URL.
 
 **Request Body:**
 ```json
@@ -265,6 +269,9 @@ Compute BPM from audio preview URL.
   "bpm": 128,
   "bpm_raw": 64.0,
   "confidence": 0.73,
+  "key": "C",
+  "scale": "major",
+  "key_confidence": 0.85,
   "source_url_host": "audio-ssl.itunes.apple.com"
 }
 ```
@@ -272,12 +279,15 @@ Compute BPM from audio preview URL.
 **Field Descriptions:**
 - `bpm`: Normalized BPM (70-200 range, doubled/halved as needed)
 - `bpm_raw`: Raw BPM value from Essentia
-- `confidence`: Confidence score (0.0-1.0)
+- `confidence`: BPM confidence score (0.0-1.0)
+- `key`: Detected musical key (e.g., "C", "D", "E", "F", "G", "A", "B")
+- `scale`: Detected scale ("major" or "minor")
+- `key_confidence`: Key detection confidence score (0.0-1.0)
 - `source_url_host`: Hostname of the source URL
 
 **Error Responses:**
 - `400`: Invalid URL, non-HTTPS URL, file too large, or redirect to non-HTTPS URL
-- `500`: Processing error (download, conversion, or BPM computation failed)
+- `500`: Processing error (download, conversion, BPM computation, or key detection failed)
 
 ## SSRF Protection
 
@@ -436,12 +446,13 @@ curl http://localhost:8080/health
 
 1. **Download**: Fetch audio from preview URL (with SSRF protection)
 2. **Convert**: Use ffmpeg to convert to mono 44100Hz 16-bit PCM WAV
-3. **Analyze**: Use Essentia `RhythmExtractor2013` to compute BPM and confidence
-4. **Normalize**: Adjust BPM to 70-200 range:
+3. **Analyze BPM**: Use Essentia `RhythmExtractor2013` to compute BPM and confidence
+4. **Analyze Key**: Use Essentia `KeyExtractor` to compute musical key, scale, and confidence
+5. **Normalize**: Adjust BPM to 70-200 range:
    - If BPM < 70: multiply by 2 (repeat until >= 70)
    - If BPM > 200: divide by 2 (repeat until <= 200)
-5. **Cleanup**: Delete temporary files
-6. **Return**: JSON response with BPM data
+6. **Cleanup**: Delete temporary files
+7. **Return**: JSON response with BPM and key data
 
 ## Security Notes
 

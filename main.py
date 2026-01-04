@@ -1,6 +1,6 @@
 """
 BPM Finder API - Google Cloud Run microservice
-Computes BPM from 30s audio preview URLs.
+Computes BPM and key from 30s audio preview URLs.
 """
 import os
 import tempfile
@@ -37,6 +37,9 @@ class BPMResponse(BaseModel):
     bpm: int
     bpm_raw: float
     confidence: float
+    key: str
+    scale: str
+    key_confidence: float
     source_url_host: str
 
 
@@ -180,6 +183,24 @@ def compute_bpm(wav_path: str) -> Tuple[float, float]:
     return float(bpm), float(beats_confidence)
 
 
+def compute_key(wav_path: str) -> Tuple[str, str, float]:
+    """Compute musical key using Essentia KeyExtractor.
+    
+    Returns:
+        (key, scale, confidence) tuple
+        - key: The detected key (e.g., "C", "D", "E", etc.)
+        - scale: The detected scale ("major" or "minor")
+        - confidence: Confidence score (0.0-1.0)
+    """
+    loader = es.MonoLoader(filename=wav_path)
+    audio = loader()
+    
+    key_extractor = es.KeyExtractor()
+    key, scale, strength = key_extractor(audio)
+    
+    return str(key), str(scale), float(strength)
+
+
 def normalize_bpm(bpm: float) -> int:
     """Normalize BPM to reasonable range (70-200) by doubling/halving."""
     normalized = bpm
@@ -203,7 +224,7 @@ async def health():
 
 @app.post("/bpm", response_model=BPMResponse)
 async def compute_bpm_from_url(request: BPMRequest):
-    """Compute BPM from audio preview URL."""
+    """Compute BPM and key from audio preview URL."""
     url_str = str(request.url)
     parsed = urlparse(url_str)
     source_host = parsed.hostname or ""
@@ -233,10 +254,16 @@ async def compute_bpm_from_url(request: BPMRequest):
         bpm_raw, confidence = compute_bpm(output_path)
         bpm_normalized = normalize_bpm(bpm_raw)
         
+        # Compute key
+        key, scale, key_confidence = compute_key(output_path)
+        
         return BPMResponse(
             bpm=bpm_normalized,
             bpm_raw=round(bpm_raw, 2),
             confidence=round(confidence, 2),
+            key=key,
+            scale=scale,
+            key_confidence=round(key_confidence, 2),
             source_url_host=source_host,
         )
     
