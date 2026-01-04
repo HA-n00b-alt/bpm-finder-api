@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl, field_validator
+import numpy as np
 import essentia.standard as es
 
 app = FastAPI(title="BPM Finder API")
@@ -168,23 +169,44 @@ def convert_to_wav(input_path: str, output_path: str) -> None:
         )
 
 
-def compute_bpm(wav_path: str) -> Tuple[float, float]:
-    """Compute BPM using Essentia RhythmExtractor2013.
+def compute_bpm(percussive_audio: np.ndarray) -> Tuple[float, float, float]:
+    """Compute BPM using Essentia RhythmExtractor2013 with dual-method approach.
+    
+    Uses percussive component from HPSS for improved BPM accuracy. Tries both multifeature
+    and degara methods, normalizes BPM values before comparing confidence scores to prevent
+    octave errors, and returns the result with higher confidence.
+    
+    Args:
+        percussive_audio: Percussive audio component from HPSS (numpy array)
     
     Returns:
-        (bpm, confidence) tuple
+        (normalized_bpm, raw_bpm, confidence) tuple
     """
-    loader = es.MonoLoader(filename=wav_path)
-    audio = loader()
+    # Try multifeature method
+    rhythm_extractor_mf = es.RhythmExtractor2013(method="multifeature")
+    bpm_mf_raw, beats_mf, beats_confidence_mf, _, beats_intervals_mf = rhythm_extractor_mf(percussive_audio)
+    bpm_mf_normalized = normalize_bpm(float(bpm_mf_raw))
     
-    rhythm_extractor = es.RhythmExtractor2013(method="multifeature")
-    bpm, beats, beats_confidence, _, beats_intervals = rhythm_extractor(audio)
+    # Try degara method
+    rhythm_extractor_dg = es.RhythmExtractor2013(method="degara")
+    bpm_dg_raw, beats_dg, beats_confidence_dg, _, beats_intervals_dg = rhythm_extractor_dg(percussive_audio)
+    bpm_dg_normalized = normalize_bpm(float(bpm_dg_raw))
     
-    return float(bpm), float(beats_confidence)
+    # Compare confidence scores and return normalized BPM of winning method
+    if beats_confidence_mf >= beats_confidence_dg:
+        return bpm_mf_normalized, float(bpm_mf_raw), float(beats_confidence_mf)
+    else:
+        return bpm_dg_normalized, float(bpm_dg_raw), float(beats_confidence_dg)
 
 
-def compute_key(wav_path: str) -> Tuple[str, str, float]:
-    """Compute musical key using Essentia KeyExtractor.
+def compute_key(harmonic_audio: np.ndarray) -> Tuple[str, str, float]:
+    """Compute musical key using Essentia KeyExtractor with multiple profile types.
+    
+    Uses harmonic component from HPSS for improved key detection accuracy. Tries multiple
+    key profile types and returns the result with the highest strength value.
+    
+    Args:
+        harmonic_audio: Harmonic audio component from HPSS (numpy array)
     
     Returns:
         (key, scale, confidence) tuple
@@ -192,28 +214,56 @@ def compute_key(wav_path: str) -> Tuple[str, str, float]:
         - scale: The detected scale ("major" or "minor")
         - confidence: Confidence score (0.0-1.0)
     """
-    loader = es.MonoLoader(filename=wav_path)
-    audio = loader()
+    # Try multiple key profile types
+    key_profiles = ['temperley', 'krumhansl', 'edma', 'edmm']
+    results = []
     
+    for profile in key_profiles:
+        try:
+            key_extractor = es.KeyExtractor(
+                profileType=profile,
+                pcpSize=36,
+                numHarmonics=4
+            )
+            key, scale, strength = key_extractor(harmonic_audio)
+            results.append((str(key), str(scale), float(strength), profile))
+        except Exception:
+            # Profile not available in this Essentia version, skip
+            continue
+    
+    # If we have results, return the one with highest strength
+    if results:
+        # Sort by strength (index 2) in descending order
+        results.sort(key=lambda x: x[2], reverse=True)
+        key, scale, strength, _ = results[0]
+        return key, scale, strength
+    
+    # Fall back to default KeyExtractor if no profiles worked
     key_extractor = es.KeyExtractor()
-    key, scale, strength = key_extractor(audio)
+    key, scale, strength = key_extractor(harmonic_audio)
     
     return str(key), str(scale), float(strength)
 
 
-def normalize_bpm(bpm: float) -> int:
-    """Normalize BPM to reasonable range (70-200) by doubling/halving."""
+def normalize_bpm(bpm: float) -> float:
+    """Normalize BPM by applying corrections only for extreme outliers.
+    
+    Args:
+        bpm: The BPM value to normalize
+    
+    Returns:
+        Normalized BPM value (float, rounded to 1 decimal place)
+    """
     normalized = bpm
     
-    # Double if too slow
-    while normalized < 70:
+    # Apply corrections only for extreme outliers
+    if normalized < 40:
         normalized *= 2
-    
-    # Halve if too fast
-    while normalized > 200:
+    elif normalized > 220:
         normalized /= 2
     
-    return round(normalized)
+    # Round to 1 decimal place
+    return round(normalized, 1)
 
 
 @app.get("/health")
@@ -250,15 +300,22 @@ async def compute_bpm_from_url(request: BPMRequest):
         # Convert to WAV
         convert_to_wav(input_path, output_path)
         
-        # Compute BPM
-        bpm_raw, confidence = compute_bpm(output_path)
-        bpm_normalized = normalize_bpm(bpm_raw)
+        # Load audio and apply HPSS for improved accuracy
+        loader = es.MonoLoader(filename=output_path, sampleRate=44100)
+        audio = loader()
         
-        # Compute key
-        key, scale, key_confidence = compute_key(output_path)
+        # Apply Harmonic-Percussive Source Separation
+        hpss = es.HPSS()
+        harmonic, percussive = hpss(audio)
+        
+        # Compute BPM using percussive component
+        bpm_normalized, bpm_raw, confidence = compute_bpm(percussive)
+        
+        # Compute key using harmonic component
+        key, scale, key_confidence = compute_key(harmonic)
         
         return BPMResponse(
-            bpm=bpm_normalized,
+            bpm=int(round(bpm_normalized)),
             bpm_raw=round(bpm_raw, 2),
             confidence=round(confidence, 2),
             key=key,

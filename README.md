@@ -4,8 +4,10 @@ A Google Cloud Run microservice that computes BPM (beats per minute) and musical
 
 ## Features
 
-- BPM computation from audio preview URLs
-- Musical key detection (key and scale)
+- BPM computation from audio preview URLs using Harmonic-Percussive Source Separation (HPSS) for improved accuracy
+- Musical key detection (key and scale) using HPSS harmonic component
+- Dual-method BPM extraction (multifeature and degara) with confidence-based selection
+- Multiple key profile types with automatic selection of best result
 - Private Cloud Run service with IAM authentication
 - SSRF protection through HTTPS-only requirement
 - Fast processing with Essentia and ffmpeg
@@ -14,7 +16,7 @@ A Google Cloud Run microservice that computes BPM (beats per minute) and musical
 ## Architecture
 
 - **Runtime**: Python 3 + FastAPI + Uvicorn
-- **Audio Processing**: Essentia (RhythmExtractor2013 for BPM, KeyExtractor for key detection) + ffmpeg
+- **Audio Processing**: Essentia (HPSS for source separation, RhythmExtractor2013 for BPM, KeyExtractor for key detection) + ffmpeg
 - **Container**: MTG Essentia base image (`ghcr.io/mtg/essentia`)
 - **Deployment**: Google Cloud Run
 - **Authentication**: Cloud Run IAM (Identity Tokens)
@@ -138,7 +140,9 @@ gcloud iam service-accounts keys create ${SERVICE_ACCOUNT}-key.json \
 
 ## Deployment
 
-### Deploy to Cloud Run
+### Quick Deploy
+
+To deploy the service to Google Cloud Run, simply run the deployment script:
 
 ```bash
 # Set your project ID
@@ -150,6 +154,8 @@ export PROJECT_ID="your-project-id"
 # Or override region
 REGION=us-central1 ./deploy.sh
 ```
+
+**Note**: Make sure you've completed the [One-Time Setup](#one-time-setup) steps before deploying.
 
 The `deploy.sh` script will:
 1. Build the Docker image using Cloud Build
@@ -446,13 +452,17 @@ curl http://localhost:8080/health
 
 1. **Download**: Fetch audio from preview URL (with SSRF protection)
 2. **Convert**: Use ffmpeg to convert to mono 44100Hz 16-bit PCM WAV
-3. **Analyze BPM**: Use Essentia `RhythmExtractor2013` to compute BPM and confidence
-4. **Analyze Key**: Use Essentia `KeyExtractor` to compute musical key, scale, and confidence
-5. **Normalize**: Adjust BPM to 70-200 range:
-   - If BPM < 70: multiply by 2 (repeat until >= 70)
-   - If BPM > 200: divide by 2 (repeat until <= 200)
-6. **Cleanup**: Delete temporary files
-7. **Return**: JSON response with BPM and key data
+3. **Separate**: Apply Essentia `HPSS` (Harmonic-Percussive Source Separation) to split audio into:
+   - **Harmonic component**: Used for key detection (tonal content)
+   - **Percussive component**: Used for BPM detection (rhythmic content)
+4. **Analyze BPM**: Use Essentia `RhythmExtractor2013` (dual-method: multifeature and degara) on percussive component to compute BPM and confidence
+5. **Analyze Key**: Use Essentia `KeyExtractor` (multiple profile types) on harmonic component to compute musical key, scale, and confidence
+6. **Normalize**: Adjust BPM for extreme outliers only:
+   - If BPM < 40: multiply by 2
+   - If BPM > 220: divide by 2
+   - Otherwise: return unchanged
+7. **Cleanup**: Delete temporary files
+8. **Return**: JSON response with BPM and key data
 
 ## Security Notes
 
