@@ -6,6 +6,8 @@ Accepts pre-processed audio files directly via file upload (batch processing).
 import io
 import os
 import tempfile
+import asyncio
+from concurrent.futures import ProcessPoolExecutor
 from typing import Optional, Tuple, List
 from fastapi import FastAPI, UploadFile, HTTPException, Request
 from pydantic import BaseModel
@@ -15,6 +17,25 @@ app = FastAPI(title="BPM Fallback Service")
 
 # Import librosa at module level (required for Cloud Run startup)
 import librosa
+
+# ProcessPoolExecutor for CPU-bound work (bypasses GIL)
+# Use 2 workers to match Cloud Run's 2 CPU cores
+_process_pool = None
+
+def get_process_pool():
+    """Get or create the ProcessPoolExecutor singleton."""
+    global _process_pool
+    if _process_pool is None:
+        _process_pool = ProcessPoolExecutor(max_workers=2)
+    return _process_pool
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup ProcessPoolExecutor on shutdown."""
+    global _process_pool
+    if _process_pool is not None:
+        _process_pool.shutdown(wait=True)
+        _process_pool = None
 
 
 class FallbackResponse(BaseModel):
@@ -43,7 +64,7 @@ def normalize_bpm(bpm: float) -> float:
         bpm: The BPM value to normalize
     
     Returns:
-        Normalized BPM value (float, rounded to 1 decimal place)
+        Normalized BPM value (float, no rounding - rounding happens once at response level)
     """
     normalized = bpm
     
@@ -53,8 +74,7 @@ def normalize_bpm(bpm: float) -> float:
     elif normalized > 220:
         normalized /= 2
     
-    # Round to 1 decimal place
-    return round(normalized, 1)
+    return normalized
 
 
 def extract_key_from_chroma(chroma: np.ndarray) -> Tuple[str, str, float]:
@@ -145,24 +165,61 @@ def process_single_audio(
     # For compressed formats (MP3/AAC), librosa needs a file path, not BytesIO
     # Use a temporary file that gets cleaned up immediately
     temp_file = None
+    temp_fd = None
     try:
         # Create temporary file
         temp_fd, temp_file = tempfile.mkstemp(suffix='.tmp', dir='/tmp')
         os.close(temp_fd)  # Close file descriptor, we'll write via path
+        temp_fd = None  # Mark as closed
         
         # Write audio content to temporary file
-        with open(temp_file, 'wb') as f:
-            f.write(audio_content)
+        try:
+            with open(temp_file, 'wb') as f:
+                f.write(audio_content)
+                f.flush()
+                os.fsync(f.fileno())  # Ensure data is written to disk
+        except Exception as e:
+            # If write fails, ensure file is cleaned up
+            if temp_file and os.path.exists(temp_file):
+                try:
+                    os.unlink(temp_file)
+                except Exception:
+                    pass
+            raise HTTPException(
+                status_code=500,
+                detail=f"Audio file write failed: {str(e)[:200]}"
+            )
         
         # Load audio using librosa (can now detect format from file extension/path)
-        audio, sr = librosa.load(temp_file, sr=44100, mono=True)
+        try:
+            audio, sr = librosa.load(temp_file, sr=44100, mono=True)
+        except Exception as e:
+            # If load fails, ensure file is cleaned up
+            if temp_file and os.path.exists(temp_file):
+                try:
+                    os.unlink(temp_file)
+                except Exception:
+                    pass
+            raise HTTPException(
+                status_code=500,
+                detail=f"Audio loading failed: {str(e)[:200]}"
+            )
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
+        # Catch any other unexpected errors
         raise HTTPException(
             status_code=500,
-            detail=f"Audio loading failed: {str(e)[:200]}"
+            detail=f"Unexpected error: {str(e)[:200]}"
         )
     finally:
-        # Clean up temporary file immediately after loading
+        # Clean up temporary file and file descriptor in all cases
+        if temp_fd is not None:
+            try:
+                os.close(temp_fd)
+            except Exception:
+                pass
         if temp_file and os.path.exists(temp_file):
             try:
                 os.unlink(temp_file)
@@ -214,7 +271,17 @@ def process_single_audio(
     if process_key:
         try:
             # Use chroma_cqt for better stability (more robust to timbre variations)
-            chroma = librosa.feature.chroma_cqt(y=harmonic, sr=sr)
+            # Optimized parameters for speed: larger hop_length (less time resolution needed for key),
+            # reduced n_octaves (key detection doesn't need full frequency range),
+            # fmin set to C2 (65.41 Hz) to avoid processing very low frequencies
+            chroma = librosa.feature.chroma_cqt(
+                y=harmonic,
+                sr=sr,
+                hop_length=2048,      # Default: 512, 4x larger = ~4x faster, still sufficient for key detection
+                fmin=65.41,            # C2 - reasonable lower bound for musical key detection
+                n_octaves=5,           # Default: 6, reduced by 1 octave = faster, still covers full musical range
+                bins_per_octave=12     # Default: 12, keep for accuracy
+            )
             key, scale, key_confidence = extract_key_from_chroma(chroma)
         except Exception as e:
             # If key processing fails and it was requested, raise error
@@ -289,34 +356,64 @@ async def process_batch(
             idx = int(key.split("_")[-1])
             process_flags.setdefault(idx, {})["key"] = value.lower() == "true"
     
-    results = []
-    
-    # Process sequentially (librosa is CPU-heavy, limit concurrency)
+    # Read all file contents first (I/O bound, can be done concurrently)
+    file_contents = []
     for i, audio_file in enumerate(audio_files):
         try:
-            # Read file content into memory
             content = await audio_file.read()
-            
-            # Get processing flags for this file (default to True if not provided)
             flags = process_flags.get(i, {})
             process_bpm = flags.get("bpm", True)
             process_key = flags.get("key", True)
             
             # Validate that at least one processing option is requested
             if not process_bpm and not process_key:
-                results.append(FallbackResponse())  # Return empty response
-                continue
-            
-            # Process audio
-            result = process_single_audio(content, process_bpm, process_key)
-            results.append(result)
-            
-        except HTTPException:
-            # Re-raise HTTP exceptions
-            raise
+                file_contents.append((i, None, False, False))  # Empty response marker
+            else:
+                file_contents.append((i, content, process_bpm, process_key))
         except Exception as e:
+            # If reading fails, mark for empty response
+            file_contents.append((i, None, False, False))
+    
+    # Process files concurrently using ProcessPoolExecutor (CPU-bound work)
+    # This bypasses the GIL and allows true parallelism on multiple CPU cores
+    process_pool = get_process_pool()
+    loop = asyncio.get_event_loop()
+    
+    # Create tasks for concurrent processing
+    futures = []
+    task_indices = []  # Track original index for each task
+    for i, content, process_bpm, process_key in file_contents:
+        if content is None:
+            # Empty response - create a completed future with None
+            future = asyncio.Future()
+            future.set_result(FallbackResponse())
+            futures.append(future)
+            task_indices.append(i)
+        else:
+            # Submit CPU-bound work to process pool
+            future = loop.run_in_executor(
+                process_pool,
+                process_single_audio,
+                content,
+                process_bpm,
+                process_key
+            )
+            futures.append(future)
+            task_indices.append(i)
+    
+    # Wait for all tasks to complete concurrently, handling errors per item
+    results = [None] * len(audio_files)
+    completed = await asyncio.gather(*futures, return_exceptions=True)
+    
+    # Process results in order, handling exceptions
+    for idx, result in zip(task_indices, completed):
+        if isinstance(result, HTTPException):
+            # Re-raise HTTP exceptions (these are expected errors)
+            raise result
+        elif isinstance(result, Exception):
             # Per-item error handling: return empty response for failed items
-            results.append(FallbackResponse())
-            continue
+            results[idx] = FallbackResponse()
+        else:
+            results[idx] = result
     
     return results

@@ -10,6 +10,7 @@ import time
 from typing import Optional, Tuple, List
 from urllib.parse import urlparse
 import httpx
+import aiofiles
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl, field_validator
 import essentia.standard as es
@@ -46,6 +47,121 @@ MAX_AUDIO_DURATION = 35.0  # seconds - cap analysis to first 35s
 # Fallback Service Configuration
 FALLBACK_SERVICE_URL = "https://bpm-fallback-service-340051416180.europe-west3.run.app"
 FALLBACK_SERVICE_AUDIENCE = FALLBACK_SERVICE_URL
+FALLBACK_TIMEOUT = 120.0  # seconds - total timeout for fallback request
+FALLBACK_REQUEST_TIMEOUT_COLD_START = 120.0  # seconds - timeout for first attempt (handles cold starts ~95s)
+FALLBACK_REQUEST_TIMEOUT_WARM = 60.0  # seconds - timeout for retries (warm instances are faster)
+FALLBACK_MAX_RETRIES = 3  # Maximum retry attempts for transient failures
+FALLBACK_RETRY_DELAY = 2.0  # seconds - delay between retries (increased for cold start recovery)
+
+# Circuit breaker state for fallback service
+class FallbackCircuitBreaker:
+    """Simple circuit breaker for fallback service calls."""
+    def __init__(self, failure_threshold=5, recovery_timeout=60):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.state = "closed"  # closed, open, half_open
+    
+    def record_success(self):
+        """Record a successful call."""
+        self.failure_count = 0
+        self.state = "closed"
+    
+    def record_failure(self):
+        """Record a failed call."""
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        if self.failure_count >= self.failure_threshold:
+            self.state = "open"
+    
+    def can_attempt(self) -> bool:
+        """Check if we can attempt a call."""
+        if self.state == "closed":
+            return True
+        elif self.state == "open":
+            # Check if recovery timeout has passed
+            if self.last_failure_time and (time.time() - self.last_failure_time) >= self.recovery_timeout:
+                self.state = "half_open"
+                return True
+            return False
+        else:  # half_open
+            return True
+
+# Global circuit breaker instance
+fallback_circuit_breaker = FallbackCircuitBreaker()
+
+# Global HTTPX client with connection pooling for reuse across requests
+_http_client: Optional[httpx.AsyncClient] = None
+
+def get_http_client() -> httpx.AsyncClient:
+    """Get or create the global HTTPX AsyncClient with connection pooling."""
+    global _http_client
+    if _http_client is None:
+        # Create client with connection pooling enabled
+        # limits: max_keepalive_connections=20, max_connections=100
+        _http_client = httpx.AsyncClient(
+            limits=httpx.Limits(
+                max_keepalive_connections=20,  # Keep 20 connections alive for reuse
+                max_connections=100,           # Maximum 100 total connections
+            ),
+            timeout=httpx.Timeout(
+                connect=10.0,  # Default connect timeout
+                read=30.0,     # Default read timeout (can be overridden per request)
+                write=30.0,    # Default write timeout
+                pool=10.0      # Pool timeout
+            ),
+            follow_redirects=False,  # We handle redirects manually for security
+        )
+    return _http_client
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize HTTP client and check fallback service health at startup."""
+    # Pre-initialize the HTTP client with connection pooling
+    get_http_client()
+    
+    # Check fallback service health
+    try:
+        # Try to get auth headers (this will fail if auth is misconfigured)
+        try:
+            auth_headers = await get_auth_headers(FALLBACK_SERVICE_AUDIENCE)
+        except Exception as e:
+            print(f"Warning: Fallback service auth check failed at startup: {str(e)[:200]}")
+            print("Fallback service calls will be skipped until auth is configured.")
+            return
+        
+        # Try to reach the fallback service health endpoint using global client
+        client = get_http_client()
+        timeout = httpx.Timeout(connect=5.0, read=10.0)
+        try:
+            response = await client.get(
+                f"{FALLBACK_SERVICE_URL}/health",
+                headers=auth_headers,
+                timeout=timeout
+            )
+            if response.status_code == 200:
+                print("✅ Fallback service is reachable and healthy")
+                fallback_circuit_breaker.record_success()
+            else:
+                print(f"⚠️  Fallback service returned HTTP {response.status_code} at startup")
+                fallback_circuit_breaker.record_failure()
+        except httpx.TimeoutException:
+            print("⚠️  Fallback service health check timed out at startup")
+            fallback_circuit_breaker.record_failure()
+        except Exception as e:
+            print(f"⚠️  Fallback service health check failed: {str(e)[:200]}")
+            fallback_circuit_breaker.record_failure()
+    except Exception as e:
+        print(f"Warning: Startup fallback service check failed: {str(e)[:200]}")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup HTTP client on shutdown."""
+    global _http_client
+    if _http_client is not None:
+        await _http_client.aclose()
+        _http_client = None
 
 
 class BatchBPMRequest(BaseModel):
@@ -61,8 +177,8 @@ class BatchBPMRequest(BaseModel):
             raise ValueError("urls list cannot be empty")
         for url in v:
             url_str = str(url)
-            if not url_str.startswith("https://"):
-                raise ValueError("Only HTTPS URLs are allowed")
+        if not url_str.startswith("https://"):
+            raise ValueError("Only HTTPS URLs are allowed")
         return v
     
     @field_validator("max_confidence")
@@ -114,105 +230,116 @@ def validate_redirect_url(url: str) -> bool:
 
 async def download_audio_async(url: str, output_path: str) -> None:
     """Download audio file with SSRF protection and size limits using async streaming."""
+    # Use global HTTP client with connection pooling
+    client = get_http_client()
     timeout = httpx.Timeout(
-        connect=CONNECT_TIMEOUT,
-        read=TOTAL_TIMEOUT,
-        write=TOTAL_TIMEOUT,
-        pool=CONNECT_TIMEOUT
+            connect=CONNECT_TIMEOUT,
+            read=TOTAL_TIMEOUT,
+            write=TOTAL_TIMEOUT,
+            pool=CONNECT_TIMEOUT
     )
     
-    async with httpx.AsyncClient(
-        timeout=timeout,
-        follow_redirects=False,
-        max_redirects=10,
-    ) as client:
-        current_url = url
-        redirect_count = 0
-        max_redirects = 10
+    # Use global client (connection pooling enabled)
+    # Note: follow_redirects=False is set in global client, we handle redirects manually
+    current_url = url
+    redirect_count = 0
+    max_redirects = 10
+    
+    # Follow redirects manually, validating each one
+    while redirect_count < max_redirects:
+        response = await client.get(current_url, timeout=timeout)
         
-        # Follow redirects manually, validating each one
-        while redirect_count < max_redirects:
-            response = await client.get(current_url)
-            
-            # If redirect, validate and follow
-            if response.status_code in (301, 302, 303, 307, 308):
-                redirect_url = response.headers.get("location")
-                if not redirect_url:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Invalid redirect: missing Location header"
-                    )
-                
-                # Resolve relative URLs
-                if redirect_url.startswith("/"):
-                    parsed = urlparse(current_url)
-                    redirect_url = f"{parsed.scheme}://{parsed.netloc}{redirect_url}"
-                elif not redirect_url.startswith("http"):
-                    parsed = urlparse(current_url)
-                    redirect_url = f"{parsed.scheme}://{parsed.netloc}/{redirect_url.lstrip('/')}"
-                
-                # Validate redirect URL
-                if not validate_redirect_url(redirect_url):
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Redirect to non-HTTPS URL not allowed"
-                    )
-                
-                current_url = redirect_url
-                redirect_count += 1
-                continue
-            
-            # If not a redirect, we have the final response
-            if response.status_code != 200:
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail=f"Download failed: HTTP {response.status_code}"
-                )
-            
-            # Check final URL uses HTTPS
-            final_url = str(response.url)
-            if not validate_redirect_url(final_url):
+        # If redirect, validate and follow
+        if response.status_code in (301, 302, 303, 307, 308):
+            redirect_url = response.headers.get("location")
+            if not redirect_url:
                 raise HTTPException(
                     status_code=400,
-                    detail="Final URL must use HTTPS"
+                    detail="Invalid redirect: missing Location header"
                 )
             
-            # Check content length
-            content_length = response.headers.get("content-length")
-            if content_length and int(content_length) > MAX_SIZE:
+            # Resolve relative URLs
+            if redirect_url.startswith("/"):
+                parsed = urlparse(current_url)
+                redirect_url = f"{parsed.scheme}://{parsed.netloc}{redirect_url}"
+            elif not redirect_url.startswith("http"):
+                parsed = urlparse(current_url)
+                redirect_url = f"{parsed.scheme}://{parsed.netloc}/{redirect_url.lstrip('/')}"
+            
+            # Validate redirect URL
+            if not validate_redirect_url(redirect_url):
                 raise HTTPException(
                     status_code=400,
-                    detail=f"File too large (max {MAX_SIZE / 1024 / 1024:.1f}MB)"
+                    detail="Redirect to non-HTTPS URL not allowed"
                 )
             
-            # Stream download directly to file with size limit (non-blocking I/O)
-            total_size = 0
-            # Open file in binary write mode
-            f = open(output_path, "wb")
-            try:
-                async for chunk in response.aiter_bytes():
-                    total_size += len(chunk)
-                    if total_size > MAX_SIZE:
-                        f.close()
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"File too large (max {MAX_SIZE / 1024 / 1024:.1f}MB)"
-                        )
-                    # Use run_in_executor to make file write non-blocking (Python 3.8 compatible)
-                    # This allows the event loop to switch to other pending requests
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(None, f.write, chunk)
-            finally:
-                # Ensure file is closed even if an error occurs
-                f.close()
-            
-            return
+            current_url = redirect_url
+            redirect_count += 1
+            continue
         
-        # Too many redirects
-        raise HTTPException(
-            status_code=400,
-            detail="Too many redirects"
-        )
+        # If not a redirect, we have the final response
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"Download failed: HTTP {response.status_code}"
+            )
+        
+        # Check final URL uses HTTPS
+        final_url = str(response.url)
+        if not validate_redirect_url(final_url):
+            raise HTTPException(
+                status_code=400,
+                detail="Final URL must use HTTPS"
+            )
+        
+        # Check content length
+        content_length = response.headers.get("content-length")
+        if content_length and int(content_length) > MAX_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File too large (max {MAX_SIZE / 1024 / 1024:.1f}MB)"
+            )
+        
+        # Stream download directly to file with size limit (async I/O using aiofiles)
+        # Use buffered writes to reduce system calls and improve performance
+        BUFFER_SIZE = 64 * 1024  # 64KB buffer - balances performance and memory
+        total_size = 0
+        buffer = bytearray()
+        
+        async with aiofiles.open(output_path, "wb") as f:
+            async for chunk in response.aiter_bytes():
+                total_size += len(chunk)
+                if total_size > MAX_SIZE:
+                    # Clean up partial file
+                    await f.close()
+                    try:
+                        os.unlink(output_path)
+                    except Exception:
+                        pass
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"File too large (max {MAX_SIZE / 1024 / 1024:.1f}MB)"
+                    )
+                
+                # Add chunk to buffer
+                buffer.extend(chunk)
+                
+                # Write buffer when it reaches threshold
+                if len(buffer) >= BUFFER_SIZE:
+                    await f.write(bytes(buffer))
+                    buffer.clear()
+            
+            # Write any remaining data in buffer
+            if buffer:
+                await f.write(bytes(buffer))
+        
+        return
+    
+    # Too many redirects
+    raise HTTPException(
+        status_code=400,
+        detail="Too many redirects"
+    )
 
 
 def normalize_confidence(confidence: float) -> Tuple[float, str]:
@@ -266,7 +393,7 @@ def normalize_bpm(bpm: float) -> float:
         bpm: The BPM value to normalize
     
     Returns:
-        Normalized BPM value (float, rounded to 1 decimal place)
+        Normalized BPM value (float, no rounding - rounding happens once at response level)
     """
     normalized = bpm
     
@@ -276,8 +403,7 @@ def normalize_bpm(bpm: float) -> float:
     elif normalized > 220:
         normalized /= 2
     
-    # Round to 1 decimal place
-    return round(normalized, 1)
+    return normalized
 
 
 def analyze_audio(audio_path: str, max_confidence: float) -> Tuple[
@@ -336,7 +462,7 @@ def analyze_audio(audio_path: str, max_confidence: float) -> Tuple[
         bpm_confidence_normalized, bpm_quality = normalize_confidence(float(confidence_raw))
         bpm_normalized = normalize_bpm(float(bpm_raw))
         
-        debug_lines.append(f"BPM={bpm_raw:.2f} (normalized={bpm_normalized:.1f})")
+        debug_lines.append(f"BPM={bpm_raw:.2f} (normalized={round(bpm_normalized, 1):.1f})")
         debug_lines.append(f"Confidence: raw={confidence_raw:.3f} (range: 0-5.32), normalized={bpm_confidence_normalized:.3f} (0-1), quality={bpm_quality}")
         
         # Check if BPM confidence meets threshold
@@ -602,6 +728,8 @@ async def get_auth_headers(audience: str) -> dict:
         raise  # Re-raise so caller can see the error
 
 
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint."""
@@ -728,130 +856,207 @@ async def analyze_batch(request: BatchBPMRequest):
             file_handles = []  # Keep track for cleanup
             file_index_to_item_index = []  # Map file index to fallback_items index
             
+            # Open files asynchronously to avoid blocking the event loop
+            loop = asyncio.get_event_loop()
             for i, item in enumerate(fallback_items):
-                if item["file_path"] and os.path.exists(item["file_path"]):
-                    # Open file for streaming upload
-                    file_handle = open(item["file_path"], "rb")
-                    file_handles.append(file_handle)
-                    file_idx = len(files)  # Index in files array
-                    file_index_to_item_index.append(i)  # Map to fallback_items index
-                    # httpx requires each file to have a unique tuple entry
-                    # Multiple files with same field name are sent as separate entries
-                    files.append(
-                        ("audio_files", (f"audio_{file_idx}.tmp", file_handle, "audio/mpeg"))
-                    )
-                    data[f"process_bpm_{file_idx}"] = str(item["need_fallback_bpm"]).lower()
-                    data[f"process_key_{file_idx}"] = str(item["need_fallback_key"]).lower()
-                    data[f"url_{file_idx}"] = item["url"]
+                if item["file_path"]:
+                    # Check file existence asynchronously
+                    file_exists = await loop.run_in_executor(None, os.path.exists, item["file_path"])
+                    if file_exists:
+                        # Open file for streaming upload (non-blocking using executor)
+                        file_handle = await loop.run_in_executor(None, open, item["file_path"], "rb")
+                        file_handles.append(file_handle)
+                        file_idx = len(files)  # Index in files array
+                        file_index_to_item_index.append(i)  # Map to fallback_items index
+                        # httpx requires each file to have a unique tuple entry
+                        # Multiple files with same field name are sent as separate entries
+                        files.append(
+                            ("audio_files", (f"audio_{file_idx}.tmp", file_handle, "audio/mpeg"))
+                        )
+                        data[f"process_bpm_{file_idx}"] = str(item["need_fallback_bpm"]).lower()
+                        data[f"process_key_{file_idx}"] = str(item["need_fallback_key"]).lower()
+                        data[f"url_{file_idx}"] = item["url"]
+                    else:
+                        # Log missing file
+                        item["debug_info_parts"].append(f"Fallback skipped: file_path missing or doesn't exist")
                 else:
-                    # Log missing file
+                    # Log missing file path
                     item["debug_info_parts"].append(f"Fallback skipped: file_path missing or doesn't exist")
             
             # Make batch request to fallback service
             if files:  # Only make request if we have files to send
-                try:
+                # Check circuit breaker
+                if not fallback_circuit_breaker.can_attempt():
                     for item in fallback_items:
-                        item["debug_info_parts"].append(f"Calling fallback service: {FALLBACK_SERVICE_URL}/process_batch")
-                    
-                    # Log what we're sending
-                    for item in fallback_items:
-                        item["debug_info_parts"].append(f"Sending {len(files)} files to fallback service")
-                    
-                    fallback_timing["start"] = time.time()
-                    async with httpx.AsyncClient(timeout=120.0) as client:
-                        response = await client.post(
-                            f"{FALLBACK_SERVICE_URL}/process_batch",
-                            files=files,
-                            data=data,
-                            headers=auth_headers
-                        )
-                    fallback_timing["end"] = time.time()
-                    fallback_timing["duration"] = fallback_timing["end"] - fallback_timing["start"]
-                    
-                    # Close file handles
+                        item["debug_info_parts"].append("Fallback service circuit breaker is OPEN - skipping fallback call")
+                    # Clean up file handles before returning
                     for fh in file_handles:
                         try:
                             fh.close()
                         except Exception:
                             pass
-                    
-                    # Log response status
-                    for item in fallback_items:
-                        item["debug_info_parts"].append(f"Fallback service response: HTTP {response.status_code}")
-                    
-                    if response.status_code == 200:
-                        fallback_results = response.json()
-                        
-                        # Log what we received for debugging
+                else:
+                    try:
                         for item in fallback_items:
-                            item["debug_info_parts"].append(f"Fallback results received: {len(fallback_results)} items")
+                            item["debug_info_parts"].append(f"Calling fallback service: {FALLBACK_SERVICE_URL}/process_batch")
                         
-                        # Update processed items with fallback results
-                        # Match results by file_index_to_item_index mapping
-                        for file_idx, fallback_result in enumerate(fallback_results):
-                            if file_idx < len(file_index_to_item_index):
-                                item_idx = file_index_to_item_index[file_idx]
-                                item = fallback_items[item_idx]
-                                item_index = item["index"]
-                                
-                                # Log the result we're processing
-                                item["debug_info_parts"].append(
-                                    f"Processing fallback result {file_idx}: bpm_normalized={fallback_result.get('bpm_normalized')}, "
-                                    f"bpm_raw={fallback_result.get('bpm_raw')}, confidence={fallback_result.get('confidence')}"
+                        # Log what we're sending
+                        for item in fallback_items:
+                            item["debug_info_parts"].append(f"Sending {len(files)} files to fallback service")
+                        
+                        # Retry logic for transient failures
+                        last_exception = None
+                        response = None
+                        fallback_timing["start"] = time.time()
+                        
+                        for attempt in range(FALLBACK_MAX_RETRIES):
+                            # Progressive timeout: longer for first attempt (cold start), shorter for retries (warm)
+                            request_timeout = FALLBACK_REQUEST_TIMEOUT_COLD_START if attempt == 0 else FALLBACK_REQUEST_TIMEOUT_WARM
+                            
+                            try:
+                                # Create timeout with per-request timeout
+                                timeout = httpx.Timeout(
+                                    connect=5.0,
+                                    read=request_timeout,
+                                    write=request_timeout,
+                                    pool=5.0
                                 )
                                 
-                                # Update Librosa BPM fields if fallback was needed and returned
-                                if item["need_fallback_bpm"] and fallback_result.get("bpm_normalized") is not None:
-                                    processed_items[item_index]["bpm_librosa"] = int(round(fallback_result["bpm_normalized"]))
-                                    processed_items[item_index]["bpm_raw_librosa"] = round(fallback_result["bpm_raw"], 2) if fallback_result.get("bpm_raw") else None
-                                    processed_items[item_index]["bpm_confidence_librosa"] = round(fallback_result["confidence"], 2) if fallback_result.get("confidence") else None
-                                    processed_items[item_index]["debug_info_parts"].append(
-                                        f"Fallback BPM: {fallback_result['bpm_normalized']:.1f} (confidence={fallback_result['confidence']:.3f})"
-                                    )
-                                elif item["need_fallback_bpm"]:
-                                    processed_items[item_index]["debug_info_parts"].append(
-                                        f"Fallback BPM: No result returned (bpm_normalized={fallback_result.get('bpm_normalized')}, response keys: {list(fallback_result.keys())})"
-                                    )
+                                # Use global HTTP client with connection pooling
+                                client = get_http_client()
+                                response = await client.post(
+                                    f"{FALLBACK_SERVICE_URL}/process_batch",
+                                    files=files,
+                                    data=data,
+                                    headers=auth_headers,
+                                    timeout=timeout
+                                )
                                 
-                                # Update Librosa key fields if fallback was needed and returned
-                                if item["need_fallback_key"] and fallback_result.get("key") is not None:
-                                    processed_items[item_index]["key_librosa"] = fallback_result["key"]
-                                    processed_items[item_index]["scale_librosa"] = fallback_result["scale"]
-                                    processed_items[item_index]["keyscale_confidence_librosa"] = round(fallback_result["key_confidence"], 2) if fallback_result.get("key_confidence") else None
-                                    processed_items[item_index]["debug_info_parts"].append(
-                                        f"Fallback key: {fallback_result['key']} {fallback_result['scale']} (confidence={fallback_result['key_confidence']:.3f})"
-                                    )
-                                elif item["need_fallback_key"]:
-                                    processed_items[item_index]["debug_info_parts"].append(
-                                        f"Fallback key: No result returned (key={fallback_result.get('key')}, response keys: {list(fallback_result.keys())})"
-                                    )
-                            else:
-                                # Log if we have more results than expected
-                                for item in fallback_items:
-                                    item["debug_info_parts"].append(
-                                        f"Warning: Fallback result index {file_idx} exceeds mapping length {len(file_index_to_item_index)}"
-                                    )
-                    else:
-                        # Log non-200 response
-                        error_text = response.text[:200] if hasattr(response, 'text') else str(response.content)[:200]
+                                # Success - record and break
+                                fallback_circuit_breaker.record_success()
+                                break
+                                
+                            except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as e:
+                                last_exception = e
+                                error_type = type(e).__name__
+                                error_msg = str(e) if str(e) else f"{error_type} occurred"
+                                if attempt < FALLBACK_MAX_RETRIES - 1:
+                                    # Wait before retry (exponential backoff)
+                                    retry_delay = FALLBACK_RETRY_DELAY * (2 ** attempt)  # 2s, 4s, 8s
+                                    await asyncio.sleep(retry_delay)
+                                    for item in fallback_items:
+                                        item["debug_info_parts"].append(
+                                            f"Fallback retry attempt {attempt + 2}/{FALLBACK_MAX_RETRIES} (error: {error_type}, timeout: {request_timeout}s)"
+                                        )
+                                else:
+                                    # All retries exhausted
+                                    fallback_circuit_breaker.record_failure()
+                                    for item in fallback_items:
+                                        item["debug_info_parts"].append(
+                                            f"Fallback service: All {FALLBACK_MAX_RETRIES} retries exhausted. Last error: {error_type}: {error_msg[:150]}"
+                                        )
+                                    raise
+                            except Exception as e:
+                                # Non-retryable error
+                                last_exception = e
+                                fallback_circuit_breaker.record_failure()
+                                raise
+                        
+                        fallback_timing["end"] = time.time()
+                        fallback_timing["duration"] = fallback_timing["end"] - fallback_timing["start"]
+                        
+                        # Close file handles after successful request
+                        for fh in file_handles:
+                            try:
+                                fh.close()
+                            except Exception:
+                                pass
+                    
+                    except Exception as e:
+                        # Log error but continue with Essentia results
+                        error_type = type(e).__name__
+                        error_msg = str(e) if str(e) else f"{error_type} occurred"
+                        # Include more context for timeout/connection errors
+                        if isinstance(e, (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError)):
+                            error_msg = f"{error_type}: {error_msg} (fallback service may be unreachable or overloaded)"
+                        error_msg = error_msg[:300]  # Allow slightly longer error messages
                         for item in fallback_items:
-                            item["debug_info_parts"].append(
-                                f"Fallback service error: HTTP {response.status_code} - {error_text}"
+                            processed_items[item["index"]]["debug_info_parts"].append(
+                                f"Fallback service exception: {error_msg}"
                             )
-                except Exception as e:
-                    # Log error but continue with Essentia results
-                    error_msg = str(e)[:200]
-                    for item in fallback_items:
-                        processed_items[item["index"]]["debug_info_parts"].append(
-                            f"Fallback service exception: {error_msg}"
-                        )
-                finally:
-                    # Ensure file handles are closed even if there's an error
-                    for fh in file_handles:
-                        try:
-                            fh.close()
-                        except Exception:
-                            pass
+                        # Ensure file handles are closed even on error
+                        for fh in file_handles:
+                            try:
+                                fh.close()
+                            except Exception:
+                                pass
+                        response = None
+                    
+                    # Process response if we got one
+                    if response is not None:
+                        # Log response status
+                        for item in fallback_items:
+                            item["debug_info_parts"].append(f"Fallback service response: HTTP {response.status_code}")
+                        
+                        if response.status_code == 200:
+                            fallback_results = response.json()
+                            
+                            # Log what we received for debugging
+                            for item in fallback_items:
+                                item["debug_info_parts"].append(f"Fallback results received: {len(fallback_results)} items")
+                            
+                            # Update processed items with fallback results
+                            # Match results by file_index_to_item_index mapping
+                            for file_idx, fallback_result in enumerate(fallback_results):
+                                if file_idx < len(file_index_to_item_index):
+                                    item_idx = file_index_to_item_index[file_idx]
+                                    item = fallback_items[item_idx]
+                                    item_index = item["index"]
+                                    
+                                    # Log the result we're processing
+                                    item["debug_info_parts"].append(
+                                        f"Processing fallback result {file_idx}: bpm_normalized={fallback_result.get('bpm_normalized')}, "
+                                        f"bpm_raw={fallback_result.get('bpm_raw')}, confidence={fallback_result.get('confidence')}"
+                                    )
+                                    
+                                    # Update Librosa BPM fields if fallback was needed and returned
+                                    if item["need_fallback_bpm"] and fallback_result.get("bpm_normalized") is not None:
+                                        processed_items[item_index]["bpm_librosa"] = int(round(fallback_result["bpm_normalized"]))
+                                        processed_items[item_index]["bpm_raw_librosa"] = round(fallback_result["bpm_raw"], 2) if fallback_result.get("bpm_raw") else None
+                                        processed_items[item_index]["bpm_confidence_librosa"] = round(fallback_result["confidence"], 2) if fallback_result.get("confidence") else None
+                                        processed_items[item_index]["debug_info_parts"].append(
+                                            f"Fallback BPM: {round(fallback_result['bpm_normalized'], 1):.1f} (confidence={fallback_result['confidence']:.3f})"
+                                        )
+                                    elif item["need_fallback_bpm"]:
+                                        processed_items[item_index]["debug_info_parts"].append(
+                                            f"Fallback BPM: No result returned (bpm_normalized={fallback_result.get('bpm_normalized')}, response keys: {list(fallback_result.keys())})"
+                                        )
+                                    
+                                    # Update Librosa key fields if fallback was needed and returned
+                                    if item["need_fallback_key"] and fallback_result.get("key") is not None:
+                                        processed_items[item_index]["key_librosa"] = fallback_result["key"]
+                                        processed_items[item_index]["scale_librosa"] = fallback_result["scale"]
+                                        processed_items[item_index]["keyscale_confidence_librosa"] = round(fallback_result["key_confidence"], 2) if fallback_result.get("key_confidence") else None
+                                        processed_items[item_index]["debug_info_parts"].append(
+                                            f"Fallback key: {fallback_result['key']} {fallback_result['scale']} (confidence={fallback_result['key_confidence']:.3f})"
+                                        )
+                                    elif item["need_fallback_key"]:
+                                        processed_items[item_index]["debug_info_parts"].append(
+                                            f"Fallback key: No result returned (key={fallback_result.get('key')}, response keys: {list(fallback_result.keys())})"
+                                        )
+                                else:
+                                    # Log if we have more results than expected
+                                    for item in fallback_items:
+                                        item["debug_info_parts"].append(
+                                            f"Warning: Fallback result index {file_idx} exceeds mapping length {len(file_index_to_item_index)}"
+                                        )
+                        else:
+                            # Log non-200 response
+                            error_text = response.text[:200] if hasattr(response, 'text') else str(response.content)[:200]
+                            for item in fallback_items:
+                                item["debug_info_parts"].append(
+                                    f"Fallback service error: HTTP {response.status_code} - {error_text}"
+                                )
             else:
                 # No files to send
                 for item in fallback_items:
@@ -903,11 +1108,15 @@ async def analyze_batch(request: BatchBPMRequest):
             debug_txt=debug_txt if debug_txt else None,
         ))
         
-        # Cleanup temp file
-        if item["file_path"] and os.path.exists(item["file_path"]):
+        # Cleanup temp file (ensure cleanup even if fallback failed) - async to avoid blocking
+        if item.get("file_path"):
+            loop = asyncio.get_event_loop()
             try:
-                os.unlink(item["file_path"])
+                # Check existence and delete asynchronously
+                file_exists = await loop.run_in_executor(None, os.path.exists, item["file_path"])
+                if file_exists:
+                    await loop.run_in_executor(None, os.unlink, item["file_path"])
             except Exception:
                 pass
-    
+
     return final_responses
