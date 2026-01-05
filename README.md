@@ -14,13 +14,15 @@ A Google Cloud Run microservice that computes BPM (beats per minute) and musical
   - Can call fallback for BPM only, key only, both, or neither
   - **Single batch fallback request** for all low-confidence items
 - **Configurable Confidence Threshold**: `max_confidence` parameter (default 0.65) controls when fallback is triggered
+- **Configurable Debug Output**: `debug_level` parameter (`minimal`, `normal`, `detailed`) controls debug information verbosity
 - **Musical Key Detection**: Multiple Essentia key profile types with automatic selection of best result
 - **Normalized Confidence Scores**: All confidence values normalized to 0-1 range for consistent interpretation
-- **Comprehensive Debug Information**: Detailed debug info including method comparisons, confidence analysis, and error reporting
+- **Comprehensive Debug Information**: Detailed debug info including method comparisons, confidence analysis, error reporting, and telemetry
+- **Telemetry**: Timing information for download, Essentia analysis, and fallback service calls
+- **Separate Results**: Response includes both Essentia and Librosa results separately (Librosa fields are null if not used)
 - **Private Cloud Run Service**: IAM authentication required for access
 - **SSRF Protection**: HTTPS-only requirement with redirect validation
 - **High Concurrency**: Optimized for batch processing with 80 concurrent requests per instance
-- **Complete Response Data**: Returns BPM, raw BPM, BPM confidence, BPM method, debug info, key, scale, and key confidence
 
 ## Architecture
 
@@ -265,6 +267,34 @@ gcloud run services describe ${SERVICE_NAME} \
 
 ## Testing
 
+### Using the Test Script
+
+A test script is provided for easy testing:
+
+```bash
+# Test with default settings (max_confidence=0.65, debug_level=normal)
+./test_api.sh
+
+# Test with custom max_confidence
+./test_api.sh 0.75
+
+# Test with custom max_confidence and debug_level
+./test_api.sh 0.75 detailed
+```
+
+The test script will:
+1. Get an authentication token using `gcloud auth print-identity-token`
+2. Make a batch request to the `/analyze/batch` endpoint
+3. Display the formatted JSON response
+
+**Optional Debug Scripts:**
+
+For debugging purposes, optional test scripts are available:
+- `test_fallback_direct.sh`: Test the fallback service directly (requires manual configuration)
+- `test_fallback_auth.sh`: Test fallback service authentication (requires manual configuration)
+
+These scripts are not required for normal operation, as the primary service handles all fallback calls automatically.
+
 ### Test Health Endpoint
 
 ```bash
@@ -304,7 +334,8 @@ curl -X POST \
         "https://audio-ssl.itunes.apple.com/...",
         "https://audio-ssl.itunes.apple.com/..."
       ],
-      "max_confidence": 0.65
+      "max_confidence": 0.65,
+      "debug_level": "normal"
     }' \
     "${SERVICE_URL}/analyze/batch" | python3 -m json.tool
 ```
@@ -313,24 +344,34 @@ Expected response (array of results, one per URL):
 ```json
 [
   {
-    "bpm": 128,
-    "bpm_raw": 128.0,
-    "bpm_confidence": 0.77,
-    "bpm_method": "multifeature",
-    "debug_info": "Max confidence threshold: 0.65\nURL fetch: SUCCESS (https://audio-ssl.itunes.apple.com/...)\nAudio loaded: 30.0s (capped at 35.0s)\n=== Analysis (Essentia) ===\nBPM=128.0 (normalized=128.0)\nConfidence: raw=4.10 (range: 0-5.32), normalized=0.77 (0-1), quality=excellent\nBPM confidence (0.770) >= threshold (0.65) - using Essentia result\nKey strength (0.859) >= threshold (0.65) - using Essentia result",
-    "key": "C",
-    "scale": "major",
-    "key_confidence": 0.86
+    "bpm_essentia": 128,
+    "bpm_raw_essentia": 128.0,
+    "bpm_confidence_essentia": 0.77,
+    "bpm_librosa": null,
+    "bpm_raw_librosa": null,
+    "bpm_confidence_librosa": null,
+    "key_essentia": "C",
+    "scale_essentia": "major",
+    "keyscale_confidence_essentia": 0.86,
+    "key_librosa": null,
+    "scale_librosa": null,
+    "keyscale_confidence_librosa": null,
+    "debug_txt": "URL fetch: SUCCESS (https://audio-ssl.itunes.apple.com/...)\nMax confidence threshold: 0.65\n=== Analysis (Essentia) ===\nAudio loaded: 30.0s\nBPM=128.0 (normalized=128.0)\nConfidence: raw=4.10 (range: 0-5.32), normalized=0.77 (0-1), quality=excellent\nBPM confidence (0.770) >= threshold (0.65) - using Essentia result\nKey strength (0.859) >= threshold (0.65) - using Essentia result\n=== Telemetry ===\nDownload: 1.23s, Essentia analysis: 2.45s"
   },
   {
-    "bpm": 130,
-    "bpm_raw": 130.0,
-    "bpm_confidence": 0.82,
-    "bpm_method": "librosa_hpss_fallback",
-    "debug_info": "Max confidence threshold: 0.65\nURL fetch: SUCCESS (...)\nAudio loaded: 30.0s (capped at 35.0s)\n=== Analysis (Essentia) ===\nBPM=130.0 (normalized=130.0)\nConfidence: raw=2.50 (range: 0-5.32), normalized=0.47 (0-1), quality=moderate\nBPM confidence (0.470) < threshold (0.65) - fallback needed\n=== Fallback Service Call (BPM) ===\nFallback service: SUCCESS\nFallback BPM: 130.0 (confidence=0.82)",
-    "key": "C",
-    "scale": "major",
-    "key_confidence": 0.86
+    "bpm_essentia": 130,
+    "bpm_raw_essentia": 130.0,
+    "bpm_confidence_essentia": 0.47,
+    "bpm_librosa": 130,
+    "bpm_raw_librosa": 130.0,
+    "bpm_confidence_librosa": 0.82,
+    "key_essentia": "C",
+    "scale_essentia": "major",
+    "keyscale_confidence_essentia": 0.86,
+    "key_librosa": null,
+    "scale_librosa": null,
+    "keyscale_confidence_librosa": null,
+    "debug_txt": "URL fetch: SUCCESS (...)\nMax confidence threshold: 0.65\n=== Analysis (Essentia) ===\nAudio loaded: 30.0s\nBPM=130.0 (normalized=130.0)\nConfidence: raw=2.50 (range: 0-5.32), normalized=0.47 (0-1), quality=moderate\nBPM confidence (0.470) < threshold (0.65) - fallback needed\n=== Fallback Service ===\nFallback needed: BPM=True, Key=False\nAuth token generated: Yes (Bearer token present)\nCalling fallback service: https://bpm-fallback-service-340051416180.europe-west3.run.app/process_batch\nFallback service response: HTTP 200\nFallback results received: 1 items\nProcessing fallback result 0: bpm_normalized=130.0, bpm_raw=130.0, confidence=0.82\nFallback BPM: 130.0 (confidence=0.820)\n=== Telemetry ===\nDownload: 1.15s, Essentia analysis: 2.38s, Fallback service: 3.21s"
   }
 ]
 ```
@@ -376,13 +417,18 @@ Batch process multiple audio URLs: compute BPM and key for each URL concurrently
     "https://audio-ssl.itunes.apple.com/...",
     "https://audio-ssl.itunes.apple.com/..."
   ],
-  "max_confidence": 0.65
+  "max_confidence": 0.65,
+  "debug_level": "normal"
 }
 ```
 
 **Request Parameters:**
 - `urls` (required): Array of HTTPS URLs to audio preview files (minimum 1 URL)
 - `max_confidence` (optional, default: 0.65): Confidence threshold (0.0-1.0) below which the fallback service is called. If Essentia's confidence is above this threshold, the primary service result is used.
+- `debug_level` (optional, default: "normal"): Controls debug output verbosity:
+  - `"minimal"`: Only errors and final results
+  - `"normal"`: All debug info + telemetry summary (default)
+  - `"detailed"`: Full debug info + detailed timing with timestamps
 
 **Response:**
 Array of `BPMResponse` objects, one per input URL (maintains order):
@@ -390,48 +436,69 @@ Array of `BPMResponse` objects, one per input URL (maintains order):
 ```json
 [
   {
-    "bpm": 128,
-    "bpm_raw": 128.0,
-    "bpm_confidence": 0.77,
-    "bpm_method": "multifeature",
-    "debug_info": "Max confidence threshold: 0.65\nURL fetch: SUCCESS (https://audio-ssl.itunes.apple.com/...)\nAudio loaded: 30.0s (capped at 35.0s)\n=== Analysis (Essentia) ===\nBPM=128.0 (normalized=128.0)\nConfidence: raw=4.10 (range: 0-5.32), normalized=0.77 (0-1), quality=excellent\nBPM confidence (0.770) >= threshold (0.65) - using Essentia result\nKey strength (0.859) >= threshold (0.65) - using Essentia result",
-    "key": "C",
-    "scale": "major",
-    "key_confidence": 0.86
+    "bpm_essentia": 128,
+    "bpm_raw_essentia": 128.0,
+    "bpm_confidence_essentia": 0.77,
+    "bpm_librosa": null,
+    "bpm_raw_librosa": null,
+    "bpm_confidence_librosa": null,
+    "key_essentia": "C",
+    "scale_essentia": "major",
+    "keyscale_confidence_essentia": 0.86,
+    "key_librosa": null,
+    "scale_librosa": null,
+    "keyscale_confidence_librosa": null,
+    "debug_txt": "URL fetch: SUCCESS (https://audio-ssl.itunes.apple.com/...)\nMax confidence threshold: 0.65\n=== Analysis (Essentia) ===\nAudio loaded: 30.0s\nBPM=128.0 (normalized=128.0)\nConfidence: raw=4.10 (range: 0-5.32), normalized=0.77 (0-1), quality=excellent\nBPM confidence (0.770) >= threshold (0.65) - using Essentia result\nKey strength (0.859) >= threshold (0.65) - using Essentia result\n=== Telemetry ===\nDownload: 1.23s, Essentia analysis: 2.45s"
   },
   {
-    "bpm": 130,
-    "bpm_raw": 130.0,
-    "bpm_confidence": 0.82,
-    "bpm_method": "librosa_hpss_fallback",
-    "debug_info": "Max confidence threshold: 0.65\nURL fetch: SUCCESS (...)\nAudio loaded: 30.0s (capped at 35.0s)\n=== Analysis (Essentia) ===\nBPM=130.0 (normalized=130.0)\nConfidence: raw=2.50 (range: 0-5.32), normalized=0.47 (0-1), quality=moderate\nBPM confidence (0.470) < threshold (0.65) - fallback needed\n=== Fallback Service Call (BPM) ===\nFallback service: SUCCESS\nFallback BPM: 130.0 (confidence=0.82)",
-    "key": "C",
-    "scale": "major",
-    "key_confidence": 0.86
+    "bpm_essentia": 130,
+    "bpm_raw_essentia": 130.0,
+    "bpm_confidence_essentia": 0.47,
+    "bpm_librosa": 130,
+    "bpm_raw_librosa": 130.0,
+    "bpm_confidence_librosa": 0.82,
+    "key_essentia": "C",
+    "scale_essentia": "major",
+    "keyscale_confidence_essentia": 0.86,
+    "key_librosa": null,
+    "scale_librosa": null,
+    "keyscale_confidence_librosa": null,
+    "debug_txt": "URL fetch: SUCCESS (...)\nMax confidence threshold: 0.65\n=== Analysis (Essentia) ===\nAudio loaded: 30.0s\nBPM=130.0 (normalized=130.0)\nConfidence: raw=2.50 (range: 0-5.32), normalized=0.47 (0-1), quality=moderate\nBPM confidence (0.470) < threshold (0.65) - fallback needed\n=== Fallback Service ===\nFallback needed: BPM=True, Key=False\nAuth token generated: Yes (Bearer token present)\nCalling fallback service: https://bpm-fallback-service-340051416180.europe-west3.run.app/process_batch\nFallback service response: HTTP 200\nFallback results received: 1 items\nProcessing fallback result 0: bpm_normalized=130.0, bpm_raw=130.0, confidence=0.82\nFallback BPM: 130.0 (confidence=0.820)\n=== Telemetry ===\nDownload: 1.15s, Essentia analysis: 2.38s, Fallback service: 3.21s"
   }
 ]
 ```
 
 **Field Descriptions:**
-- `bpm`: Normalized BPM (integer, rounded from normalized value). Only extreme outliers are corrected:
+
+**Essentia BPM Results:**
+- `bpm_essentia`: Normalized BPM from Essentia (integer, rounded). Only extreme outliers are corrected:
   - If raw BPM < 40: multiplied by 2
   - If raw BPM > 220: divided by 2
   - Otherwise: returned unchanged
-- `bpm_raw`: Raw BPM value from Essentia or fallback service (before normalization, rounded to 2 decimal places)
-- `bpm_confidence`: BPM confidence score (0.0-1.0, rounded to 2 decimal places). Normalized from Essentia's raw confidence values (0-5.32 range). Higher value indicates more reliable BPM detection.
-- `bpm_method`: The BPM extraction method used:
-  - `"multifeature"`: Essentia RhythmExtractor2013 with multifeature method (primary service)
-  - `"librosa_hpss_fallback"`: Fallback service was used (confidence was below `max_confidence` threshold)
-- `debug_info`: Comprehensive debug information string including:
-  - Max confidence threshold
-  - URL fetch status
-  - Audio loading status (with duration cap info)
-  - BPM and key analysis details (raw and normalized confidence)
-  - Fallback service status (if triggered)
-  - Error messages (if any)
-- `key`: Detected musical key (e.g., "C", "D", "E", "F", "G", "A", "B")
-- `scale`: Detected scale ("major" or "minor")
-- `key_confidence`: Key detection confidence score (0.0-1.0, rounded to 2 decimal places). Higher value indicates more reliable key detection.
+- `bpm_raw_essentia`: Raw BPM value from Essentia (before normalization, rounded to 2 decimal places)
+- `bpm_confidence_essentia`: BPM confidence score from Essentia (0.0-1.0, rounded to 2 decimal places). Normalized from Essentia's raw confidence values (0-5.32 range). Higher value indicates more reliable BPM detection.
+
+**Librosa BPM Results (null if fallback not used):**
+- `bpm_librosa`: Normalized BPM from Librosa fallback service (integer, rounded, null if not used)
+- `bpm_raw_librosa`: Raw BPM value from Librosa fallback service (rounded to 2 decimal places, null if not used)
+- `bpm_confidence_librosa`: BPM confidence score from Librosa fallback service (0.0-1.0, rounded to 2 decimal places, null if not used)
+
+**Essentia Key Results:**
+- `key_essentia`: Detected musical key from Essentia (e.g., "C", "D", "E", "F", "G", "A", "B")
+- `scale_essentia`: Detected scale from Essentia ("major" or "minor")
+- `keyscale_confidence_essentia`: Key detection confidence score from Essentia (0.0-1.0, rounded to 2 decimal places). Higher value indicates more reliable key detection.
+
+**Librosa Key Results (null if fallback not used):**
+- `key_librosa`: Detected musical key from Librosa fallback service (null if not used)
+- `scale_librosa`: Detected scale from Librosa fallback service (null if not used)
+- `keyscale_confidence_librosa`: Key detection confidence score from Librosa fallback service (0.0-1.0, rounded to 2 decimal places, null if not used)
+
+**Debug Information:**
+- `debug_txt`: Comprehensive debug information string (format depends on `debug_level` parameter):
+  - **minimal**: Only errors and final results
+  - **normal**: All debug info + telemetry summary (download time, Essentia analysis time, fallback service time if used)
+  - **detailed**: Full debug info + detailed timing with timestamps
+  - Includes: URL fetch status, audio loading status, BPM and key analysis details, fallback service status (if triggered), error messages (if any), and telemetry
 
 **Processing Behavior:**
 - URLs are processed **concurrently** using `asyncio.gather()`
@@ -541,6 +608,7 @@ export default async function handler(req, res) {
     body: JSON.stringify({
       urls: req.body.urls, // Array of preview URLs from your frontend
       max_confidence: req.body.max_confidence || 0.65,
+      debug_level: req.body.debug_level || "normal",
     }),
   });
   
@@ -591,7 +659,8 @@ response = requests.post(
     },
     json={
         "urls": preview_urls,  # List of URLs
-        "max_confidence": 0.65
+        "max_confidence": 0.65,
+        "debug_level": "normal"
     }
 )
 

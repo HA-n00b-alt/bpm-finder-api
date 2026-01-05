@@ -1,10 +1,12 @@
 #!/bin/bash
 
 # Test script for BPM Finder API (Batch Processing)
-# Usage: ./test_api.sh [max_confidence]
+# Usage: ./test_api.sh [max_confidence] [debug_level]
+# debug_level: minimal, normal (default), detailed
 
 SERVICE_URL="https://bpm-service-340051416180.europe-west3.run.app"
 MAX_CONFIDENCE="${1:-0.65}"
+DEBUG_LEVEL="${2:-normal}"
 
 # Test URLs
 TEST_URLS=(
@@ -16,6 +18,7 @@ TEST_URLS=(
 echo "Testing BPM Finder API (Batch Processing)..."
 echo "Service: $SERVICE_URL"
 echo "Max Confidence Threshold: $MAX_CONFIDENCE"
+echo "Debug Level: $DEBUG_LEVEL"
 echo "Number of URLs: ${#TEST_URLS[@]}"
 echo ""
 
@@ -36,7 +39,7 @@ for i in "${!TEST_URLS[@]}"; do
     fi
     JSON_PAYLOAD+="\"${TEST_URLS[$i]}\""
 done
-JSON_PAYLOAD+="], \"max_confidence\": $MAX_CONFIDENCE}"
+JSON_PAYLOAD+="], \"max_confidence\": $MAX_CONFIDENCE, \"debug_level\": \"$DEBUG_LEVEL\"}"
 
 # Make the API request
 echo "Making batch API request..."

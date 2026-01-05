@@ -257,15 +257,27 @@ async def process_batch(
     # Get form data
     form = await request.form()
     
-    # Extract audio files - FastAPI handles multiple files with same name as a list
+    # Extract audio files - FastAPI handles multiple files with same name
+    # Use multi_items() to get all items including duplicates
     audio_files = []
-    form_items = list(form.items())
+    form_items = list(form.multi_items())
+    
+    # Debug: log what we received
+    print(f"DEBUG: Form multi_items count: {len(form_items)}")
     for key, value in form_items:
         if key == "audio_files":
-            if isinstance(value, list):
+            print(f"DEBUG: Found audio_files, type: {type(value)}")
+            # value should be an UploadFile object
+            if hasattr(value, 'read'):  # It's an UploadFile
+                audio_files.append(value)
+            elif isinstance(value, list):
                 audio_files.extend(value)
             else:
                 audio_files.append(value)
+        else:
+            print(f"DEBUG: Form key: {key}, type: {type(value)}")
+    
+    print(f"DEBUG: Total audio_files extracted: {len(audio_files)}")
     
     # Extract processing flags
     process_flags = {}

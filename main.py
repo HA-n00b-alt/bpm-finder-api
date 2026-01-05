@@ -6,6 +6,7 @@ import os
 import tempfile
 import asyncio
 import io
+import time
 from typing import Optional, Tuple, List
 from urllib.parse import urlparse
 import httpx
@@ -50,6 +51,7 @@ FALLBACK_SERVICE_AUDIENCE = FALLBACK_SERVICE_URL
 class BatchBPMRequest(BaseModel):
     urls: List[HttpUrl]
     max_confidence: Optional[float] = 0.65
+    debug_level: Optional[str] = "normal"  # "minimal", "normal", "detailed"
 
     @field_validator("urls")
     @classmethod
@@ -70,17 +72,39 @@ class BatchBPMRequest(BaseModel):
         if v is not None and (v < 0.0 or v > 1.0):
             raise ValueError("max_confidence must be between 0.0 and 1.0")
         return v
+    
+    @field_validator("debug_level")
+    @classmethod
+    def validate_debug_level(cls, v):
+        """Validate debug_level is a valid option."""
+        if v not in ["minimal", "normal", "detailed"]:
+            raise ValueError("debug_level must be one of: minimal, normal, detailed")
+        return v
 
 
 class BPMResponse(BaseModel):
-    bpm: int
-    bpm_raw: float
-    bpm_confidence: float
-    bpm_method: str
-    debug_info: Optional[str] = None
-    key: str
-    scale: str
-    key_confidence: float
+    # Essentia BPM results
+    bpm_essentia: Optional[int] = None
+    bpm_raw_essentia: Optional[float] = None
+    bpm_confidence_essentia: Optional[float] = None
+    
+    # Librosa BPM results (null if not used)
+    bpm_librosa: Optional[int] = None
+    bpm_raw_librosa: Optional[float] = None
+    bpm_confidence_librosa: Optional[float] = None
+    
+    # Essentia key results
+    key_essentia: Optional[str] = None
+    scale_essentia: Optional[str] = None
+    keyscale_confidence_essentia: Optional[float] = None
+    
+    # Librosa key results (null if not used)
+    key_librosa: Optional[str] = None
+    scale_librosa: Optional[str] = None
+    keyscale_confidence_librosa: Optional[float] = None
+    
+    # Debug information
+    debug_txt: Optional[str] = None
 
 
 def validate_redirect_url(url: str) -> bool:
@@ -410,14 +434,27 @@ async def process_single_url(
     input_path = None
     debug_info_parts = []
     
+    # Timing telemetry
+    timing = {
+        "download_start": None,
+        "download_end": None,
+        "download_duration": None,
+        "essentia_start": None,
+        "essentia_end": None,
+        "essentia_duration": None,
+    }
+    
     try:
         # Create temp file
         input_fd, input_path = tempfile.mkstemp(suffix=input_ext, dir="/tmp")
         os.close(input_fd)  # Close file descriptor, we'll write via path
         
-        # Download audio (async streaming)
+        # Download audio (async streaming) with timing
         try:
+            timing["download_start"] = time.time()
             await download_audio_async(url_str, input_path)
+            timing["download_end"] = time.time()
+            timing["download_duration"] = timing["download_end"] - timing["download_start"]
             debug_info_parts.append(f"URL fetch: SUCCESS ({url_str[:50]}...)")
         except Exception as e:
             error_msg = f"URL fetch error: {str(e)}"
@@ -426,46 +463,64 @@ async def process_single_url(
                 "index": index,
                 "url": url_str,
                 "file_path": None,
-                "bpm_normalized": 0.0,
-                "bpm_raw": 0.0,
-                "bpm_confidence_normalized": 0.0,
-                "bpm_method": "error",
-                "key": "unknown",
-                "scale": "unknown",
-                "key_confidence_normalized": 0.0,
+                "bpm_essentia": None,
+                "bpm_raw_essentia": None,
+                "bpm_confidence_essentia": None,
+                "bpm_librosa": None,
+                "bpm_raw_librosa": None,
+                "bpm_confidence_librosa": None,
+                "key_essentia": "unknown",
+                "scale_essentia": "unknown",
+                "keyscale_confidence_essentia": 0.0,
+                "key_librosa": None,
+                "scale_librosa": None,
+                "keyscale_confidence_librosa": None,
                 "need_fallback_bpm": True,
                 "need_fallback_key": True,
                 "debug_info_parts": debug_info_parts,
+                "timing": timing,
             }
         
-        # Analyze audio (BPM + key from same loaded array)
+        # Analyze audio (BPM + key from same loaded array) with timing
+        timing["essentia_start"] = time.time()
         (
             bpm_normalized, bpm_raw, bpm_confidence_normalized, bpm_quality, bpm_method,
             key, scale, key_strength_raw, key_confidence_normalized,
             need_fallback_bpm, need_fallback_key,
             analysis_debug
         ) = analyze_audio(input_path, max_confidence)
+        timing["essentia_end"] = time.time()
+        timing["essentia_duration"] = timing["essentia_end"] - timing["essentia_start"]
         
         debug_info_parts.append(f"Max confidence threshold: {max_confidence:.2f}")
         debug_info_parts.append("=== Analysis (Essentia) ===")
         debug_info_parts.append(analysis_debug)
         
         # Store for potential fallback batch call
-        # Return result with fallback flags
+        # Return result with fallback flags and separate Essentia/Librosa fields
         return index, {
             "index": index,
             "url": url_str,
             "file_path": input_path,  # Keep file for batch fallback if needed
-            "bpm_normalized": bpm_normalized,
-            "bpm_raw": bpm_raw,
-            "bpm_confidence_normalized": bpm_confidence_normalized,
-            "bpm_method": bpm_method,
-            "key": key,
-            "scale": scale,
-            "key_confidence_normalized": key_confidence_normalized,
+            # Essentia results
+            "bpm_essentia": int(round(bpm_normalized)) if bpm_normalized is not None else None,
+            "bpm_raw_essentia": round(bpm_raw, 2) if bpm_raw is not None else None,
+            "bpm_confidence_essentia": round(bpm_confidence_normalized, 2) if bpm_confidence_normalized is not None else None,
+            "key_essentia": key if key else "unknown",
+            "scale_essentia": scale if scale else "unknown",
+            "keyscale_confidence_essentia": round(key_confidence_normalized, 2) if key_confidence_normalized is not None else 0.0,
+            # Librosa results (will be populated by fallback if needed)
+            "bpm_librosa": None,
+            "bpm_raw_librosa": None,
+            "bpm_confidence_librosa": None,
+            "key_librosa": None,
+            "scale_librosa": None,
+            "keyscale_confidence_librosa": None,
+            # Fallback flags
             "need_fallback_bpm": need_fallback_bpm,
             "need_fallback_key": need_fallback_key,
             "debug_info_parts": debug_info_parts,
+            "timing": timing,
         }
     
     except Exception as e:
@@ -475,16 +530,22 @@ async def process_single_url(
             "index": index,
             "url": url_str,
             "file_path": None,
-            "bpm_normalized": 0.0,
-            "bpm_raw": 0.0,
-            "bpm_confidence_normalized": 0.0,
-            "bpm_method": "error",
-            "key": "unknown",
-            "scale": "unknown",
-            "key_confidence_normalized": 0.0,
+            "bpm_essentia": None,
+            "bpm_raw_essentia": None,
+            "bpm_confidence_essentia": None,
+            "bpm_librosa": None,
+            "bpm_raw_librosa": None,
+            "bpm_confidence_librosa": None,
+            "key_essentia": "unknown",
+            "scale_essentia": "unknown",
+            "keyscale_confidence_essentia": 0.0,
+            "key_librosa": None,
+            "scale_librosa": None,
+            "keyscale_confidence_librosa": None,
             "need_fallback_bpm": True,
             "need_fallback_key": True,
             "debug_info_parts": debug_info_parts,
+            "timing": timing,
         }
     
     finally:
@@ -547,6 +608,57 @@ async def health():
     return {"ok": True}
 
 
+def generate_debug_output(debug_info_parts: List[str], timing: dict, fallback_timing: Optional[dict], debug_level: str) -> str:
+    """Generate debug output based on debug_level.
+    
+    Args:
+        debug_info_parts: List of debug message strings
+        timing: Dict with download and essentia timing
+        fallback_timing: Optional dict with fallback service timing
+        debug_level: "minimal", "normal", or "detailed"
+    
+    Returns:
+        Formatted debug string
+    """
+    if debug_level == "minimal":
+        # Only errors and final results
+        filtered = [line for line in debug_info_parts if "error" in line.lower() or "SUCCESS" in line or "Fallback" in line]
+        if filtered:
+            return "\n".join(filtered)
+        return ""
+    
+    elif debug_level == "normal":
+        # Include telemetry summary
+        output = "\n".join(debug_info_parts)
+        telemetry = []
+        if timing.get("download_duration"):
+            telemetry.append(f"Download: {timing['download_duration']:.2f}s")
+        if timing.get("essentia_duration"):
+            telemetry.append(f"Essentia analysis: {timing['essentia_duration']:.2f}s")
+        if fallback_timing and fallback_timing.get("duration"):
+            telemetry.append(f"Fallback service: {fallback_timing['duration']:.2f}s")
+        if telemetry:
+            output += f"\n=== Telemetry ===\n" + ", ".join(telemetry)
+        return output
+    
+    else:  # detailed
+        # Full output with all timing details
+        output = "\n".join(debug_info_parts)
+        telemetry = []
+        if timing.get("download_start") and timing.get("download_end"):
+            telemetry.append(f"Download: {timing['download_duration']:.3f}s (start: {timing['download_start']:.3f}, end: {timing['download_end']:.3f})")
+        if timing.get("essentia_start") and timing.get("essentia_end"):
+            telemetry.append(f"Essentia analysis: {timing['essentia_duration']:.3f}s (start: {timing['essentia_start']:.3f}, end: {timing['essentia_end']:.3f})")
+        if fallback_timing:
+            if fallback_timing.get("start") and fallback_timing.get("end"):
+                telemetry.append(f"Fallback service: {fallback_timing['duration']:.3f}s (start: {fallback_timing['start']:.3f}, end: {fallback_timing['end']:.3f})")
+            elif fallback_timing.get("duration"):
+                telemetry.append(f"Fallback service: {fallback_timing['duration']:.3f}s")
+        if telemetry:
+            output += f"\n=== Telemetry ===\n" + "\n".join(telemetry)
+        return output
+
+
 @app.post("/analyze/batch", response_model=List[BPMResponse])
 async def analyze_batch(request: BatchBPMRequest):
     """Batch process multiple audio URLs: compute BPM and key for each.
@@ -555,6 +667,7 @@ async def analyze_batch(request: BatchBPMRequest):
     service for items that need it.
     """
     max_confidence = request.max_confidence if request.max_confidence is not None else 0.65
+    debug_level = request.debug_level if request.debug_level else "normal"
     
     # Process all URLs concurrently
     tasks = [
@@ -572,6 +685,13 @@ async def analyze_batch(request: BatchBPMRequest):
         item for item in processed_items
         if item["need_fallback_bpm"] or item["need_fallback_key"]
     ]
+    
+    # Track fallback service timing
+    fallback_timing = {
+        "start": None,
+        "end": None,
+        "duration": None,
+    }
     
     # Single batch request to fallback service if needed
     if fallback_items:
@@ -615,6 +735,8 @@ async def analyze_batch(request: BatchBPMRequest):
                     file_handles.append(file_handle)
                     file_idx = len(files)  # Index in files array
                     file_index_to_item_index.append(i)  # Map to fallback_items index
+                    # httpx requires each file to have a unique tuple entry
+                    # Multiple files with same field name are sent as separate entries
                     files.append(
                         ("audio_files", (f"audio_{file_idx}.tmp", file_handle, "audio/mpeg"))
                     )
@@ -631,6 +753,11 @@ async def analyze_batch(request: BatchBPMRequest):
                     for item in fallback_items:
                         item["debug_info_parts"].append(f"Calling fallback service: {FALLBACK_SERVICE_URL}/process_batch")
                     
+                    # Log what we're sending
+                    for item in fallback_items:
+                        item["debug_info_parts"].append(f"Sending {len(files)} files to fallback service")
+                    
+                    fallback_timing["start"] = time.time()
                     async with httpx.AsyncClient(timeout=120.0) as client:
                         response = await client.post(
                             f"{FALLBACK_SERVICE_URL}/process_batch",
@@ -638,6 +765,8 @@ async def analyze_batch(request: BatchBPMRequest):
                             data=data,
                             headers=auth_headers
                         )
+                    fallback_timing["end"] = time.time()
+                    fallback_timing["duration"] = fallback_timing["end"] - fallback_timing["start"]
                         
                         # Close file handles
                         for fh in file_handles:
@@ -653,6 +782,10 @@ async def analyze_batch(request: BatchBPMRequest):
                         if response.status_code == 200:
                             fallback_results = response.json()
                             
+                            # Log what we received for debugging
+                            for item in fallback_items:
+                                item["debug_info_parts"].append(f"Fallback results received: {len(fallback_results)} items")
+                            
                             # Update processed items with fallback results
                             # Match results by file_index_to_item_index mapping
                             for file_idx, fallback_result in enumerate(fallback_results):
@@ -661,31 +794,42 @@ async def analyze_batch(request: BatchBPMRequest):
                                     item = fallback_items[item_idx]
                                     item_index = item["index"]
                                     
-                                    # Update BPM if fallback was needed and returned
+                                    # Log the result we're processing
+                                    item["debug_info_parts"].append(
+                                        f"Processing fallback result {file_idx}: bpm_normalized={fallback_result.get('bpm_normalized')}, "
+                                        f"bpm_raw={fallback_result.get('bpm_raw')}, confidence={fallback_result.get('confidence')}"
+                                    )
+                                    
+                                    # Update Librosa BPM fields if fallback was needed and returned
                                     if item["need_fallback_bpm"] and fallback_result.get("bpm_normalized") is not None:
-                                        processed_items[item_index]["bpm_normalized"] = fallback_result["bpm_normalized"]
-                                        processed_items[item_index]["bpm_raw"] = fallback_result["bpm_raw"]
-                                        processed_items[item_index]["bpm_confidence_normalized"] = fallback_result["confidence"]
-                                        processed_items[item_index]["bpm_method"] = "librosa_hpss_fallback"
+                                        processed_items[item_index]["bpm_librosa"] = int(round(fallback_result["bpm_normalized"]))
+                                        processed_items[item_index]["bpm_raw_librosa"] = round(fallback_result["bpm_raw"], 2) if fallback_result.get("bpm_raw") else None
+                                        processed_items[item_index]["bpm_confidence_librosa"] = round(fallback_result["confidence"], 2) if fallback_result.get("confidence") else None
                                         processed_items[item_index]["debug_info_parts"].append(
                                             f"Fallback BPM: {fallback_result['bpm_normalized']:.1f} (confidence={fallback_result['confidence']:.3f})"
                                         )
                                     elif item["need_fallback_bpm"]:
                                         processed_items[item_index]["debug_info_parts"].append(
-                                            f"Fallback BPM: No result returned (response: {fallback_result})"
+                                            f"Fallback BPM: No result returned (bpm_normalized={fallback_result.get('bpm_normalized')}, response keys: {list(fallback_result.keys())})"
                                         )
                                     
-                                    # Update key if fallback was needed and returned
+                                    # Update Librosa key fields if fallback was needed and returned
                                     if item["need_fallback_key"] and fallback_result.get("key") is not None:
-                                        processed_items[item_index]["key"] = fallback_result["key"]
-                                        processed_items[item_index]["scale"] = fallback_result["scale"]
-                                        processed_items[item_index]["key_confidence_normalized"] = fallback_result["key_confidence"]
+                                        processed_items[item_index]["key_librosa"] = fallback_result["key"]
+                                        processed_items[item_index]["scale_librosa"] = fallback_result["scale"]
+                                        processed_items[item_index]["keyscale_confidence_librosa"] = round(fallback_result["key_confidence"], 2) if fallback_result.get("key_confidence") else None
                                         processed_items[item_index]["debug_info_parts"].append(
                                             f"Fallback key: {fallback_result['key']} {fallback_result['scale']} (confidence={fallback_result['key_confidence']:.3f})"
                                         )
                                     elif item["need_fallback_key"]:
                                         processed_items[item_index]["debug_info_parts"].append(
-                                            f"Fallback key: No result returned (response: {fallback_result})"
+                                            f"Fallback key: No result returned (key={fallback_result.get('key')}, response keys: {list(fallback_result.keys())})"
+                                        )
+                                else:
+                                    # Log if we have more results than expected
+                                    for item in fallback_items:
+                                        item["debug_info_parts"].append(
+                                            f"Warning: Fallback result index {file_idx} exceeds mapping length {len(file_index_to_item_index)}"
                                         )
                         else:
                             # Log non-200 response
@@ -723,20 +867,40 @@ async def analyze_batch(request: BatchBPMRequest):
     # Build final responses and cleanup
     final_responses = []
     for item in processed_items:
-        # Ensure valid values
-        bpm_normalized = item["bpm_normalized"] if item["bpm_normalized"] is not None else 0.0
-        bpm_raw = item["bpm_raw"] if item["bpm_raw"] is not None else 0.0
-        bpm_confidence = item["bpm_confidence_normalized"] if item["bpm_confidence_normalized"] is not None else 0.0
+        # Use fallback timing if this item used fallback, otherwise None
+        item_fallback_timing = fallback_timing if (item.get("need_fallback_bpm") or item.get("need_fallback_key")) and fallback_timing.get("duration") else None
+        
+        # Generate debug output based on debug_level
+        debug_txt = generate_debug_output(
+            item.get("debug_info_parts", []),
+            item.get("timing", {}),
+            item_fallback_timing,
+            debug_level
+        )
         
         final_responses.append(BPMResponse(
-            bpm=int(round(bpm_normalized)),
-            bpm_raw=round(bpm_raw, 2),
-            bpm_confidence=round(bpm_confidence, 2),
-            bpm_method=item["bpm_method"],
-            debug_info="\n".join(item["debug_info_parts"]),
-            key=item["key"],
-            scale=item["scale"],
-            key_confidence=round(item["key_confidence_normalized"], 2),
+            # Essentia BPM results
+            bpm_essentia=item.get("bpm_essentia"),
+            bpm_raw_essentia=item.get("bpm_raw_essentia"),
+            bpm_confidence_essentia=item.get("bpm_confidence_essentia"),
+            
+            # Librosa BPM results
+            bpm_librosa=item.get("bpm_librosa"),
+            bpm_raw_librosa=item.get("bpm_raw_librosa"),
+            bpm_confidence_librosa=item.get("bpm_confidence_librosa"),
+            
+            # Essentia key results
+            key_essentia=item.get("key_essentia"),
+            scale_essentia=item.get("scale_essentia"),
+            keyscale_confidence_essentia=item.get("keyscale_confidence_essentia"),
+            
+            # Librosa key results
+            key_librosa=item.get("key_librosa"),
+            scale_librosa=item.get("scale_librosa"),
+            keyscale_confidence_librosa=item.get("keyscale_confidence_librosa"),
+            
+            # Debug information
+            debug_txt=debug_txt if debug_txt else None,
         ))
         
         # Cleanup temp file
