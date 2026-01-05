@@ -9,6 +9,7 @@ import io
 import time
 from typing import Optional, Tuple, List
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor
 import httpx
 import aiofiles
 from fastapi import FastAPI, HTTPException
@@ -94,6 +95,31 @@ fallback_circuit_breaker = FallbackCircuitBreaker()
 # Global HTTPX client with connection pooling for reuse across requests
 _http_client: Optional[httpx.AsyncClient] = None
 
+# ThreadPoolExecutor for CPU-bound Essentia analysis (prevents event loop blocking)
+_essentia_executor: Optional[ThreadPoolExecutor] = None
+_essentia_semaphore: Optional[asyncio.Semaphore] = None
+
+def get_essentia_executor() -> ThreadPoolExecutor:
+    """Get or create the global ThreadPoolExecutor for Essentia analysis."""
+    global _essentia_executor
+    if _essentia_executor is None:
+        # Use env var or default to CPU count
+        max_workers = int(os.getenv("ESSENTIA_MAX_CONCURRENCY", max(1, os.cpu_count() or 1)))
+        _essentia_executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="essentia")
+    return _essentia_executor
+
+def get_essentia_semaphore() -> asyncio.Semaphore:
+    """Get or create the global semaphore for Essentia analysis concurrency control."""
+    global _essentia_semaphore
+    if _essentia_semaphore is None:
+        # Use same limit as executor
+        max_concurrent = int(os.getenv("ESSENTIA_MAX_CONCURRENCY", max(1, os.cpu_count() or 1)))
+        _essentia_semaphore = asyncio.Semaphore(max_concurrent)
+    return _essentia_semaphore
+
+# Per-request URL concurrency limit for batch processing
+BATCH_URL_CONCURRENCY = int(os.getenv("BATCH_URL_CONCURRENCY", "10"))
+
 def get_http_client() -> httpx.AsyncClient:
     """Get or create the global HTTPX AsyncClient with connection pooling."""
     global _http_client
@@ -157,11 +183,14 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Cleanup HTTP client on shutdown."""
-    global _http_client
+    """Cleanup HTTP client and executor on shutdown."""
+    global _http_client, _essentia_executor
     if _http_client is not None:
         await _http_client.aclose()
         _http_client = None
+    if _essentia_executor is not None:
+        _essentia_executor.shutdown(wait=True)
+        _essentia_executor = None
 
 
 class BatchBPMRequest(BaseModel):
@@ -177,8 +206,8 @@ class BatchBPMRequest(BaseModel):
             raise ValueError("urls list cannot be empty")
         for url in v:
             url_str = str(url)
-        if not url_str.startswith("https://"):
-            raise ValueError("Only HTTPS URLs are allowed")
+            if not url_str.startswith("https://"):
+                raise ValueError("Only HTTPS URLs are allowed")
         return v
     
     @field_validator("max_confidence")
@@ -247,11 +276,15 @@ async def download_audio_async(url: str, output_path: str) -> None:
     
     # Follow redirects manually, validating each one
     while redirect_count < max_redirects:
+        # httpx streams by default when using aiter_bytes() - no stream parameter needed
         response = await client.get(current_url, timeout=timeout)
         
         # If redirect, validate and follow
         if response.status_code in (301, 302, 303, 307, 308):
             redirect_url = response.headers.get("location")
+            # Close redirect response (we don't need the body, only headers)
+            await response.aclose()
+            
             if not redirect_url:
                 raise HTTPException(
                     status_code=400,
@@ -279,6 +312,8 @@ async def download_audio_async(url: str, output_path: str) -> None:
         
         # If not a redirect, we have the final response
         if response.status_code != 200:
+            # Close response before raising error (we don't need the body)
+            await response.aclose()
             raise HTTPException(
                 status_code=response.status_code,
                 detail=f"Download failed: HTTP {response.status_code}"
@@ -583,6 +618,17 @@ async def process_single_url(
             timing["download_duration"] = timing["download_end"] - timing["download_start"]
             debug_info_parts.append(f"URL fetch: SUCCESS ({url_str[:50]}...)")
         except Exception as e:
+            # Clean up temp file on download failure
+            if input_path:
+                try:
+                    loop = asyncio.get_event_loop()
+                    file_exists = await loop.run_in_executor(None, os.path.exists, input_path)
+                    if file_exists:
+                        await loop.run_in_executor(None, os.unlink, input_path)
+                except Exception:
+                    pass  # Ignore cleanup errors
+                input_path = None
+            
             error_msg = f"URL fetch error: {str(e)}"
             debug_info_parts.append(error_msg)
             return index, {
@@ -608,13 +654,24 @@ async def process_single_url(
             }
         
         # Analyze audio (BPM + key from same loaded array) with timing
+        # Offload CPU-bound Essentia analysis to thread pool to prevent event loop blocking
         timing["essentia_start"] = time.time()
-        (
-            bpm_normalized, bpm_raw, bpm_confidence_normalized, bpm_quality, bpm_method,
-            key, scale, key_strength_raw, key_confidence_normalized,
-            need_fallback_bpm, need_fallback_key,
-            analysis_debug
-        ) = analyze_audio(input_path, max_confidence)
+        essentia_executor = get_essentia_executor()
+        essentia_sem = get_essentia_semaphore()
+        loop = asyncio.get_event_loop()
+        
+        async with essentia_sem:
+            (
+                bpm_normalized, bpm_raw, bpm_confidence_normalized, bpm_quality, bpm_method,
+                key, scale, key_strength_raw, key_confidence_normalized,
+                need_fallback_bpm, need_fallback_key,
+                analysis_debug
+            ) = await loop.run_in_executor(
+                essentia_executor,
+                analyze_audio,
+                input_path,
+                max_confidence
+            )
         timing["essentia_end"] = time.time()
         timing["essentia_duration"] = timing["essentia_end"] - timing["essentia_start"]
         
@@ -791,15 +848,23 @@ def generate_debug_output(debug_info_parts: List[str], timing: dict, fallback_ti
 async def analyze_batch(request: BatchBPMRequest):
     """Batch process multiple audio URLs: compute BPM and key for each.
     
-    Processes URLs concurrently, then sends a single batch request to fallback
+    Processes URLs concurrently (with concurrency limit), then sends a single batch request to fallback
     service for items that need it.
     """
     max_confidence = request.max_confidence if request.max_confidence is not None else 0.65
     debug_level = request.debug_level if request.debug_level else "normal"
     
-    # Process all URLs concurrently
+    # Semaphore to limit per-request URL concurrency
+    batch_semaphore = asyncio.Semaphore(BATCH_URL_CONCURRENCY)
+    
+    async def process_with_limit(url, max_conf, index):
+        """Wrapper to apply concurrency limit to process_single_url."""
+        async with batch_semaphore:
+            return await process_single_url(url, max_conf, index)
+    
+    # Process all URLs concurrently with concurrency limit
     tasks = [
-        process_single_url(url, max_confidence, i)
+        process_with_limit(url, max_confidence, i)
         for i, url in enumerate(request.urls)
     ]
     results = await asyncio.gather(*tasks)
