@@ -107,6 +107,7 @@ if ! gcloud run deploy "${SERVICE_NAME}" \
     --cpu 2 \
     --timeout 120s \
     --max-instances 10 \
+    --cpu-boost \
     --project "${PROJECT_ID}"; then
     echo ""
     echo "❌ Error: Cloud Run deployment failed. You may need additional permissions."

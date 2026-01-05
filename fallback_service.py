@@ -8,10 +8,13 @@ import tempfile
 from typing import Optional, Tuple
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel
-import librosa
 import numpy as np
 
 app = FastAPI(title="BPM Fallback Service")
+
+# Import librosa at module level (required for Cloud Run startup)
+# This ensures the import happens during container startup
+import librosa
 
 
 class FallbackResponse(BaseModel):
@@ -99,8 +102,8 @@ def extract_key_from_chroma(chroma: np.ndarray) -> Tuple[str, str, float]:
 
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
-    return {"ok": True}
+    """Health check endpoint for Cloud Run startup probe."""
+    return {"ok": True, "service": "bpm-fallback-service"}
 
 
 @app.post("/bpm", response_model=FallbackResponse)

@@ -1,11 +1,14 @@
 # Use Python base image for librosa
 FROM python:3.11-slim
 
-# Install system dependencies for librosa (libsndfile1 for WAV file reading)
+# Install system dependencies for librosa
+# - libsndfile1: for WAV file reading
+# - libgomp1: GNU OpenMP runtime library required by Numba (librosa dependency)
 # Note: ffmpeg not needed since primary service sends clean WAV files
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     libsndfile1 \
+    libgomp1 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -31,6 +34,7 @@ USER appuser
 # Expose port 8080 (Cloud Run requirement)
 EXPOSE 8080
 
-# Run uvicorn
-CMD ["uvicorn", "fallback_service:app", "--host", "0.0.0.0", "--port", "8080"]
+# Run uvicorn with PORT from environment variable (Cloud Run provides this)
+# Default to 8080 if PORT is not set
+CMD uvicorn fallback_service:app --host 0.0.0.0 --port ${PORT:-8080}
 
