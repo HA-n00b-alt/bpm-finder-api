@@ -96,6 +96,7 @@ fi
 rm -rf "${TEMP_DIR}"
 
 # Deploy to Cloud Run (without public access)
+# Low concurrency for CPU-heavy librosa processing, CPU boost for startup
 echo "🚢 Deploying to Cloud Run..."
 if ! gcloud run deploy "${SERVICE_NAME}" \
     --image "${IMAGE_TAG}" \
@@ -105,8 +106,9 @@ if ! gcloud run deploy "${SERVICE_NAME}" \
     --port 8080 \
     --memory 4Gi \
     --cpu 2 \
-    --timeout 120s \
+    --timeout 300s \
     --max-instances 10 \
+    --concurrency 2 \
     --cpu-boost \
     --project "${PROJECT_ID}"; then
     echo ""

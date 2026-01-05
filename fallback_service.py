@@ -1,19 +1,17 @@
 """
 BPM Fallback Service - Google Cloud Run microservice
 High-accuracy, high-cost fallback service for low-confidence primary service results.
-Accepts pre-processed WAV audio files directly via file upload.
+Accepts pre-processed audio files directly via file upload (batch processing).
 """
-import os
-import tempfile
-from typing import Optional, Tuple, Literal
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from pydantic import BaseModel, Field
+import io
+from typing import Optional, Tuple, List
+from fastapi import FastAPI, UploadFile, HTTPException, Request
+from pydantic import BaseModel
 import numpy as np
 
 app = FastAPI(title="BPM Fallback Service")
 
 # Import librosa at module level (required for Cloud Run startup)
-# This ensures the import happens during container startup
 import librosa
 
 
@@ -60,7 +58,7 @@ def normalize_bpm(bpm: float) -> float:
 def extract_key_from_chroma(chroma: np.ndarray) -> Tuple[str, str, float]:
     """Extract musical key from chroma features using Krumhansl-Schmuckler algorithm.
     
-    Implements complete template matching with all 12 transpositions of Major and Minor templates.
+    Improved version: uses chroma_cqt for better stability, drops low-energy frames.
     
     Args:
         chroma: Chroma features array (12 x time frames)
@@ -76,8 +74,16 @@ def extract_key_from_chroma(chroma: np.ndarray) -> Tuple[str, str, float]:
     major_template = major_template / major_template.sum()
     minor_template = minor_template / minor_template.sum()
     
-    # Average chroma across time to get 12-element profile
-    chroma_profile = np.mean(chroma, axis=1)
+    # Average chroma across time, but drop low-energy frames for stability
+    chroma_energy = np.sum(chroma, axis=0)
+    energy_threshold = np.percentile(chroma_energy, 25)  # Keep top 75% of frames
+    valid_frames = chroma_energy >= energy_threshold
+    
+    if np.any(valid_frames):
+        chroma_profile = np.mean(chroma[:, valid_frames], axis=1)
+    else:
+        chroma_profile = np.mean(chroma, axis=1)
+    
     chroma_profile = chroma_profile / (chroma_profile.sum() + 1e-10)  # Normalize
     
     # Calculate correlation with all 12 transpositions of Major and Minor templates
@@ -110,138 +116,175 @@ def extract_key_from_chroma(chroma: np.ndarray) -> Tuple[str, str, float]:
     return best_key, best_scale, confidence
 
 
+def process_single_audio(
+    audio_content: bytes,
+    process_bpm: bool,
+    process_key: bool
+) -> FallbackResponse:
+    """Process a single audio file from memory.
+    
+    Args:
+        audio_content: Audio file content as bytes
+        process_bpm: Whether to process BPM
+        process_key: Whether to process key
+    
+    Returns:
+        FallbackResponse with requested fields populated
+    """
+    # Initialize response values
+    bpm_normalized = None
+    bpm_raw = None
+    confidence = None
+    key = None
+    scale = None
+    key_confidence = None
+    
+    # Load audio from memory using BytesIO
+    audio_io = io.BytesIO(audio_content)
+    try:
+        audio, sr = librosa.load(audio_io, sr=44100, mono=True)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Audio loading failed: {str(e)[:200]}"
+        )
+    
+    # Only perform HPSS if we need either BPM or key
+    if process_bpm or process_key:
+        # Perform Harmonic-Percussive Source Separation
+        harmonic, percussive = librosa.effects.hpss(audio)
+    else:
+        # Should not happen (validated at endpoint), but return empty
+        return FallbackResponse()
+    
+    # BPM Extraction (Percussive component) - only if requested
+    if process_bpm:
+        try:
+            tempo, beats = librosa.beat.beat_track(y=percussive, sr=sr)
+            bpm_raw = float(tempo)
+            bpm_normalized = normalize_bpm(bpm_raw)
+            
+            # Calculate confidence based on beat tracking quality
+            # Use the consistency of detected beats as confidence indicator
+            if len(beats) > 0:
+                # Calculate confidence from beat consistency
+                beat_intervals = np.diff(beats)
+                if len(beat_intervals) > 1:
+                    # Lower variance in beat intervals = higher confidence
+                    interval_std = np.std(beat_intervals)
+                    interval_mean = np.mean(beat_intervals)
+                    if interval_mean > 0:
+                        cv = interval_std / interval_mean  # Coefficient of variation
+                        # Apply cap to prevent over-reporting confidence
+                        confidence = min(0.85, max(0.0, 1.0 - cv * 2))
+                    else:
+                        confidence = 0.5
+                else:
+                    confidence = 0.5
+            else:
+                confidence = 0.0
+        except Exception as e:
+            # If BPM processing fails and it was requested, raise error
+            raise HTTPException(
+                status_code=500,
+                detail=f"BPM processing failed: {str(e)[:200]}"
+            )
+    
+    # Key Extraction (Harmonic component) - only if requested
+    if process_key:
+        try:
+            # Use chroma_cqt for better stability (more robust to timbre variations)
+            chroma = librosa.feature.chroma_cqt(y=harmonic, sr=sr)
+            key, scale, key_confidence = extract_key_from_chroma(chroma)
+        except Exception as e:
+            # If key processing fails and it was requested, raise error
+            raise HTTPException(
+                status_code=500,
+                detail=f"Key processing failed: {str(e)[:200]}"
+            )
+    
+    return FallbackResponse(
+        bpm_normalized=bpm_normalized,
+        bpm_raw=round(bpm_raw, 2) if bpm_raw is not None else None,
+        confidence=round(confidence, 2) if confidence is not None else None,
+        key=key,
+        scale=scale,
+        key_confidence=round(key_confidence, 2) if key_confidence is not None else None,
+    )
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint for Cloud Run startup probe."""
     return {"ok": True, "service": "bpm-fallback-service"}
 
 
-@app.post("/bpm", response_model=FallbackResponse)
-async def process_bpm(
-    audio_file: UploadFile = File(...),
-    url: Optional[str] = Form(None),
-    process_bpm: bool = Form(True),
-    process_key: bool = Form(True)
+@app.post("/process_batch", response_model=List[FallbackResponse])
+async def process_batch(
+    request: Request
 ):
-    """Process BPM and/or key from uploaded WAV audio file using high-accuracy librosa methods.
+    """Batch process multiple audio files from memory.
     
-    Args:
-        audio_file: Uploaded WAV audio file (mono, 44100Hz)
-        url: Optional original URL for logging/debug purposes
-        process_bpm: Whether to process BPM (default: True)
-        process_key: Whether to process key (default: True)
+    Accepts multipart form data with:
+    - audio_files: List of uploaded audio files (multiple files with same name)
+    - process_bpm_{i}: Whether to process BPM for file i (as string "true"/"false")
+    - process_key_{i}: Whether to process key for file i (as string "true"/"false")
+    - url_{i}: Optional URL for file i
     
     Returns:
-        FallbackResponse with BPM and/or key analysis (only requested fields populated)
+        List of FallbackResponse, one per input file
     """
-    # Validate that at least one processing option is requested
-    if not process_bpm and not process_key:
-        raise HTTPException(
-            status_code=400,
-            detail="At least one of process_bpm or process_key must be True"
-        )
+    # Get form data
+    form = await request.form()
     
-    temp_path = None
+    # Extract audio files - FastAPI handles multiple files with same name as a list
+    audio_files = []
+    form_items = list(form.items())
+    for key, value in form_items:
+        if key == "audio_files":
+            if isinstance(value, list):
+                audio_files.extend(value)
+            else:
+                audio_files.append(value)
     
-    try:
-        # Read and save file with robust file handling
-        content = await audio_file.read()
-        
-        # Create temporary file with proper context management
-        temp_fd, temp_path = tempfile.mkstemp(suffix='.wav', dir='/tmp')
+    # Extract processing flags
+    process_flags = {}
+    for key, value in form.items():
+        if key.startswith("process_bpm_"):
+            idx = int(key.split("_")[-1])
+            process_flags.setdefault(idx, {})["bpm"] = value.lower() == "true"
+        elif key.startswith("process_key_"):
+            idx = int(key.split("_")[-1])
+            process_flags.setdefault(idx, {})["key"] = value.lower() == "true"
+    
+    results = []
+    
+    # Process sequentially (librosa is CPU-heavy, limit concurrency)
+    for i, audio_file in enumerate(audio_files):
         try:
-            with os.fdopen(temp_fd, 'wb') as f:
-                f.write(content)
-                f.flush()  # Ensure data is written to disk
-                os.fsync(f.fileno())  # Force write to disk
+            # Read file content into memory
+            content = await audio_file.read()
+            
+            # Get processing flags for this file (default to True if not provided)
+            flags = process_flags.get(i, {})
+            process_bpm = flags.get("bpm", True)
+            process_key = flags.get("key", True)
+            
+            # Validate that at least one processing option is requested
+            if not process_bpm and not process_key:
+                results.append(FallbackResponse())  # Return empty response
+                continue
+            
+            # Process audio
+            result = process_single_audio(content, process_bpm, process_key)
+            results.append(result)
+            
+        except HTTPException:
+            # Re-raise HTTP exceptions
+            raise
         except Exception as e:
-            # Clean up on write error
-            try:
-                os.unlink(temp_path)
-            except Exception:
-                pass
-            raise HTTPException(status_code=500, detail=f"File write failed: {str(e)}")
-        
-        # Load audio with librosa (guaranteed to be mono, 44100Hz WAV)
-        audio, sr = librosa.load(temp_path, sr=44100, mono=True)
-        
-        # Initialize response values
-        bpm_normalized = None
-        bpm_raw = None
-        confidence = None
-        key = None
-        scale = None
-        key_confidence = None
-        
-        # Perform Harmonic-Percussive Source Separation
-        # We always need HPSS if either BPM or key is requested (already validated above)
-        harmonic, percussive = librosa.effects.hpss(audio)
-        
-        # BPM Extraction (Percussive component) - only if requested
-        if process_bpm:
-            try:
-                tempo, beats = librosa.beat.beat_track(y=percussive, sr=sr)
-                bpm_raw = float(tempo)
-                bpm_normalized = normalize_bpm(bpm_raw)
-                
-                # Calculate confidence based on beat tracking quality
-                # Use the consistency of detected beats as confidence indicator
-                if len(beats) > 0:
-                    # Calculate confidence from beat consistency
-                    beat_intervals = np.diff(beats)
-                    if len(beat_intervals) > 1:
-                        # Lower variance in beat intervals = higher confidence
-                        interval_std = np.std(beat_intervals)
-                        interval_mean = np.mean(beat_intervals)
-                        if interval_mean > 0:
-                            cv = interval_std / interval_mean  # Coefficient of variation
-                            # Apply cap to prevent over-reporting confidence
-                            confidence = min(0.85, max(0.0, 1.0 - cv * 2))
-                        else:
-                            confidence = 0.5
-                    else:
-                        confidence = 0.5
-                else:
-                    confidence = 0.0
-            except Exception as e:
-                # If BPM processing fails and it was requested, raise error
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"BPM processing failed: {str(e)[:200]}"
-                )
-        
-        # Key Extraction (Harmonic component) - only if requested
-        if process_key:
-            try:
-                chroma = librosa.feature.chroma_stft(y=harmonic, sr=sr)
-                key, scale, key_confidence = extract_key_from_chroma(chroma)
-            except Exception as e:
-                # If key processing fails and it was requested, raise error
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Key processing failed: {str(e)[:200]}"
-                )
-        
-        return FallbackResponse(
-            bpm_normalized=bpm_normalized,
-            bpm_raw=round(bpm_raw, 2) if bpm_raw is not None else None,
-            confidence=round(confidence, 2) if confidence is not None else None,
-            key=key,
-            scale=scale,
-            key_confidence=round(key_confidence, 2) if key_confidence is not None else None,
-        )
+            # Per-item error handling: return empty response for failed items
+            results.append(FallbackResponse())
+            continue
     
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Processing failed: {str(e)[:200]}"
-        )
-    
-    finally:
-        # Cleanup temporary file
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.unlink(temp_path)
-            except Exception:
-                pass  # Ignore cleanup errors
-
+    return results

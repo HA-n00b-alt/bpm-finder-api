@@ -1,21 +1,25 @@
 # BPM Finder API
 
-A Google Cloud Run microservice that computes BPM (beats per minute) and musical key from 30-second audio preview URLs. The service is deployed as a **private** Cloud Run service, requiring Google Cloud IAM authentication.
+A Google Cloud Run microservice that computes BPM (beats per minute) and musical key from audio preview URLs. **Batch processing enabled** for efficient analysis of multiple URLs concurrently. The service is deployed as a **private** Cloud Run service, requiring Google Cloud IAM authentication.
 
 ## Features
 
+- **Batch Processing**: Process multiple audio URLs concurrently in a single request
 - **Single-Method BPM Extraction**: Uses Essentia's `RhythmExtractor2013(method="multifeature")` for BPM detection
+- **Direct Compressed Audio Analysis**: Essentia handles MP3/AAC decoding directly (no ffmpeg conversion step)
+- **Duration Capping**: Analyzes first 35 seconds only for latency/cost optimization
 - **Selective Fallback Architecture**: Automatically uses a high-accuracy fallback service (librosa-based) only when needed:
   - BPM fallback: Triggered when BPM confidence < `max_confidence` threshold
   - Key fallback: Triggered when key strength < `max_confidence` threshold
   - Can call fallback for BPM only, key only, both, or neither
+  - **Single batch fallback request** for all low-confidence items
 - **Configurable Confidence Threshold**: `max_confidence` parameter (default 0.65) controls when fallback is triggered
 - **Musical Key Detection**: Multiple Essentia key profile types with automatic selection of best result
 - **Normalized Confidence Scores**: All confidence values normalized to 0-1 range for consistent interpretation
 - **Comprehensive Debug Information**: Detailed debug info including method comparisons, confidence analysis, and error reporting
 - **Private Cloud Run Service**: IAM authentication required for access
 - **SSRF Protection**: HTTPS-only requirement with redirect validation
-- **Fast Processing**: Essentia and ffmpeg for efficient audio processing
+- **High Concurrency**: Optimized for batch processing with 80 concurrent requests per instance
 - **Complete Response Data**: Returns BPM, raw BPM, BPM confidence, BPM method, debug info, key, scale, and key confidence
 
 ## Architecture
@@ -23,24 +27,38 @@ A Google Cloud Run microservice that computes BPM (beats per minute) and musical
 ### Primary Service (`bpm-service`)
 
 - **Runtime**: Python 3 + FastAPI + Uvicorn
-- **Audio Processing**: Essentia (RhythmExtractor2013 for BPM, KeyExtractor for key detection) + ffmpeg
+- **Audio Processing**: Essentia (RhythmExtractor2013 for BPM, KeyExtractor for key detection)
+  - Direct MP3/AAC decoding (no ffmpeg conversion step)
+  - Analyzes first 35 seconds only
 - **BPM Method**: Single method:
   - `multifeature`: RhythmExtractor2013 with multifeature method (confidence range: 0-5.32)
-- **Container**: MTG Essentia base image (`ghcr.io/mtg/essentia:latest`)
+- **Container**: MTG Essentia base image (`ghcr.io/mtg/essentia:latest`) with ffmpeg for codec support
 - **Deployment**: Google Cloud Run
+  - **High Concurrency**: 80 concurrent requests per instance (optimized for batch processing)
+  - **Resources**: 2GB RAM, 2 CPU
+  - **Timeout**: 300 seconds (for large batch requests)
+  - **Max Instances**: 10 (auto-scaling)
 - **Authentication**: Cloud Run IAM (Identity Tokens)
 - **Fallback Integration**: Selectively calls fallback service based on `max_confidence` threshold (default 0.65)
+  - Single batch request for all low-confidence items
 
 ### Fallback Service (`bpm-fallback-service`)
 
 - **Runtime**: Python 3 + FastAPI + Uvicorn
 - **Audio Processing**: Librosa (HPSS, beat tracking, chroma features)
+  - Processes audio from memory (BytesIO) - no disk I/O
+  - Direct MP3/AAC decoding from memory
 - **BPM Method**: Harmonic-Percussive Source Separation (HPSS) with percussive component beat tracking
-- **Key Method**: Krumhansl-Schmuckler algorithm on harmonic component chroma features
-- **Container**: Python 3.11-slim with librosa, numpy, scipy
-- **Deployment**: Google Cloud Run (higher resources: 4GB RAM, 2 CPU, CPU boost)
+- **Key Method**: Krumhansl-Schmuckler algorithm on harmonic component (improved with chroma_cqt and low-energy frame dropping)
+- **Container**: Python 3.11-slim with librosa, numpy, scipy, ffmpeg
+- **Deployment**: Google Cloud Run
+  - **Low Concurrency**: 2 concurrent requests per instance (librosa is CPU-heavy)
+  - **Higher Resources**: 4GB RAM, 2 CPU, CPU boost enabled
+  - **Timeout**: 300 seconds (for batch processing)
+  - **Max Instances**: 10 (auto-scaling)
 - **Authentication**: Cloud Run IAM (service-to-service authentication)
 - **Use Case**: High-accuracy, high-cost fallback for low-confidence primary results
+- **Batch Processing**: Accepts multiple files in a single request, processes sequentially
 
 ## Prerequisites
 
@@ -265,63 +283,56 @@ Expected response:
 {"ok": true}
 ```
 
-### Test BPM Endpoint
+### Test Batch Analysis Endpoint
 
-**Option 1: Using the test script**
-
-A convenient test script is provided:
-
-```bash
-# Test with default URL
-./test_api.sh
-
-# Test with custom URL
-./test_api.sh "https://audio-ssl.itunes.apple.com/..."
-```
-
-**Option 2: Manual curl command**
+**Batch Processing Example**
 
 ```bash
 # Get identity token
 TOKEN=$(gcloud auth print-identity-token)
 
-# Replace with your actual service URL and a valid preview URL
+# Replace with your actual service URL
 SERVICE_URL="https://your-service-url.run.app"
-PREVIEW_URL="https://audio-ssl.itunes.apple.com/..."
 
+# Batch process multiple URLs
 curl -X POST \
     -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d "{\"url\": \"${PREVIEW_URL}\", \"max_confidence\": 0.65}" \
-    "${SERVICE_URL}/bpm" | python3 -m json.tool
+    -d '{
+      "urls": [
+        "https://audio-ssl.itunes.apple.com/...",
+        "https://audio-ssl.itunes.apple.com/...",
+        "https://audio-ssl.itunes.apple.com/..."
+      ],
+      "max_confidence": 0.65
+    }' \
+    "${SERVICE_URL}/analyze/batch" | python3 -m json.tool
 ```
 
-Expected response:
+Expected response (array of results, one per URL):
 ```json
-{
-  "bpm": 128,
-  "bpm_raw": 128.0,
-  "bpm_confidence": 0.77,
-  "bpm_method": "multifeature",
-  "debug_info": "Max confidence threshold: 0.65\nURL fetch: SUCCESS (https://audio-ssl.itunes.apple.com/...)\nAudio conversion: SUCCESS\n=== BPM Analysis (Essentia) ===\nBPM=128.0 (normalized=128.0)\nConfidence: raw=4.10 (range: 0-5.32), normalized=0.77 (0-1), quality=excellent\nBPM confidence (0.770) >= threshold (0.65) - using Essentia result\n=== Key Analysis (Essentia) ===\nkey_profile=temperley: key=C major, strength=0.859\nWinner: temperley profile (strength=0.859, normalized=0.859)\nKey strength (0.859) >= threshold (0.65) - using Essentia result",
-  "key": "C",
-  "scale": "major",
-  "key_confidence": 0.86
-}
-```
-
-**Example with fallback triggered:**
-```json
-{
-  "bpm": 130,
-  "bpm_raw": 130.0,
-  "bpm_confidence": 0.82,
-  "bpm_method": "librosa_hpss_fallback",
-  "debug_info": "Max confidence threshold: 0.65\nURL fetch: SUCCESS (...)\nAudio conversion: SUCCESS\n=== BPM Analysis (Essentia) ===\nBPM=130.0 (normalized=130.0)\nConfidence: raw=2.50 (range: 0-5.32), normalized=0.47 (0-1), quality=moderate\nBPM confidence (0.470) < threshold (0.65) - fallback needed\n=== Key Analysis (Essentia) ===\nkey_profile=temperley: key=C major, strength=0.859\nWinner: temperley profile (strength=0.859, normalized=0.859)\nKey strength (0.859) >= threshold (0.65) - using Essentia result\n=== Fallback Service Call (BPM) ===\nFallback service: SUCCESS\nFallback BPM: 130.0 (confidence=0.82)",
-  "key": "C",
-  "scale": "major",
-  "key_confidence": 0.86
-}
+[
+  {
+    "bpm": 128,
+    "bpm_raw": 128.0,
+    "bpm_confidence": 0.77,
+    "bpm_method": "multifeature",
+    "debug_info": "Max confidence threshold: 0.65\nURL fetch: SUCCESS (https://audio-ssl.itunes.apple.com/...)\nAudio loaded: 30.0s (capped at 35.0s)\n=== Analysis (Essentia) ===\nBPM=128.0 (normalized=128.0)\nConfidence: raw=4.10 (range: 0-5.32), normalized=0.77 (0-1), quality=excellent\nBPM confidence (0.770) >= threshold (0.65) - using Essentia result\nKey strength (0.859) >= threshold (0.65) - using Essentia result",
+    "key": "C",
+    "scale": "major",
+    "key_confidence": 0.86
+  },
+  {
+    "bpm": 130,
+    "bpm_raw": 130.0,
+    "bpm_confidence": 0.82,
+    "bpm_method": "librosa_hpss_fallback",
+    "debug_info": "Max confidence threshold: 0.65\nURL fetch: SUCCESS (...)\nAudio loaded: 30.0s (capped at 35.0s)\n=== Analysis (Essentia) ===\nBPM=130.0 (normalized=130.0)\nConfidence: raw=2.50 (range: 0-5.32), normalized=0.47 (0-1), quality=moderate\nBPM confidence (0.470) < threshold (0.65) - fallback needed\n=== Fallback Service Call (BPM) ===\nFallback service: SUCCESS\nFallback BPM: 130.0 (confidence=0.82)",
+    "key": "C",
+    "scale": "major",
+    "key_confidence": 0.86
+  }
+]
 ```
 
 ### Test with Service Account
@@ -353,34 +364,52 @@ Health check endpoint.
 {"ok": true}
 ```
 
-### `POST /bpm`
+### `POST /analyze/batch`
 
-Compute BPM and key from audio preview URL.
+Batch process multiple audio URLs: compute BPM and key for each URL concurrently.
 
 **Request Body:**
 ```json
 {
-  "url": "https://audio-ssl.itunes.apple.com/...",
+  "urls": [
+    "https://audio-ssl.itunes.apple.com/...",
+    "https://audio-ssl.itunes.apple.com/...",
+    "https://audio-ssl.itunes.apple.com/..."
+  ],
   "max_confidence": 0.65
 }
 ```
 
 **Request Parameters:**
-- `url` (required): HTTPS URL to the audio preview file
+- `urls` (required): Array of HTTPS URLs to audio preview files (minimum 1 URL)
 - `max_confidence` (optional, default: 0.65): Confidence threshold (0.0-1.0) below which the fallback service is called. If Essentia's confidence is above this threshold, the primary service result is used.
 
 **Response:**
+Array of `BPMResponse` objects, one per input URL (maintains order):
+
 ```json
-{
-  "bpm": 128,
-  "bpm_raw": 64.0,
-  "bpm_confidence": 0.73,
-  "bpm_method": "multifeature",
-  "debug_info": "URL fetch: SUCCESS (https://audio-ssl.itunes.apple.com/...)\nAudio conversion: SUCCESS\n=== BPM Analysis ===\nmultifeature: BPM=128.0 (norm=128.0), confidence=2.319 (norm=0.77)\ndegara: BPM=128.0 (norm=128.0), confidence=0.000 (norm=0.00)\nonset: BPM=128.0 (norm=128.0), confidence=1.500 (norm=0.50)\nEnsemble: avg_confidence=0.42, range=[0.00, 0.77]\nWinner: multifeature (confidence=0.77)\n=== Key Analysis ===\nkey_profile=temperley: key=C major, strength=0.859\nWinner: temperley profile (strength=0.859)",
-  "key": "C",
-  "scale": "major",
-  "key_confidence": 0.86
-}
+[
+  {
+    "bpm": 128,
+    "bpm_raw": 128.0,
+    "bpm_confidence": 0.77,
+    "bpm_method": "multifeature",
+    "debug_info": "Max confidence threshold: 0.65\nURL fetch: SUCCESS (https://audio-ssl.itunes.apple.com/...)\nAudio loaded: 30.0s (capped at 35.0s)\n=== Analysis (Essentia) ===\nBPM=128.0 (normalized=128.0)\nConfidence: raw=4.10 (range: 0-5.32), normalized=0.77 (0-1), quality=excellent\nBPM confidence (0.770) >= threshold (0.65) - using Essentia result\nKey strength (0.859) >= threshold (0.65) - using Essentia result",
+    "key": "C",
+    "scale": "major",
+    "key_confidence": 0.86
+  },
+  {
+    "bpm": 130,
+    "bpm_raw": 130.0,
+    "bpm_confidence": 0.82,
+    "bpm_method": "librosa_hpss_fallback",
+    "debug_info": "Max confidence threshold: 0.65\nURL fetch: SUCCESS (...)\nAudio loaded: 30.0s (capped at 35.0s)\n=== Analysis (Essentia) ===\nBPM=130.0 (normalized=130.0)\nConfidence: raw=2.50 (range: 0-5.32), normalized=0.47 (0-1), quality=moderate\nBPM confidence (0.470) < threshold (0.65) - fallback needed\n=== Fallback Service Call (BPM) ===\nFallback service: SUCCESS\nFallback BPM: 130.0 (confidence=0.82)",
+    "key": "C",
+    "scale": "major",
+    "key_confidence": 0.86
+  }
+]
 ```
 
 **Field Descriptions:**
@@ -394,19 +423,66 @@ Compute BPM and key from audio preview URL.
   - `"multifeature"`: Essentia RhythmExtractor2013 with multifeature method (primary service)
   - `"librosa_hpss_fallback"`: Fallback service was used (confidence was below `max_confidence` threshold)
 - `debug_info`: Comprehensive debug information string including:
+  - Max confidence threshold
   - URL fetch status
-  - Audio conversion status
-  - BPM analysis details (all three methods with raw and normalized confidence)
-  - Key analysis details (all profile types tested)
+  - Audio loading status (with duration cap info)
+  - BPM and key analysis details (raw and normalized confidence)
   - Fallback service status (if triggered)
   - Error messages (if any)
 - `key`: Detected musical key (e.g., "C", "D", "E", "F", "G", "A", "B")
 - `scale`: Detected scale ("major" or "minor")
 - `key_confidence`: Key detection confidence score (0.0-1.0, rounded to 2 decimal places). Higher value indicates more reliable key detection.
 
+**Processing Behavior:**
+- URLs are processed **concurrently** using `asyncio.gather()`
+- Audio is analyzed for **first 35 seconds only** (latency/cost optimization)
+- Low-confidence items are collected and sent in a **single batch request** to fallback service
+- Response array maintains the same order as input URLs
+
+**Performance Recommendations:**
+- **Recommended max batch size: 20 songs** for optimal performance and reliability
+- **For batches over 20 songs**: Consider switching from a single synchronous request to an asynchronous pattern:
+  - Call a job-creation endpoint (if available) to submit the batch
+  - Receive a Job ID
+  - Poll a separate results endpoint to retrieve results when ready
+  - This pattern removes the hard timeout limit imposed by the HTTP connection (currently 300 seconds)
+  - Allows processing of very large batches without connection timeouts
+- **Current synchronous batch endpoint**: Best suited for batches of 20 songs or fewer to avoid HTTP timeout issues
+
 **Error Responses:**
-- `400`: Invalid URL, non-HTTPS URL, file too large, or redirect to non-HTTPS URL
-- `500`: Processing error (download, conversion, BPM computation, or key detection failed)
+- `400`: Invalid URL, non-HTTPS URL, file too large, redirect to non-HTTPS URL, or empty URLs array
+- `500`: Processing error (download, analysis, or fallback service failed)
+- `504`: Gateway timeout (may occur with very large batches exceeding 300 seconds)
+
+## Batch Processing Best Practices
+
+### Recommended Batch Sizes
+
+- **Optimal batch size: ≤20 songs** for synchronous requests
+  - Provides best balance of performance and reliability
+  - Stays well within the 300-second HTTP timeout limit
+  - Allows for efficient concurrent processing
+
+### Large Batch Processing (20+ songs)
+
+For batches **over 20 songs**, consider using an **asynchronous job pattern** instead of a single synchronous request:
+
+**Why use async pattern for large batches:**
+- Removes the hard timeout limit imposed by HTTP connections (currently 300 seconds)
+- Allows processing of very large batches (100+ songs) without connection timeouts
+- Better error handling and retry capabilities
+- More efficient resource utilization
+
+**Recommended async pattern:**
+1. **Job Creation**: Call a job-creation endpoint (if available) to submit the batch
+   - Returns a Job ID immediately
+   - Job is queued for processing
+2. **Polling**: Poll a separate results endpoint using the Job ID
+   - Check job status periodically (e.g., every 5-10 seconds)
+   - Retrieve results when processing is complete
+3. **Error Handling**: Handle job failures and retries appropriately
+
+**Note**: The current `/analyze/batch` endpoint is synchronous and best suited for batches of 20 songs or fewer. For larger batches, an async job pattern is recommended to avoid HTTP timeout issues.
 
 ## SSRF Protection
 
@@ -455,15 +531,16 @@ export default async function handler(req, res) {
   const client = await auth.getIdTokenClient(cloudRunUrl);
   const idToken = await client.idTokenProvider.fetchIdToken(cloudRunUrl);
   
-  // Call Cloud Run service
-  const response = await fetch(`${cloudRunUrl}/bpm`, {
+  // Call Cloud Run service (batch endpoint)
+  const response = await fetch(`${cloudRunUrl}/analyze/batch`, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${idToken}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      url: req.body.url, // Preview URL from your frontend
+      urls: req.body.urls, // Array of preview URLs from your frontend
+      max_confidence: req.body.max_confidence || 0.65,
     }),
   });
   
@@ -505,17 +582,20 @@ credentials = service_account.Credentials.from_service_account_info(
 request = Request()
 id_token_obj = id_token.fetch_id_token(request, cloud_run_url)
 
-# Call Cloud Run service
+# Call Cloud Run service (batch endpoint)
 response = requests.post(
-    f"{cloud_run_url}/bpm",
+    f"{cloud_run_url}/analyze/batch",
     headers={
         "Authorization": f"Bearer {id_token_obj}",
         "Content-Type": "application/json",
     },
-    json={"url": preview_url}
+    json={
+        "urls": preview_urls,  # List of URLs
+        "max_confidence": 0.65
+    }
 )
 
-data = response.json()
+data = response.json()  # Returns list of BPMResponse objects
 ```
 
 ### Example: Other Platforms
@@ -563,48 +643,73 @@ curl http://localhost:8080/health
 
 ## Processing Pipeline
 
-### Primary Service Flow
+### Primary Service Flow (Batch Processing)
 
-1. **Download**: Fetch audio from preview URL (with SSRF protection)
-2. **Convert**: Use ffmpeg to convert to mono 44100Hz 16-bit PCM WAV
-3. **BPM Analysis**:
-   - Use `RhythmExtractor2013(method="multifeature")` to extract BPM and confidence
-   - Confidence range: 0-5.32 (raw), normalized to 0-1
-   - Quality levels:
-     - [0, 1): very low confidence
-     - [1, 2): low confidence
-     - [2, 3): moderate confidence
-     - [3, 3.5): high confidence
-     - (3.5, 5.32]: excellent confidence
-   - Check if normalized confidence >= `max_confidence` threshold
-4. **Key Analysis**: Use Essentia `KeyExtractor` with multiple profile types (temperley, krumhansl, edma, edmm) and select best result
-   - Check if normalized strength >= `max_confidence` threshold
-5. **Selective Fallback Decision**:
-   - If BPM confidence < `max_confidence`: Note need for BPM fallback
-   - If key strength < `max_confidence`: Note need for key fallback
-   - Call fallback service for BPM only, key only, both, or neither
-6. **Fallback Service Call** (if needed):
-   - Upload WAV file to fallback service
-   - Receive high-accuracy results from librosa-based processing
-   - Overwrite only the results that needed fallback (BPM, key, or both)
-7. **Normalize BPM**: Adjust for extreme outliers only:
+1. **Concurrent Download**: Fetch all audio URLs concurrently using `asyncio.gather()`:
+   - Stream downloads directly to disk with **non-blocking I/O** (using `asyncio.to_thread` for file writes)
+   - This allows the event loop to handle other requests while writing chunks to disk
+   - SSRF protection: HTTPS-only, redirect validation
+   - Max file size: 10MB per file
+
+2. **Concurrent Analysis**: Process all downloaded files concurrently:
+   - **Direct Essentia Analysis**: Load compressed audio (MP3/AAC) directly with Essentia
+     - No ffmpeg conversion step (Essentia handles decoding)
+     - Duration cap: Analyze first 35 seconds only (`endTime=35.0`)
+   - **Single Audio Load**: Load audio once, compute both BPM and key from same array
+   - **BPM Analysis**:
+     - Use `RhythmExtractor2013(method="multifeature")` to extract BPM and confidence
+     - Confidence range: 0-5.32 (raw), normalized to 0-1
+     - Quality levels:
+       - [0, 1): very low confidence
+       - [1, 2): low confidence
+       - [2, 3): moderate confidence
+       - [3, 3.5): high confidence
+       - (3.5, 5.32]: excellent confidence
+     - Check if normalized confidence >= `max_confidence` threshold
+   - **Key Analysis**: Use Essentia `KeyExtractor` with multiple profile types (temperley, krumhansl, edma, edmm) and select best result
+     - Check if normalized strength >= `max_confidence` threshold
+
+3. **Collect Low-Confidence Items**: After all primary analyses complete:
+   - Identify items where BPM confidence < `max_confidence` and/or key strength < `max_confidence`
+   - Collect only these items for fallback processing
+
+4. **Single Batch Fallback Request** (if any items need fallback):
+   - Send one batch request to fallback service with all low-confidence items
+   - Stream file handles directly (not reading full files into RAM)
+   - Include processing flags (BPM only, key only, or both) for each item
+   - Uses multipart form data with file streaming for efficient memory usage
+
+5. **Update Results**: Overwrite only the results that needed fallback (BPM, key, or both)
+
+6. **Normalize BPM**: Adjust for extreme outliers only:
    - If BPM < 40: multiply by 2
    - If BPM > 220: divide by 2
    - Otherwise: return unchanged
-8. **Cleanup**: Delete temporary files
-9. **Return**: JSON response with BPM and key data
 
-### Fallback Service Flow (when triggered)
+7. **Cleanup**: Delete temporary files
 
-1. **Receive**: WAV file upload from primary service
-2. **Load**: Load audio with librosa (44100Hz, mono)
-3. **HPSS**: Apply Harmonic-Percussive Source Separation:
-   - **Percussive component**: Used for BPM detection
-   - **Harmonic component**: Used for key detection
-4. **BPM Extraction**: Use `librosa.beat.beat_track()` on percussive component
-5. **Key Extraction**: Use `librosa.feature.chroma_stft()` on harmonic component + Krumhansl-Schmuckler algorithm
-6. **Confidence Calculation**: Calculate BPM confidence from beat consistency (capped at 0.85)
-7. **Return**: High-accuracy results to primary service
+8. **Return**: Array of JSON responses (one per input URL, maintains order)
+
+### Fallback Service Flow (Batch Processing)
+
+1. **Receive**: Batch request with multiple audio files (multipart upload)
+
+2. **Process Sequentially** (librosa is CPU-heavy, limited concurrency):
+   - For each file:
+     - **Load from Memory**: Read file content into memory, use `BytesIO` for librosa
+     - **Direct Decoding**: librosa decodes MP3/AAC directly from memory (no disk I/O)
+     - **HPSS**: Apply Harmonic-Percussive Source Separation:
+       - **Percussive component**: Used for BPM detection (if requested)
+       - **Harmonic component**: Used for key detection (if requested)
+     - **BPM Extraction** (if `process_bpm=True`):
+       - Use `librosa.beat.beat_track()` on percussive component
+       - Calculate confidence from beat consistency (capped at 0.85)
+     - **Key Extraction** (if `process_key=True`):
+       - Use `librosa.feature.chroma_cqt()` on harmonic component (improved stability)
+       - Apply Krumhansl-Schmuckler algorithm with low-energy frame dropping
+     - **Per-Item Error Handling**: If one file fails, return empty response for that item, continue with others
+
+3. **Return**: Array of `FallbackResponse` objects (one per input file, maintains order)
 
 ## Algorithms and Confidence Ranges
 
@@ -628,7 +733,7 @@ curl http://localhost:8080/health
 - **librosa.beat.beat_track()**: No built-in confidence. Custom confidence calculated from beat consistency (coefficient of variation), capped at 0.85.
 
 **Key Detection:**
-- **librosa.feature.chroma_stft() + Krumhansl-Schmuckler**: Correlation values (-1 to 1) normalized to 0-1 using `(corr + 1) / 2`.
+- **librosa.feature.chroma_cqt() + Krumhansl-Schmuckler**: Uses chroma_cqt for improved stability, drops low-energy frames, then applies Krumhansl-Schmuckler template matching. Correlation values (-1 to 1) normalized to 0-1 using `(corr + 1) / 2`.
 
 ## Confidence Normalization
 
@@ -638,7 +743,7 @@ The service normalizes confidence values from different algorithms to a consiste
   - Quality levels are determined from raw confidence before normalization
 - **Essentia KeyExtractor**: Strength values (typically 0-1 range), used as-is if already 0-1, otherwise clamped to [0, 1]
 - **Librosa beat_track**: Custom confidence calculation from beat consistency (already 0-1, capped at 0.85)
-- **Krumhansl-Schmuckler**: Correlation values (-1 to 1) normalized to 0-1 using `(corr + 1) / 2`
+- **Krumhansl-Schmuckler**: Uses chroma_cqt for improved stability, drops low-energy frames, then correlates with key templates. Correlation values (-1 to 1) normalized to 0-1 using `(corr + 1) / 2`
 
 ## Security Notes
 
@@ -674,13 +779,13 @@ Ensure the URL:
 - Starts with `https://`
 - Is a valid, accessible URL
 
-### ffmpeg conversion errors
+### Audio format errors
 
-Ensure the audio file is a valid format. The service supports common audio formats (MP3, M4A, etc.) that ffmpeg can handle.
+The service supports common audio formats (MP3, M4A, AAC, etc.) that Essentia can decode directly. No ffmpeg conversion step is required - Essentia handles decoding natively.
 
 ### High memory usage
 
-The primary service is configured with 2GB memory. For very large files or high concurrency, consider increasing:
+The primary service is configured with 2GB memory and high concurrency (80) for batch processing. For very large batches, consider increasing:
 
 ```bash
 PROJECT_ID="your-project-id"
@@ -690,19 +795,31 @@ SERVICE_NAME="bpm-service"
 gcloud run services update ${SERVICE_NAME} \
     --region=${REGION} \
     --memory 4Gi \
+    --concurrency 80 \
+    --timeout 300s \
     --project=${PROJECT_ID}
 ```
 
-The fallback service is already configured with 4GB memory and 2 CPU cores for high-accuracy processing.
+The fallback service is already configured with 4GB memory, 2 CPU cores, and low concurrency (2) for CPU-heavy librosa processing.
+
+### Batch processing performance
+
+For optimal batch processing performance:
+
+- **Primary Service**: High concurrency (80) allows processing many URLs concurrently
+- **Fallback Service**: Low concurrency (2) prevents CPU overload from librosa
+- **Timeout**: Both services use 300s timeout to handle large batches
+- **Duration Cap**: Audio analysis is capped at 35 seconds to optimize latency and cost
 
 ### Fallback service not being called
 
 If the fallback service is not being triggered when expected:
 
-1. **Check confidence threshold**: Ensure the primary service's `FALLBACK_THRESHOLD` in `main.py` is set correctly (default: 0.70)
+1. **Check confidence threshold**: The `max_confidence` parameter (default: 0.65) controls when fallback is triggered. Lower values trigger fallback more often.
 2. **Verify fallback URL**: Ensure `FALLBACK_SERVICE_URL` in `main.py` matches the deployed fallback service URL
 3. **Check authentication**: The primary service needs permission to call the fallback service. Ensure the primary service's default Cloud Run service account has `roles/run.invoker` permission on the fallback service
 4. **Check debug_info**: The `debug_info` field in the response will indicate if fallback was triggered and any errors encountered
+5. **Batch processing**: In batch mode, only items with low confidence are sent to fallback in a single batch request
 
 ### Fallback service authentication errors
 

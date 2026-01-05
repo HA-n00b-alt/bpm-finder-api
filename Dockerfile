@@ -1,7 +1,9 @@
-# Use MTG Essentia base image (requires Essentia >= 2.1b6 for HPSS support)
+# Use MTG Essentia base image
+# Essentia handles MP3/AAC decoding directly, ffmpeg provides backend support
 FROM ghcr.io/mtg/essentia:latest
 
 # Install ffmpeg and ensure pip is available
+# ffmpeg provides codec support for Essentia's audio decoding (MP3, AAC, etc.)
 # Set DEBIAN_FRONTEND=noninteractive to suppress debconf warnings
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && \
