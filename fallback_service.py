@@ -288,171 +288,202 @@ async def process_batch(
     Returns:
         List of FallbackResponse, one per input file
     """
-    # Get form data
-    form = await request.form()
-    
-    # Extract audio files - FastAPI handles multiple files with same name
-    # Use multi_items() to get all items including duplicates
-    audio_files = []
-    form_items = list(form.multi_items())
-    
-    # Debug: log what we received
-    print(f"DEBUG: Form multi_items count: {len(form_items)}")
-    for key, value in form_items:
-        if key == "audio_files":
-            print(f"DEBUG: Found audio_files, type: {type(value)}")
-            # value should be an UploadFile object
-            if hasattr(value, 'read'):  # It's an UploadFile
-                audio_files.append(value)
-            elif isinstance(value, list):
-                audio_files.extend(value)
-            else:
-                audio_files.append(value)
-        else:
-            print(f"DEBUG: Form key: {key}, type: {type(value)}")
-    
-    print(f"DEBUG: Total audio_files extracted: {len(audio_files)}")
-    
-    # Extract processing flags
-    process_flags = {}
-    for key, value in form.items():
-        if key.startswith("process_bpm_"):
-            idx = int(key.split("_")[-1])
-            process_flags.setdefault(idx, {})["bpm"] = value.lower() == "true"
-        elif key.startswith("process_key_"):
-            idx = int(key.split("_")[-1])
-            process_flags.setdefault(idx, {})["key"] = value.lower() == "true"
-    
-    # Stream files to temp disk and collect paths (avoid loading full files into RAM)
-    # This reduces memory usage and pickling overhead when passing to process pool
-    file_tasks = []
     temp_files = {}  # Track temp files for cleanup: {index: path}
-    
-    async def stream_to_temp(audio_file, index, process_bpm, process_key):
-        """Stream upload to temp file and return path."""
-        # Determine file extension from filename or content_type
-        suffix = '.tmp'
-        if audio_file.filename:
-            # Extract extension from filename
-            _, ext = os.path.splitext(audio_file.filename)
-            if ext:
-                suffix = ext
-        elif hasattr(audio_file, 'content_type') and audio_file.content_type:
-            # Map content type to extension
-            content_type = audio_file.content_type
-            if content_type == 'audio/mpeg':
-                suffix = '.mp3'
-            elif content_type in ('audio/mp4', 'audio/aac'):
-                suffix = '.m4a'
-            elif content_type == 'audio/wav':
-                suffix = '.wav'
+    try:
+        # Get form data
+        form = await request.form()
         
-        # Create temp file
-        temp_fd, temp_path = tempfile.mkstemp(suffix=suffix, dir='/tmp')
-        os.close(temp_fd)  # Close fd, we'll write via path
+        # Extract audio files - FastAPI handles multiple files with same name
+        # Use multi_items() to get all items including duplicates
+        audio_files = []
+        form_items = list(form.multi_items())
         
-        try:
-            # Stream file content to disk (async I/O) - read in chunks to avoid loading full file into RAM
-            async with aiofiles.open(temp_path, 'wb') as f:
-                # FastAPI UploadFile supports async iteration
-                while True:
-                    chunk = await audio_file.read(8192)  # 8KB chunks
-                    if not chunk:
-                        break
-                    await f.write(chunk)
-            # No fsync needed for ephemeral /tmp files
-            return (index, temp_path, process_bpm, process_key)
-        except Exception as e:
-            # Cleanup on error
+        # Debug: log what we received
+        print(f"DEBUG: Form multi_items count: {len(form_items)}")
+        for key, value in form_items:
+            if key == "audio_files":
+                print(f"DEBUG: Found audio_files, type: {type(value)}")
+                # value should be an UploadFile object
+                if hasattr(value, 'read'):  # It's an UploadFile
+                    audio_files.append(value)
+                elif isinstance(value, list):
+                    audio_files.extend(value)
+                else:
+                    audio_files.append(value)
+            else:
+                print(f"DEBUG: Form key: {key}, type: {type(value)}")
+        
+        print(f"DEBUG: Total audio_files extracted: {len(audio_files)}")
+        
+        # Extract processing flags
+        process_flags = {}
+        for key, value in form.items():
+            if key.startswith("process_bpm_"):
+                idx = int(key.split("_")[-1])
+                process_flags.setdefault(idx, {})["bpm"] = value.lower() == "true"
+            elif key.startswith("process_key_"):
+                idx = int(key.split("_")[-1])
+                process_flags.setdefault(idx, {})["key"] = value.lower() == "true"
+        
+        # Stream files to temp disk and collect paths (avoid loading full files into RAM)
+        # This reduces memory usage and pickling overhead when passing to process pool
+        
+        async def stream_to_temp(audio_file, index, process_bpm, process_key):
+            """Stream upload to temp file and return path."""
+            temp_path = None
+            try:
+                # Determine file extension from filename or content_type
+                suffix = '.tmp'
+                if audio_file.filename:
+                    # Extract extension from filename
+                    _, ext = os.path.splitext(audio_file.filename)
+                    if ext:
+                        suffix = ext
+                elif hasattr(audio_file, 'content_type') and audio_file.content_type:
+                    # Map content type to extension
+                    content_type = audio_file.content_type
+                    if content_type == 'audio/mpeg':
+                        suffix = '.mp3'
+                    elif content_type in ('audio/mp4', 'audio/aac'):
+                        suffix = '.m4a'
+                    elif content_type == 'audio/wav':
+                        suffix = '.wav'
+                
+                # Create temp file
+                temp_fd, temp_path = tempfile.mkstemp(suffix=suffix, dir='/tmp')
+                os.close(temp_fd)  # Close fd, we'll write via path
+                
+                # Stream file content to disk (async I/O) - read in chunks to avoid loading full file into RAM
+                total_bytes = 0
+                async with aiofiles.open(temp_path, 'wb') as f:
+                    # FastAPI UploadFile.read() can be called multiple times in a loop
+                    while True:
+                        chunk = await audio_file.read(8192)  # 8KB chunks
+                        if not chunk:
+                            break
+                        await f.write(chunk)
+                        total_bytes += len(chunk)
+                
+                # Verify file was written (not empty)
+                if total_bytes == 0:
+                    raise ValueError(f"Uploaded file for index {index} is empty")
+                
+                # No fsync needed for ephemeral /tmp files
+                return (index, temp_path, process_bpm, process_key)
+            except Exception as e:
+                # Cleanup on error
+                if temp_path and os.path.exists(temp_path):
+                    try:
+                        os.unlink(temp_path)
+                    except Exception:
+                        pass
+                # Log error for debugging
+                import traceback
+                print(f"ERROR: stream_to_temp failed for index {index}: {str(e)}")
+                print(traceback.format_exc())
+                raise
+        
+        # Stream all files concurrently
+        stream_tasks = []
+        for i, audio_file in enumerate(audio_files):
+            flags = process_flags.get(i, {})
+            process_bpm = flags.get("bpm", True)
+            process_key = flags.get("key", True)
+            
+            # Validate that at least one processing option is requested
+            if not process_bpm and not process_key:
+                # Empty response marker - create completed future
+                future = asyncio.Future()
+                future.set_result((i, None, False, False))
+                stream_tasks.append(future)
+            else:
+                stream_tasks.append(stream_to_temp(audio_file, i, process_bpm, process_key))
+        
+        # Wait for all streaming to complete
+        streamed_files = await asyncio.gather(*stream_tasks, return_exceptions=True)
+        
+        # Process files concurrently using ProcessPoolExecutor (CPU-bound work)
+        # This bypasses the GIL and allows true parallelism on multiple CPU cores
+        process_pool = get_process_pool()
+        loop = asyncio.get_event_loop()
+        
+        # Create tasks for concurrent processing
+        futures = []
+        task_indices = []  # Track original index for each task
+        for idx, item in enumerate(streamed_files):
+            if isinstance(item, Exception):
+                # Streaming failed - return empty response
+                future = asyncio.Future()
+                future.set_result({"error": True})
+                futures.append(future)
+                task_indices.append(idx)
+                continue
+                
+            if isinstance(item, tuple):
+                i, temp_path, process_bpm, process_key = item
+                if temp_path is None:
+                    # Empty response - create a completed future
+                    future = asyncio.Future()
+                    future.set_result({"error": True})
+                    futures.append(future)
+                    task_indices.append(i)
+                else:
+                    # Track temp file for cleanup
+                    temp_files[i] = temp_path
+                    # Submit CPU-bound work to process pool (pass path string, not bytes)
+                    future = loop.run_in_executor(
+                        process_pool,
+                        process_single_audio,
+                        temp_path,
+                        process_bpm,
+                        process_key
+                    )
+                    futures.append(future)
+                    task_indices.append(i)
+        
+        # Wait for all tasks to complete concurrently, handling errors per item
+        results = [None] * len(audio_files)
+        completed = await asyncio.gather(*futures, return_exceptions=True)
+        
+        # Process results in order, handling exceptions and converting dicts to Pydantic models
+        for idx, result in zip(task_indices, completed):
+            if isinstance(result, HTTPException):
+                # Re-raise HTTP exceptions (these are expected errors)
+                raise result
+            elif isinstance(result, Exception) or (isinstance(result, dict) and result.get("error")):
+                # Per-item error handling: return empty response for failed items
+                results[idx] = FallbackResponse()
+            elif isinstance(result, dict):
+                # Convert dict to Pydantic model (built in parent process to reduce pickling)
+                results[idx] = FallbackResponse(**result)
+            else:
+                results[idx] = result
+        
+    except Exception as e:
+        # Log the full error for debugging
+        import traceback
+        error_msg = f"ERROR in process_batch: {str(e)}"
+        print(error_msg)
+        print(traceback.format_exc())
+        # Cleanup temp files on error
+        for temp_path in temp_files.values():
             try:
                 if os.path.exists(temp_path):
                     os.unlink(temp_path)
             except Exception:
                 pass
-            raise
-    
-    # Stream all files concurrently
-    stream_tasks = []
-    for i, audio_file in enumerate(audio_files):
-        flags = process_flags.get(i, {})
-        process_bpm = flags.get("bpm", True)
-        process_key = flags.get("key", True)
-        
-        # Validate that at least one processing option is requested
-        if not process_bpm and not process_key:
-            # Empty response marker - create completed future
-            future = asyncio.Future()
-            future.set_result((i, None, False, False))
-            stream_tasks.append(future)
-        else:
-            stream_tasks.append(stream_to_temp(audio_file, i, process_bpm, process_key))
-    
-    # Wait for all streaming to complete
-    streamed_files = await asyncio.gather(*stream_tasks, return_exceptions=True)
-    
-    # Process files concurrently using ProcessPoolExecutor (CPU-bound work)
-    # This bypasses the GIL and allows true parallelism on multiple CPU cores
-    process_pool = get_process_pool()
-    loop = asyncio.get_event_loop()
-    
-    # Create tasks for concurrent processing
-    futures = []
-    task_indices = []  # Track original index for each task
-    for idx, item in enumerate(streamed_files):
-        if isinstance(item, Exception):
-            # Streaming failed - return empty response
-            future = asyncio.Future()
-            future.set_result({"error": True})
-            futures.append(future)
-            task_indices.append(idx)
-            continue
-            
-        if isinstance(item, tuple):
-            i, temp_path, process_bpm, process_key = item
-            if temp_path is None:
-                # Empty response - create a completed future
-                future = asyncio.Future()
-                future.set_result({"error": True})
-                futures.append(future)
-                task_indices.append(i)
-            else:
-                # Track temp file for cleanup
-                temp_files[i] = temp_path
-                # Submit CPU-bound work to process pool (pass path string, not bytes)
-                future = loop.run_in_executor(
-                    process_pool,
-                    process_single_audio,
-                    temp_path,
-                    process_bpm,
-                    process_key
-                )
-                futures.append(future)
-                task_indices.append(i)
-    
-    # Wait for all tasks to complete concurrently, handling errors per item
-    results = [None] * len(audio_files)
-    completed = await asyncio.gather(*futures, return_exceptions=True)
-    
-    # Process results in order, handling exceptions and converting dicts to Pydantic models
-    for idx, result in zip(task_indices, completed):
-        if isinstance(result, HTTPException):
-            # Re-raise HTTP exceptions (these are expected errors)
-            raise result
-        elif isinstance(result, Exception) or (isinstance(result, dict) and result.get("error")):
-            # Per-item error handling: return empty response for failed items
-            results[idx] = FallbackResponse()
-        elif isinstance(result, dict):
-            # Convert dict to Pydantic model (built in parent process to reduce pickling)
-            results[idx] = FallbackResponse(**result)
-        else:
-            results[idx] = result
-    
-    # Cleanup temp files
-    for temp_path in temp_files.values():
-        try:
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
-        except Exception:
-            pass  # Ignore cleanup errors
+        # Return error response
+        raise HTTPException(
+            status_code=500,
+            detail=f"Batch processing failed: {str(e)[:200]}"
+        )
+    finally:
+        # Cleanup temp files
+        for temp_path in temp_files.values():
+            try:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+            except Exception:
+                pass  # Ignore cleanup errors
     
     return results
