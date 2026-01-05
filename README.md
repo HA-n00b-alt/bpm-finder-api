@@ -284,8 +284,14 @@ A test script is provided for easy testing:
 
 The test script will:
 1. Get an authentication token using `gcloud auth print-identity-token`
-2. Make a batch request to the `/analyze/batch` endpoint
+2. Make a batch request to the `/analyze/batch` endpoint with the specified parameters
 3. Display the formatted JSON response
+
+**Expected Response Structure:**
+- Each item in the response array contains separate fields for Essentia and Librosa results
+- Essentia fields are always populated (primary service analysis)
+- Librosa fields are only populated when the fallback service was called (null otherwise)
+- Check `debug_txt` for detailed information about which method was used and why
 
 **Optional Debug Scripts:**
 
@@ -499,6 +505,14 @@ Array of `BPMResponse` objects, one per input URL (maintains order):
   - **normal**: All debug info + telemetry summary (download time, Essentia analysis time, fallback service time if used)
   - **detailed**: Full debug info + detailed timing with timestamps
   - Includes: URL fetch status, audio loading status, BPM and key analysis details, fallback service status (if triggered), error messages (if any), and telemetry
+
+**Response Interpretation:**
+- **Essentia fields** (`bpm_essentia`, `key_essentia`, etc.): Always populated from the primary service analysis
+- **Librosa fields** (`bpm_librosa`, `key_librosa`, etc.): Only populated when fallback service was called (null otherwise)
+- **When to use which result**: 
+  - If `bpm_librosa` is not null, the fallback service provided a higher-confidence BPM result (use `bpm_librosa` for BPM)
+  - If `key_librosa` is not null, the fallback service provided a higher-confidence key result (use `key_librosa` for key)
+  - If Librosa fields are null, Essentia results met the confidence threshold and should be used
 
 **Processing Behavior:**
 - URLs are processed **concurrently** using `asyncio.gather()`

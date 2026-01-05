@@ -1,8 +1,14 @@
 #!/bin/bash
 
 # Test script for BPM Finder API (Batch Processing)
+# 
 # Usage: ./test_api.sh [max_confidence] [debug_level]
-# debug_level: minimal, normal (default), detailed
+#   max_confidence: Confidence threshold (0.0-1.0), default: 0.65
+#   debug_level: minimal, normal (default), detailed
+#
+# The script tests the /analyze/batch endpoint with multiple audio URLs.
+# Expected response: Array of BPMResponse objects with separate Essentia and Librosa fields.
+# Librosa fields (bpm_librosa, key_librosa, etc.) will be null if fallback was not used.
 
 SERVICE_URL="https://bpm-service-340051416180.europe-west3.run.app"
 MAX_CONFIDENCE="${1:-0.65}"
@@ -62,12 +68,16 @@ echo ""
 
 if [ "$STATUS_CODE" -eq 200 ]; then
     # Try to format as JSON
+    echo "✅ Success! Response (formatted JSON):"
+    echo ""
     echo "$RESPONSE_BODY" | python3 -m json.tool 2>/dev/null || {
         echo "Response (raw):"
         echo "$RESPONSE_BODY"
     }
+    echo ""
+    echo "Note: Librosa fields (bpm_librosa, key_librosa, etc.) will be null if fallback was not used."
 else
-    echo "Error Response:"
+    echo "❌ Error Response (HTTP $STATUS_CODE):"
     echo "$RESPONSE_BODY"
 fi
 
