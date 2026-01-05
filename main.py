@@ -767,77 +767,77 @@ async def analyze_batch(request: BatchBPMRequest):
                         )
                     fallback_timing["end"] = time.time()
                     fallback_timing["duration"] = fallback_timing["end"] - fallback_timing["start"]
+                    
+                    # Close file handles
+                    for fh in file_handles:
+                        try:
+                            fh.close()
+                        except Exception:
+                            pass
+                    
+                    # Log response status
+                    for item in fallback_items:
+                        item["debug_info_parts"].append(f"Fallback service response: HTTP {response.status_code}")
+                    
+                    if response.status_code == 200:
+                        fallback_results = response.json()
                         
-                        # Close file handles
-                        for fh in file_handles:
-                            try:
-                                fh.close()
-                            except Exception:
-                                pass
-                        
-                        # Log response status
+                        # Log what we received for debugging
                         for item in fallback_items:
-                            item["debug_info_parts"].append(f"Fallback service response: HTTP {response.status_code}")
+                            item["debug_info_parts"].append(f"Fallback results received: {len(fallback_results)} items")
                         
-                        if response.status_code == 200:
-                            fallback_results = response.json()
-                            
-                            # Log what we received for debugging
-                            for item in fallback_items:
-                                item["debug_info_parts"].append(f"Fallback results received: {len(fallback_results)} items")
-                            
-                            # Update processed items with fallback results
-                            # Match results by file_index_to_item_index mapping
-                            for file_idx, fallback_result in enumerate(fallback_results):
-                                if file_idx < len(file_index_to_item_index):
-                                    item_idx = file_index_to_item_index[file_idx]
-                                    item = fallback_items[item_idx]
-                                    item_index = item["index"]
-                                    
-                                    # Log the result we're processing
-                                    item["debug_info_parts"].append(
-                                        f"Processing fallback result {file_idx}: bpm_normalized={fallback_result.get('bpm_normalized')}, "
-                                        f"bpm_raw={fallback_result.get('bpm_raw')}, confidence={fallback_result.get('confidence')}"
-                                    )
-                                    
-                                    # Update Librosa BPM fields if fallback was needed and returned
-                                    if item["need_fallback_bpm"] and fallback_result.get("bpm_normalized") is not None:
-                                        processed_items[item_index]["bpm_librosa"] = int(round(fallback_result["bpm_normalized"]))
-                                        processed_items[item_index]["bpm_raw_librosa"] = round(fallback_result["bpm_raw"], 2) if fallback_result.get("bpm_raw") else None
-                                        processed_items[item_index]["bpm_confidence_librosa"] = round(fallback_result["confidence"], 2) if fallback_result.get("confidence") else None
-                                        processed_items[item_index]["debug_info_parts"].append(
-                                            f"Fallback BPM: {fallback_result['bpm_normalized']:.1f} (confidence={fallback_result['confidence']:.3f})"
-                                        )
-                                    elif item["need_fallback_bpm"]:
-                                        processed_items[item_index]["debug_info_parts"].append(
-                                            f"Fallback BPM: No result returned (bpm_normalized={fallback_result.get('bpm_normalized')}, response keys: {list(fallback_result.keys())})"
-                                        )
-                                    
-                                    # Update Librosa key fields if fallback was needed and returned
-                                    if item["need_fallback_key"] and fallback_result.get("key") is not None:
-                                        processed_items[item_index]["key_librosa"] = fallback_result["key"]
-                                        processed_items[item_index]["scale_librosa"] = fallback_result["scale"]
-                                        processed_items[item_index]["keyscale_confidence_librosa"] = round(fallback_result["key_confidence"], 2) if fallback_result.get("key_confidence") else None
-                                        processed_items[item_index]["debug_info_parts"].append(
-                                            f"Fallback key: {fallback_result['key']} {fallback_result['scale']} (confidence={fallback_result['key_confidence']:.3f})"
-                                        )
-                                    elif item["need_fallback_key"]:
-                                        processed_items[item_index]["debug_info_parts"].append(
-                                            f"Fallback key: No result returned (key={fallback_result.get('key')}, response keys: {list(fallback_result.keys())})"
-                                        )
-                                else:
-                                    # Log if we have more results than expected
-                                    for item in fallback_items:
-                                        item["debug_info_parts"].append(
-                                            f"Warning: Fallback result index {file_idx} exceeds mapping length {len(file_index_to_item_index)}"
-                                        )
-                        else:
-                            # Log non-200 response
-                            error_text = response.text[:200] if hasattr(response, 'text') else str(response.content)[:200]
-                            for item in fallback_items:
+                        # Update processed items with fallback results
+                        # Match results by file_index_to_item_index mapping
+                        for file_idx, fallback_result in enumerate(fallback_results):
+                            if file_idx < len(file_index_to_item_index):
+                                item_idx = file_index_to_item_index[file_idx]
+                                item = fallback_items[item_idx]
+                                item_index = item["index"]
+                                
+                                # Log the result we're processing
                                 item["debug_info_parts"].append(
-                                    f"Fallback service error: HTTP {response.status_code} - {error_text}"
+                                    f"Processing fallback result {file_idx}: bpm_normalized={fallback_result.get('bpm_normalized')}, "
+                                    f"bpm_raw={fallback_result.get('bpm_raw')}, confidence={fallback_result.get('confidence')}"
                                 )
+                                
+                                # Update Librosa BPM fields if fallback was needed and returned
+                                if item["need_fallback_bpm"] and fallback_result.get("bpm_normalized") is not None:
+                                    processed_items[item_index]["bpm_librosa"] = int(round(fallback_result["bpm_normalized"]))
+                                    processed_items[item_index]["bpm_raw_librosa"] = round(fallback_result["bpm_raw"], 2) if fallback_result.get("bpm_raw") else None
+                                    processed_items[item_index]["bpm_confidence_librosa"] = round(fallback_result["confidence"], 2) if fallback_result.get("confidence") else None
+                                    processed_items[item_index]["debug_info_parts"].append(
+                                        f"Fallback BPM: {fallback_result['bpm_normalized']:.1f} (confidence={fallback_result['confidence']:.3f})"
+                                    )
+                                elif item["need_fallback_bpm"]:
+                                    processed_items[item_index]["debug_info_parts"].append(
+                                        f"Fallback BPM: No result returned (bpm_normalized={fallback_result.get('bpm_normalized')}, response keys: {list(fallback_result.keys())})"
+                                    )
+                                
+                                # Update Librosa key fields if fallback was needed and returned
+                                if item["need_fallback_key"] and fallback_result.get("key") is not None:
+                                    processed_items[item_index]["key_librosa"] = fallback_result["key"]
+                                    processed_items[item_index]["scale_librosa"] = fallback_result["scale"]
+                                    processed_items[item_index]["keyscale_confidence_librosa"] = round(fallback_result["key_confidence"], 2) if fallback_result.get("key_confidence") else None
+                                    processed_items[item_index]["debug_info_parts"].append(
+                                        f"Fallback key: {fallback_result['key']} {fallback_result['scale']} (confidence={fallback_result['key_confidence']:.3f})"
+                                    )
+                                elif item["need_fallback_key"]:
+                                    processed_items[item_index]["debug_info_parts"].append(
+                                        f"Fallback key: No result returned (key={fallback_result.get('key')}, response keys: {list(fallback_result.keys())})"
+                                    )
+                            else:
+                                # Log if we have more results than expected
+                                for item in fallback_items:
+                                    item["debug_info_parts"].append(
+                                        f"Warning: Fallback result index {file_idx} exceeds mapping length {len(file_index_to_item_index)}"
+                                    )
+                    else:
+                        # Log non-200 response
+                        error_text = response.text[:200] if hasattr(response, 'text') else str(response.content)[:200]
+                        for item in fallback_items:
+                            item["debug_info_parts"].append(
+                                f"Fallback service error: HTTP {response.status_code} - {error_text}"
+                            )
                 except Exception as e:
                     # Log error but continue with Essentia results
                     error_msg = str(e)[:200]
