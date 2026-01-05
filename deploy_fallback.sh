@@ -136,8 +136,37 @@ echo "✅ Deployment complete!"
 echo "Service URL: ${SERVICE_URL}"
 echo ""
 
-# Verify service account exists
-echo "🔐 Verifying service account..."
+# Grant primary service permission to invoke fallback service
+echo "🔐 Configuring service-to-service authentication..."
+PRIMARY_SERVICE_NAME="bpm-service"
+
+# Get primary service's service account
+PRIMARY_SERVICE_ACCOUNT=$(gcloud run services describe "${PRIMARY_SERVICE_NAME}" \
+    --region "${REGION}" \
+    --format "value(spec.template.spec.serviceAccountName)" \
+    --project "${PROJECT_ID}" 2>/dev/null || echo "")
+
+# If no custom service account, use default Compute Engine service account
+if [ -z "${PRIMARY_SERVICE_ACCOUNT}" ] || [ "${PRIMARY_SERVICE_ACCOUNT}" = "default" ]; then
+    PROJECT_NUMBER=$(gcloud projects describe "${PROJECT_ID}" --format="value(projectNumber)")
+    PRIMARY_SERVICE_ACCOUNT="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+    echo "Using default Compute Engine service account: ${PRIMARY_SERVICE_ACCOUNT}"
+else
+    echo "Using primary service account: ${PRIMARY_SERVICE_ACCOUNT}"
+fi
+
+# Grant invoke permission to primary service
+echo "Granting primary service permission to invoke fallback service..."
+gcloud run services add-iam-policy-binding "${SERVICE_NAME}" \
+    --region "${REGION}" \
+    --member "serviceAccount:${PRIMARY_SERVICE_ACCOUNT}" \
+    --role "roles/run.invoker" \
+    --project "${PROJECT_ID}"
+
+echo "✅ Primary service can now invoke fallback service"
+
+# Verify external service account exists
+echo "🔐 Verifying external service account..."
 if ! gcloud iam service-accounts describe "${SERVICE_ACCOUNT}@${PROJECT_ID}.iam.gserviceaccount.com" \
     --project "${PROJECT_ID}" &>/dev/null; then
     echo "⚠️  Warning: Service account ${SERVICE_ACCOUNT} does not exist."
@@ -145,15 +174,15 @@ if ! gcloud iam service-accounts describe "${SERVICE_ACCOUNT}@${PROJECT_ID}.iam.
 else
     echo "Service account exists: ${SERVICE_ACCOUNT}"
     
-    # Grant invoke permission
-    echo "Granting invoke permission to service account..."
+    # Grant invoke permission to external service account
+    echo "Granting invoke permission to external service account..."
     gcloud run services add-iam-policy-binding "${SERVICE_NAME}" \
         --region "${REGION}" \
         --member "serviceAccount:${SERVICE_ACCOUNT}@${PROJECT_ID}.iam.gserviceaccount.com" \
         --role "roles/run.invoker" \
         --project "${PROJECT_ID}"
     
-    echo "✅ Service account configured!"
+    echo "✅ External service account configured!"
 fi
 
 echo ""
