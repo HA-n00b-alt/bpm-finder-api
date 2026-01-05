@@ -42,11 +42,34 @@ JSON_PAYLOAD+="], \"max_confidence\": $MAX_CONFIDENCE}"
 echo "Making batch API request..."
 echo ""
 
-curl -s -X POST "${SERVICE_URL}/analyze/batch" \
+# Save response to a temp file to check status and content
+TEMP_RESPONSE=$(mktemp)
+HTTP_CODE=$(curl -s -w "\n%{http_code}" -X POST "${SERVICE_URL}/analyze/batch" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $TOKEN" \
     -d "$JSON_PAYLOAD" \
-    | python3 -m json.tool
+    -o "$TEMP_RESPONSE")
+
+# Extract HTTP status code (last line)
+STATUS_CODE=$(echo "$HTTP_CODE" | tail -n1)
+RESPONSE_BODY=$(head -n -1 "$TEMP_RESPONSE" 2>/dev/null || cat "$TEMP_RESPONSE")
+
+echo "HTTP Status Code: $STATUS_CODE"
+echo ""
+
+if [ "$STATUS_CODE" -eq 200 ]; then
+    # Try to format as JSON
+    echo "$RESPONSE_BODY" | python3 -m json.tool 2>/dev/null || {
+        echo "Response (raw):"
+        echo "$RESPONSE_BODY"
+    }
+else
+    echo "Error Response:"
+    echo "$RESPONSE_BODY"
+fi
+
+# Cleanup
+rm -f "$TEMP_RESPONSE"
 
 echo ""
 echo "Done!"

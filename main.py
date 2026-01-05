@@ -162,9 +162,10 @@ async def download_audio_async(url: str, output_path: str) -> None:
                             status_code=400,
                             detail=f"File too large (max {MAX_SIZE / 1024 / 1024:.1f}MB)"
                         )
-                    # Use asyncio.to_thread to make file write non-blocking
+                    # Use run_in_executor to make file write non-blocking (Python 3.8 compatible)
                     # This allows the event loop to switch to other pending requests
-                    await asyncio.to_thread(f.write, chunk)
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, f.write, chunk)
             finally:
                 # Ensure file is closed even if an error occurs
                 f.close()
@@ -265,14 +266,19 @@ def analyze_audio(audio_path: str, max_confidence: float) -> Tuple[
     
     try:
         # Load audio once - Essentia handles MP3/AAC decoding directly
-        # Cap duration to MAX_AUDIO_DURATION seconds
         loader = es.MonoLoader(
             filename=audio_path,
-            sampleRate=44100,
-            endTime=MAX_AUDIO_DURATION
+            sampleRate=44100
         )
         audio = loader()
-        debug_lines.append(f"Audio loaded: {len(audio)/44100:.1f}s (capped at {MAX_AUDIO_DURATION}s)")
+        
+        # Cap duration to MAX_AUDIO_DURATION seconds by trimming the array
+        max_samples = int(MAX_AUDIO_DURATION * 44100)
+        if len(audio) > max_samples:
+            audio = audio[:max_samples]
+            debug_lines.append(f"Audio loaded: {len(audio)/44100:.1f}s (trimmed from original, capped at {MAX_AUDIO_DURATION}s)")
+        else:
+            debug_lines.append(f"Audio loaded: {len(audio)/44100:.1f}s")
     except Exception as e:
         error_msg = f"Essentia audio loading error: {str(e)}"
         debug_lines.append(error_msg)
@@ -322,11 +328,8 @@ def analyze_audio(audio_path: str, max_confidence: float) -> Tuple[
         
         for profile in key_profiles:
             try:
-                key_extractor = es.KeyExtractor(
-                    profileType=profile,
-                    pcpSize=36,
-                    numHarmonics=4
-                )
+                # Try with profileType only (some Essentia versions don't support pcpSize/numHarmonics)
+                key_extractor = es.KeyExtractor(profileType=profile)
                 key_result, scale_result, strength = key_extractor(audio)
                 results.append((str(key_result), str(scale_result), float(strength), profile))
                 debug_lines.append(f"key_profile={profile}: key={key_result} {scale_result}, strength={strength:.3f}")
@@ -383,11 +386,11 @@ async def process_single_url(
     url: HttpUrl,
     max_confidence: float,
     index: int
-) -> Tuple[int, BPMResponse]:
+) -> Tuple[int, dict]:
     """Process a single URL: download, analyze, return result.
     
     Returns:
-        Tuple of (index, BPMResponse)
+        Tuple of (index, dict) with processing results and fallback flags
     """
     url_str = str(url)
     parsed = urlparse(url_str)
@@ -407,16 +410,21 @@ async def process_single_url(
         except Exception as e:
             error_msg = f"URL fetch error: {str(e)}"
             debug_info_parts.append(error_msg)
-            return index, BPMResponse(
-                bpm=0,
-                bpm_raw=0.0,
-                bpm_confidence=0.0,
-                bpm_method="error",
-                debug_info="\n".join(debug_info_parts),
-                key="unknown",
-                scale="unknown",
-                key_confidence=0.0,
-            )
+            return index, {
+                "index": index,
+                "url": url_str,
+                "file_path": None,
+                "bpm_normalized": 0.0,
+                "bpm_raw": 0.0,
+                "bpm_confidence_normalized": 0.0,
+                "bpm_method": "error",
+                "key": "unknown",
+                "scale": "unknown",
+                "key_confidence_normalized": 0.0,
+                "need_fallback_bpm": True,
+                "need_fallback_key": True,
+                "debug_info_parts": debug_info_parts,
+            }
         
         # Analyze audio (BPM + key from same loaded array)
         (
@@ -522,6 +530,11 @@ async def analyze_batch(request: BatchBPMRequest):
     
     # Single batch request to fallback service if needed
     if fallback_items:
+        # Log fallback attempt
+        for item in fallback_items:
+            item["debug_info_parts"].append(f"=== Fallback Service ===")
+            item["debug_info_parts"].append(f"Fallback needed: BPM={item['need_fallback_bpm']}, Key={item['need_fallback_key']}")
+        
         try:
             auth_headers = await get_auth_headers(FALLBACK_SERVICE_AUDIENCE)
             
@@ -541,10 +554,16 @@ async def analyze_batch(request: BatchBPMRequest):
                     data[f"process_bpm_{i}"] = str(item["need_fallback_bpm"]).lower()
                     data[f"process_key_{i}"] = str(item["need_fallback_key"]).lower()
                     data[f"url_{i}"] = item["url"]
+                else:
+                    # Log missing file
+                    item["debug_info_parts"].append(f"Fallback skipped: file_path missing or doesn't exist")
             
             # Make batch request to fallback service
             if files:  # Only make request if we have files to send
                 try:
+                    for item in fallback_items:
+                        item["debug_info_parts"].append(f"Calling fallback service: {FALLBACK_SERVICE_URL}/process_batch")
+                    
                     async with httpx.AsyncClient(timeout=120.0) as client:
                         response = await client.post(
                             f"{FALLBACK_SERVICE_URL}/process_batch",
@@ -559,6 +578,10 @@ async def analyze_batch(request: BatchBPMRequest):
                                 fh.close()
                             except Exception:
                                 pass
+                        
+                        # Log response status
+                        for item in fallback_items:
+                            item["debug_info_parts"].append(f"Fallback service response: HTTP {response.status_code}")
                         
                         if response.status_code == 200:
                             fallback_results = response.json()
@@ -578,6 +601,10 @@ async def analyze_batch(request: BatchBPMRequest):
                                         processed_items[item_index]["debug_info_parts"].append(
                                             f"Fallback BPM: {fallback_result['bpm_normalized']:.1f} (confidence={fallback_result['confidence']:.3f})"
                                         )
+                                    elif item["need_fallback_bpm"]:
+                                        processed_items[item_index]["debug_info_parts"].append(
+                                            f"Fallback BPM: No result returned (response: {fallback_result})"
+                                        )
                                     
                                     # Update key if fallback was needed and returned
                                     if item["need_fallback_key"] and fallback_result.get("key") is not None:
@@ -587,11 +614,23 @@ async def analyze_batch(request: BatchBPMRequest):
                                         processed_items[item_index]["debug_info_parts"].append(
                                             f"Fallback key: {fallback_result['key']} {fallback_result['scale']} (confidence={fallback_result['key_confidence']:.3f})"
                                         )
+                                    elif item["need_fallback_key"]:
+                                        processed_items[item_index]["debug_info_parts"].append(
+                                            f"Fallback key: No result returned (response: {fallback_result})"
+                                        )
+                        else:
+                            # Log non-200 response
+                            error_text = response.text[:200] if hasattr(response, 'text') else str(response.content)[:200]
+                            for item in fallback_items:
+                                item["debug_info_parts"].append(
+                                    f"Fallback service error: HTTP {response.status_code} - {error_text}"
+                                )
                 except Exception as e:
                     # Log error but continue with Essentia results
+                    error_msg = str(e)[:200]
                     for item in fallback_items:
                         processed_items[item["index"]]["debug_info_parts"].append(
-                            f"Fallback service error: {str(e)[:200]}"
+                            f"Fallback service exception: {error_msg}"
                         )
                 finally:
                     # Ensure file handles are closed even if there's an error
@@ -600,11 +639,16 @@ async def analyze_batch(request: BatchBPMRequest):
                             fh.close()
                         except Exception:
                             pass
+            else:
+                # No files to send
+                for item in fallback_items:
+                    item["debug_info_parts"].append("Fallback skipped: No valid files to send")
         except Exception as e:
             # Log error but continue with Essentia results
+            error_msg = str(e)[:200]
             for item in fallback_items:
                 processed_items[item["index"]]["debug_info_parts"].append(
-                    f"Fallback preparation error: {str(e)[:200]}"
+                    f"Fallback preparation error: {error_msg}"
                 )
     
     # Build final responses and cleanup
