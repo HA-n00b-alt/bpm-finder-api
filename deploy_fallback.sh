@@ -59,7 +59,7 @@ echo "📦 Building and pushing Docker image..."
 # Create a temporary build context
 TEMP_DIR=$(mktemp -d)
 cp fallback_service.py "${TEMP_DIR}/"
-cp requirements_fallback.txt "${TEMP_DIR}/requirements.txt"
+cp requirements_fallback.txt "${TEMP_DIR}/requirements_fallback.txt"
 cp Dockerfile.fallback "${TEMP_DIR}/Dockerfile"
 
 if ! gcloud builds submit \
