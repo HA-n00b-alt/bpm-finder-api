@@ -11,7 +11,7 @@ A Google Cloud Run microservice that computes BPM (beats per minute) and musical
 - Private Cloud Run service with IAM authentication
 - SSRF protection through HTTPS-only requirement
 - Fast processing with Essentia and ffmpeg
-- Returns BPM, raw BPM, BPM confidence, key, scale, key confidence, and source host
+- Returns BPM, raw BPM, BPM confidence, BPM method, debug info, key, scale, and key confidence
 
 ## Architecture
 
@@ -222,10 +222,11 @@ Expected response:
   "bpm": 128,
   "bpm_raw": 64.0,
   "bpm_confidence": 0.73,
+  "bpm_method": "multifeature",
+  "debug_info": "BPM Ensemble winner: multifeature",
   "key": "C",
   "scale": "major",
-  "key_confidence": 0.85,
-  "source_url_host": "audio-ssl.itunes.apple.com"
+  "key_confidence": 0.85
 }
 ```
 
@@ -275,10 +276,11 @@ Compute BPM and key from audio preview URL.
   "bpm": 128,
   "bpm_raw": 64.0,
   "bpm_confidence": 0.73,
+  "bpm_method": "multifeature",
+  "debug_info": "BPM Ensemble winner: multifeature",
   "key": "C",
   "scale": "major",
-  "key_confidence": 0.85,
-  "source_url_host": "audio-ssl.itunes.apple.com"
+  "key_confidence": 0.85
 }
 ```
 
@@ -289,10 +291,11 @@ Compute BPM and key from audio preview URL.
   - Otherwise: returned unchanged
 - `bpm_raw`: Raw BPM value from Essentia (before normalization, rounded to 2 decimal places)
 - `bpm_confidence`: BPM confidence score (0.0-1.0, rounded to 2 decimal places). Higher value indicates more reliable BPM detection.
+- `bpm_method`: The BPM extraction method that won the ensemble comparison ("multifeature", "degara", or "onset")
+- `debug_info`: Debug information string (optional, currently shows the winning BPM method)
 - `key`: Detected musical key (e.g., "C", "D", "E", "F", "G", "A", "B")
 - `scale`: Detected scale ("major" or "minor")
 - `key_confidence`: Key detection confidence score (0.0-1.0, rounded to 2 decimal places). Higher value indicates more reliable key detection.
-- `source_url_host`: Hostname of the source URL
 
 **Error Responses:**
 - `400`: Invalid URL, non-HTTPS URL, file too large, or redirect to non-HTTPS URL
