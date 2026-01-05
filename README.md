@@ -4,22 +4,43 @@ A Google Cloud Run microservice that computes BPM (beats per minute) and musical
 
 ## Features
 
-- BPM computation from audio preview URLs using Harmonic-Percussive Source Separation (HPSS) for improved accuracy
-- Musical key detection (key and scale) using HPSS harmonic component
-- Dual-method BPM extraction (multifeature and degara) with confidence-based selection
-- Multiple key profile types with automatic selection of best result
-- Private Cloud Run service with IAM authentication
-- SSRF protection through HTTPS-only requirement
-- Fast processing with Essentia and ffmpeg
-- Returns BPM, raw BPM, BPM confidence, BPM method, debug info, key, scale, and key confidence
+- **Single-Method BPM Extraction**: Uses Essentia's `RhythmExtractor2013(method="multifeature")` for BPM detection
+- **Selective Fallback Architecture**: Automatically uses a high-accuracy fallback service (librosa-based) only when needed:
+  - BPM fallback: Triggered when BPM confidence < `max_confidence` threshold
+  - Key fallback: Triggered when key strength < `max_confidence` threshold
+  - Can call fallback for BPM only, key only, both, or neither
+- **Configurable Confidence Threshold**: `max_confidence` parameter (default 0.65) controls when fallback is triggered
+- **Musical Key Detection**: Multiple Essentia key profile types with automatic selection of best result
+- **Normalized Confidence Scores**: All confidence values normalized to 0-1 range for consistent interpretation
+- **Comprehensive Debug Information**: Detailed debug info including method comparisons, confidence analysis, and error reporting
+- **Private Cloud Run Service**: IAM authentication required for access
+- **SSRF Protection**: HTTPS-only requirement with redirect validation
+- **Fast Processing**: Essentia and ffmpeg for efficient audio processing
+- **Complete Response Data**: Returns BPM, raw BPM, BPM confidence, BPM method, debug info, key, scale, and key confidence
 
 ## Architecture
 
+### Primary Service (`bpm-service`)
+
 - **Runtime**: Python 3 + FastAPI + Uvicorn
-- **Audio Processing**: Essentia (HPSS for source separation, RhythmExtractor2013 for BPM, KeyExtractor for key detection) + ffmpeg
-- **Container**: MTG Essentia base image (`ghcr.io/mtg/essentia:latest`, requires Essentia >= 2.1b6 for HPSS support)
+- **Audio Processing**: Essentia (RhythmExtractor2013 for BPM, KeyExtractor for key detection) + ffmpeg
+- **BPM Method**: Single method:
+  - `multifeature`: RhythmExtractor2013 with multifeature method (confidence range: 0-5.32)
+- **Container**: MTG Essentia base image (`ghcr.io/mtg/essentia:latest`)
 - **Deployment**: Google Cloud Run
 - **Authentication**: Cloud Run IAM (Identity Tokens)
+- **Fallback Integration**: Selectively calls fallback service based on `max_confidence` threshold (default 0.65)
+
+### Fallback Service (`bpm-fallback-service`)
+
+- **Runtime**: Python 3 + FastAPI + Uvicorn
+- **Audio Processing**: Librosa (HPSS, beat tracking, chroma features)
+- **BPM Method**: Harmonic-Percussive Source Separation (HPSS) with percussive component beat tracking
+- **Key Method**: Krumhansl-Schmuckler algorithm on harmonic component chroma features
+- **Container**: Python 3.11-slim with librosa, numpy, scipy
+- **Deployment**: Google Cloud Run (higher resources: 4GB RAM, 2 CPU, CPU boost)
+- **Authentication**: Cloud Run IAM (service-to-service authentication)
+- **Use Case**: High-accuracy, high-cost fallback for low-confidence primary results
 
 ## Prerequisites
 
@@ -34,6 +55,8 @@ A Google Cloud Run microservice that computes BPM (beats per minute) and musical
 
 ## Configuration
 
+### Primary Service Configuration
+
 Before deployment, configure the following variables in `deploy.sh` or set them as environment variables:
 
 - `PROJECT_ID`: Your GCP project ID (default: `bpm-api-microservice`)
@@ -41,6 +64,26 @@ Before deployment, configure the following variables in `deploy.sh` or set them 
 - `SERVICE_NAME`: Cloud Run service name (default: `bpm-service`)
 - `ARTIFACT_REPO`: Artifact Registry repository name (default: `bpm-repo`)
 - `SERVICE_ACCOUNT`: Service account name for external callers (default: `vercel-bpm-invoker`)
+
+### Fallback Service Configuration
+
+The fallback service configuration is in `deploy_fallback.sh`:
+
+- `PROJECT_ID`: Your GCP project ID (same as primary service)
+- `REGION`: Cloud Run region (default: `europe-west3`)
+- `SERVICE_NAME`: Fallback service name (default: `bpm-fallback-service`)
+- `ARTIFACT_REPO`: Artifact Registry repository name (default: `bpm-repo`)
+
+### Primary Service Fallback Settings
+
+The primary service fallback configuration is in `main.py`:
+
+- `FALLBACK_SERVICE_URL`: URL of the fallback service (must be updated after fallback deployment)
+- `FALLBACK_SERVICE_AUDIENCE`: OIDC audience for service-to-service authentication (same as `FALLBACK_SERVICE_URL`)
+
+**Note**: The confidence threshold is now configurable per-request via the `max_confidence` parameter (default: 0.65). This allows clients to control when fallback is triggered.
+
+**Important**: After deploying the fallback service, update `FALLBACK_SERVICE_URL` and `FALLBACK_SERVICE_AUDIENCE` in `main.py` with the actual fallback service URL, then redeploy the primary service.
 
 ## One-Time Setup
 
@@ -140,9 +183,9 @@ gcloud iam service-accounts keys create ${SERVICE_ACCOUNT}-key.json \
 
 ## Deployment
 
-### Quick Deploy
+### Deploy Primary Service
 
-To deploy the service to Google Cloud Run, simply run the deployment script:
+To deploy the primary BPM service to Google Cloud Run:
 
 ```bash
 # Set your project ID
@@ -163,6 +206,29 @@ The `deploy.sh` script will:
 3. Deploy to Cloud Run **without public access** (`--no-allow-unauthenticated`)
 4. Create/verify the service account
 5. Grant `roles/run.invoker` permission to the service account
+
+### Deploy Fallback Service
+
+To deploy the high-accuracy fallback service:
+
+```bash
+# Set your project ID (same as primary service)
+export PROJECT_ID="your-project-id"
+
+# Deploy fallback service
+./deploy_fallback.sh
+
+# Or override region
+REGION=us-central1 ./deploy_fallback.sh
+```
+
+The `deploy_fallback.sh` script will:
+1. Build the Docker image using Cloud Build
+2. Push to Artifact Registry
+3. Deploy to Cloud Run **without public access** with higher resources (4GB RAM, 2 CPU, CPU boost)
+4. Configure service-to-service authentication for primary service calls
+
+**Important**: The primary service must be able to authenticate to the fallback service. The primary service uses its default Cloud Run service account to generate OIDC tokens for calling the fallback service.
 
 ### Get Service URL
 
@@ -201,6 +267,20 @@ Expected response:
 
 ### Test BPM Endpoint
 
+**Option 1: Using the test script**
+
+A convenient test script is provided:
+
+```bash
+# Test with default URL
+./test_api.sh
+
+# Test with custom URL
+./test_api.sh "https://audio-ssl.itunes.apple.com/..."
+```
+
+**Option 2: Manual curl command**
+
 ```bash
 # Get identity token
 TOKEN=$(gcloud auth print-identity-token)
@@ -212,21 +292,35 @@ PREVIEW_URL="https://audio-ssl.itunes.apple.com/..."
 curl -X POST \
     -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d "{\"url\": \"${PREVIEW_URL}\"}" \
-    "${SERVICE_URL}/bpm"
+    -d "{\"url\": \"${PREVIEW_URL}\", \"max_confidence\": 0.65}" \
+    "${SERVICE_URL}/bpm" | python3 -m json.tool
 ```
 
 Expected response:
 ```json
 {
   "bpm": 128,
-  "bpm_raw": 64.0,
-  "bpm_confidence": 0.73,
+  "bpm_raw": 128.0,
+  "bpm_confidence": 0.77,
   "bpm_method": "multifeature",
-  "debug_info": "BPM Ensemble winner: multifeature",
+  "debug_info": "Max confidence threshold: 0.65\nURL fetch: SUCCESS (https://audio-ssl.itunes.apple.com/...)\nAudio conversion: SUCCESS\n=== BPM Analysis (Essentia) ===\nBPM=128.0 (normalized=128.0)\nConfidence: raw=4.10 (range: 0-5.32), normalized=0.77 (0-1), quality=excellent\nBPM confidence (0.770) >= threshold (0.65) - using Essentia result\n=== Key Analysis (Essentia) ===\nkey_profile=temperley: key=C major, strength=0.859\nWinner: temperley profile (strength=0.859, normalized=0.859)\nKey strength (0.859) >= threshold (0.65) - using Essentia result",
   "key": "C",
   "scale": "major",
-  "key_confidence": 0.85
+  "key_confidence": 0.86
+}
+```
+
+**Example with fallback triggered:**
+```json
+{
+  "bpm": 130,
+  "bpm_raw": 130.0,
+  "bpm_confidence": 0.82,
+  "bpm_method": "librosa_hpss_fallback",
+  "debug_info": "Max confidence threshold: 0.65\nURL fetch: SUCCESS (...)\nAudio conversion: SUCCESS\n=== BPM Analysis (Essentia) ===\nBPM=130.0 (normalized=130.0)\nConfidence: raw=2.50 (range: 0-5.32), normalized=0.47 (0-1), quality=moderate\nBPM confidence (0.470) < threshold (0.65) - fallback needed\n=== Key Analysis (Essentia) ===\nkey_profile=temperley: key=C major, strength=0.859\nWinner: temperley profile (strength=0.859, normalized=0.859)\nKey strength (0.859) >= threshold (0.65) - using Essentia result\n=== Fallback Service Call (BPM) ===\nFallback service: SUCCESS\nFallback BPM: 130.0 (confidence=0.82)",
+  "key": "C",
+  "scale": "major",
+  "key_confidence": 0.86
 }
 ```
 
@@ -266,9 +360,14 @@ Compute BPM and key from audio preview URL.
 **Request Body:**
 ```json
 {
-  "url": "https://audio-ssl.itunes.apple.com/..."
+  "url": "https://audio-ssl.itunes.apple.com/...",
+  "max_confidence": 0.65
 }
 ```
+
+**Request Parameters:**
+- `url` (required): HTTPS URL to the audio preview file
+- `max_confidence` (optional, default: 0.65): Confidence threshold (0.0-1.0) below which the fallback service is called. If Essentia's confidence is above this threshold, the primary service result is used.
 
 **Response:**
 ```json
@@ -277,10 +376,10 @@ Compute BPM and key from audio preview URL.
   "bpm_raw": 64.0,
   "bpm_confidence": 0.73,
   "bpm_method": "multifeature",
-  "debug_info": "BPM Ensemble winner: multifeature",
+  "debug_info": "URL fetch: SUCCESS (https://audio-ssl.itunes.apple.com/...)\nAudio conversion: SUCCESS\n=== BPM Analysis ===\nmultifeature: BPM=128.0 (norm=128.0), confidence=2.319 (norm=0.77)\ndegara: BPM=128.0 (norm=128.0), confidence=0.000 (norm=0.00)\nonset: BPM=128.0 (norm=128.0), confidence=1.500 (norm=0.50)\nEnsemble: avg_confidence=0.42, range=[0.00, 0.77]\nWinner: multifeature (confidence=0.77)\n=== Key Analysis ===\nkey_profile=temperley: key=C major, strength=0.859\nWinner: temperley profile (strength=0.859)",
   "key": "C",
   "scale": "major",
-  "key_confidence": 0.85
+  "key_confidence": 0.86
 }
 ```
 
@@ -289,10 +388,18 @@ Compute BPM and key from audio preview URL.
   - If raw BPM < 40: multiplied by 2
   - If raw BPM > 220: divided by 2
   - Otherwise: returned unchanged
-- `bpm_raw`: Raw BPM value from Essentia (before normalization, rounded to 2 decimal places)
-- `bpm_confidence`: BPM confidence score (0.0-1.0, rounded to 2 decimal places). Higher value indicates more reliable BPM detection.
-- `bpm_method`: The BPM extraction method that won the ensemble comparison ("multifeature", "degara", or "onset")
-- `debug_info`: Debug information string (optional, currently shows the winning BPM method)
+- `bpm_raw`: Raw BPM value from Essentia or fallback service (before normalization, rounded to 2 decimal places)
+- `bpm_confidence`: BPM confidence score (0.0-1.0, rounded to 2 decimal places). Normalized from Essentia's raw confidence values (0-5.32 range). Higher value indicates more reliable BPM detection.
+- `bpm_method`: The BPM extraction method used:
+  - `"multifeature"`: Essentia RhythmExtractor2013 with multifeature method (primary service)
+  - `"librosa_hpss_fallback"`: Fallback service was used (confidence was below `max_confidence` threshold)
+- `debug_info`: Comprehensive debug information string including:
+  - URL fetch status
+  - Audio conversion status
+  - BPM analysis details (all three methods with raw and normalized confidence)
+  - Key analysis details (all profile types tested)
+  - Fallback service status (if triggered)
+  - Error messages (if any)
 - `key`: Detected musical key (e.g., "C", "D", "E", "F", "G", "A", "B")
 - `scale`: Detected scale ("major" or "minor")
 - `key_confidence`: Key detection confidence score (0.0-1.0, rounded to 2 decimal places). Higher value indicates more reliable key detection.
@@ -456,23 +563,87 @@ curl http://localhost:8080/health
 
 ## Processing Pipeline
 
+### Primary Service Flow
+
 1. **Download**: Fetch audio from preview URL (with SSRF protection)
 2. **Convert**: Use ffmpeg to convert to mono 44100Hz 16-bit PCM WAV
-3. **Separate**: Apply Essentia `HPSS` (Harmonic-Percussive Source Separation) to split audio into:
-   - **Harmonic component**: Used for key detection (tonal content)
-   - **Percussive component**: Used for BPM detection (rhythmic content)
-4. **Analyze BPM**: Use Essentia `RhythmExtractor2013` (dual-method: multifeature and degara) on percussive component to compute BPM and confidence
-5. **Analyze Key**: Use Essentia `KeyExtractor` (multiple profile types) on harmonic component to compute musical key, scale, and confidence
-6. **Normalize**: Adjust BPM for extreme outliers only:
+3. **BPM Analysis**:
+   - Use `RhythmExtractor2013(method="multifeature")` to extract BPM and confidence
+   - Confidence range: 0-5.32 (raw), normalized to 0-1
+   - Quality levels:
+     - [0, 1): very low confidence
+     - [1, 2): low confidence
+     - [2, 3): moderate confidence
+     - [3, 3.5): high confidence
+     - (3.5, 5.32]: excellent confidence
+   - Check if normalized confidence >= `max_confidence` threshold
+4. **Key Analysis**: Use Essentia `KeyExtractor` with multiple profile types (temperley, krumhansl, edma, edmm) and select best result
+   - Check if normalized strength >= `max_confidence` threshold
+5. **Selective Fallback Decision**:
+   - If BPM confidence < `max_confidence`: Note need for BPM fallback
+   - If key strength < `max_confidence`: Note need for key fallback
+   - Call fallback service for BPM only, key only, both, or neither
+6. **Fallback Service Call** (if needed):
+   - Upload WAV file to fallback service
+   - Receive high-accuracy results from librosa-based processing
+   - Overwrite only the results that needed fallback (BPM, key, or both)
+7. **Normalize BPM**: Adjust for extreme outliers only:
    - If BPM < 40: multiply by 2
    - If BPM > 220: divide by 2
    - Otherwise: return unchanged
-7. **Cleanup**: Delete temporary files
-8. **Return**: JSON response with BPM and key data
+8. **Cleanup**: Delete temporary files
+9. **Return**: JSON response with BPM and key data
+
+### Fallback Service Flow (when triggered)
+
+1. **Receive**: WAV file upload from primary service
+2. **Load**: Load audio with librosa (44100Hz, mono)
+3. **HPSS**: Apply Harmonic-Percussive Source Separation:
+   - **Percussive component**: Used for BPM detection
+   - **Harmonic component**: Used for key detection
+4. **BPM Extraction**: Use `librosa.beat.beat_track()` on percussive component
+5. **Key Extraction**: Use `librosa.feature.chroma_stft()` on harmonic component + Krumhansl-Schmuckler algorithm
+6. **Confidence Calculation**: Calculate BPM confidence from beat consistency (capped at 0.85)
+7. **Return**: High-accuracy results to primary service
+
+## Algorithms and Confidence Ranges
+
+### Primary Service (Essentia)
+
+**BPM Extraction:**
+- **RhythmExtractor2013(method="multifeature")**: Confidence range 0-5.32, normalized by dividing by 5.32 (values > 5.32 clamped to 1.0)
+  - Quality guidelines:
+    - [0, 1): very low confidence
+    - [1, 2): low confidence
+    - [2, 3): moderate confidence
+    - [3, 3.5): high confidence
+    - (3.5, 5.32]: excellent confidence
+
+**Key Detection:**
+- **KeyExtractor**: Strength values (range varies by profile type). The service tries multiple profiles (temperley, krumhansl, edma, edmm) and selects the best result.
+
+### Fallback Service (Librosa)
+
+**BPM Extraction:**
+- **librosa.beat.beat_track()**: No built-in confidence. Custom confidence calculated from beat consistency (coefficient of variation), capped at 0.85.
+
+**Key Detection:**
+- **librosa.feature.chroma_stft() + Krumhansl-Schmuckler**: Correlation values (-1 to 1) normalized to 0-1 using `(corr + 1) / 2`.
+
+## Confidence Normalization
+
+The service normalizes confidence values from different algorithms to a consistent 0-1 range:
+
+- **Essentia RhythmExtractor2013(method="multifeature")**: Confidence range 0-5.32, normalized by dividing by 5.32 (values > 5.32 clamped to 1.0)
+  - Quality levels are determined from raw confidence before normalization
+- **Essentia KeyExtractor**: Strength values (typically 0-1 range), used as-is if already 0-1, otherwise clamped to [0, 1]
+- **Librosa beat_track**: Custom confidence calculation from beat consistency (already 0-1, capped at 0.85)
+- **Krumhansl-Schmuckler**: Correlation values (-1 to 1) normalized to 0-1 using `(corr + 1) / 2`
 
 ## Security Notes
 
 - Cloud Run IAM authentication (no public access)
+- Service-to-service authentication for fallback calls (OIDC tokens)
 - SSRF protection through HTTPS-only requirement and redirect validation
 - Download size and timeout limits
 - No audio persistence (temp files deleted immediately)
@@ -509,7 +680,7 @@ Ensure the audio file is a valid format. The service supports common audio forma
 
 ### High memory usage
 
-The service is configured with 2GB memory. For very large files or high concurrency, consider increasing:
+The primary service is configured with 2GB memory. For very large files or high concurrency, consider increasing:
 
 ```bash
 PROJECT_ID="your-project-id"
@@ -519,6 +690,41 @@ SERVICE_NAME="bpm-service"
 gcloud run services update ${SERVICE_NAME} \
     --region=${REGION} \
     --memory 4Gi \
+    --project=${PROJECT_ID}
+```
+
+The fallback service is already configured with 4GB memory and 2 CPU cores for high-accuracy processing.
+
+### Fallback service not being called
+
+If the fallback service is not being triggered when expected:
+
+1. **Check confidence threshold**: Ensure the primary service's `FALLBACK_THRESHOLD` in `main.py` is set correctly (default: 0.70)
+2. **Verify fallback URL**: Ensure `FALLBACK_SERVICE_URL` in `main.py` matches the deployed fallback service URL
+3. **Check authentication**: The primary service needs permission to call the fallback service. Ensure the primary service's default Cloud Run service account has `roles/run.invoker` permission on the fallback service
+4. **Check debug_info**: The `debug_info` field in the response will indicate if fallback was triggered and any errors encountered
+
+### Fallback service authentication errors
+
+If you see authentication errors when the fallback is triggered:
+
+```bash
+PROJECT_ID="your-project-id"
+REGION="your-region"
+PRIMARY_SERVICE="bpm-service"
+FALLBACK_SERVICE="bpm-fallback-service"
+
+# Get the primary service's service account
+PRIMARY_SA=$(gcloud run services describe ${PRIMARY_SERVICE} \
+    --region=${REGION} \
+    --format="value(spec.template.spec.serviceAccountName)" \
+    --project=${PROJECT_ID})
+
+# Grant invoker permission
+gcloud run services add-iam-policy-binding ${FALLBACK_SERVICE} \
+    --region=${REGION} \
+    --member="serviceAccount:${PRIMARY_SA}" \
+    --role="roles/run.invoker" \
     --project=${PROJECT_ID}
 ```
 

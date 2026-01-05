@@ -5,6 +5,7 @@ Computes BPM and key from 30s audio preview URLs.
 import os
 import tempfile
 import subprocess
+import math
 from typing import Optional, Tuple
 from urllib.parse import urlparse
 import httpx
@@ -13,6 +14,15 @@ from pydantic import BaseModel, HttpUrl, field_validator
 import numpy as np
 import essentia.standard as es
 
+# Google Cloud authentication for service-to-service calls
+try:
+    import google.auth
+    import google.auth.transport.requests
+    import google.oauth2.id_token
+    GCP_AUTH_AVAILABLE = True
+except ImportError:
+    GCP_AUTH_AVAILABLE = False
+
 app = FastAPI(title="BPM Finder API")
 
 # Download limits
@@ -20,9 +30,14 @@ CONNECT_TIMEOUT = 5.0  # seconds
 TOTAL_TIMEOUT = 20.0  # seconds
 MAX_SIZE = 10 * 1024 * 1024  # 10MB
 
+# Fallback Service Configuration
+FALLBACK_SERVICE_URL = "https://bpm-fallback-service-340051416180.europe-west3.run.app"
+FALLBACK_SERVICE_AUDIENCE = FALLBACK_SERVICE_URL
+
 
 class BPMRequest(BaseModel):
     url: HttpUrl
+    max_confidence: Optional[float] = 0.65
 
     @field_validator("url")
     @classmethod
@@ -31,6 +46,14 @@ class BPMRequest(BaseModel):
         url_str = str(v)
         if not url_str.startswith("https://"):
             raise ValueError("Only HTTPS URLs are allowed")
+        return v
+    
+    @field_validator("max_confidence")
+    @classmethod
+    def validate_max_confidence(cls, v):
+        """Validate max_confidence is in valid range."""
+        if v is not None and (v < 0.0 or v > 1.0):
+            raise ValueError("max_confidence must be between 0.0 and 1.0")
         return v
 
 
@@ -171,17 +194,13 @@ def convert_to_wav(input_path: str, output_path: str) -> None:
 
 
 def compute_bpm(wav_path: str) -> Tuple[float, float, float, str, str]:
-    """Compute BPM using Essentia with three-method ensemble approach.
-    
-    Implements a robust three-method BPM extraction: multifeature, degara, and onset-based.
-    Normalizes BPM values before comparing confidence scores to prevent octave errors,
-    and returns the result with highest confidence.
+    """Compute BPM using Essentia RhythmExtractor2013 with multifeature method.
     
     Args:
         wav_path: Path to the WAV audio file
     
     Returns:
-        (normalized_bpm, raw_bpm, confidence, method_name, debug_info) tuple
+        (normalized_bpm, raw_bpm, normalized_confidence, quality_level, debug_info) tuple
     """
     debug_lines = []
     
@@ -194,86 +213,26 @@ def compute_bpm(wav_path: str) -> Tuple[float, float, float, str, str]:
         debug_lines.append(error_msg)
         raise Exception(error_msg)
     
-    # Method 1: Multifeature
-    bpm_mf_raw = None
-    bpm_mf_normalized = None
-    beats_confidence_mf = 0.0
-    mf_error = None
+    # BPM extraction using multifeature method
     try:
-        rhythm_extractor_mf = es.RhythmExtractor2013(method="multifeature")
-        bpm_mf_raw, beats_mf, beats_confidence_mf, _, beats_intervals_mf = rhythm_extractor_mf(audio)
-        bpm_mf_normalized = normalize_bpm(float(bpm_mf_raw))
-        debug_lines.append(f"multifeature: BPM={bpm_mf_raw:.2f} (norm={bpm_mf_normalized:.1f}), confidence={beats_confidence_mf:.3f}")
-    except Exception as e:
-        mf_error = f"multifeature error: {str(e)}"
-        debug_lines.append(mf_error)
-        beats_confidence_mf = -1.0  # Mark as failed
-    
-    # Method 2: Degara
-    bpm_dg_raw = None
-    bpm_dg_normalized = None
-    beats_confidence_dg = 0.0
-    dg_error = None
-    try:
-        rhythm_extractor_dg = es.RhythmExtractor2013(method="degara")
-        bpm_dg_raw, beats_dg, beats_confidence_dg, _, beats_intervals_dg = rhythm_extractor_dg(audio)
-        bpm_dg_normalized = normalize_bpm(float(bpm_dg_raw))
-        debug_lines.append(f"degara: BPM={bpm_dg_raw:.2f} (norm={bpm_dg_normalized:.1f}), confidence={beats_confidence_dg:.3f}")
-    except Exception as e:
-        dg_error = f"degara error: {str(e)}"
-        debug_lines.append(dg_error)
-        beats_confidence_dg = -1.0  # Mark as failed
-    
-    # Method 3: Onset-based
-    bpm_onset_raw = None
-    bpm_onset_norm = None
-    beats_confidence_onset = 0.0
-    onset_error = None
-    try:
-        od = es.OnsetDetection(method='complex')
-        onsets = od(audio)
-        bt = es.BeatTrackerDegara()
-        bpm_onset_raw, _, beats_confidence_onset, _, _ = bt(onsets)
-        bpm_onset_norm = normalize_bpm(float(bpm_onset_raw))
-        debug_lines.append(f"onset: BPM={bpm_onset_raw:.2f} (norm={bpm_onset_norm:.1f}), confidence={beats_confidence_onset:.3f}")
-    except Exception as e:
-        onset_error = f"onset error: {str(e)}"
-        debug_lines.append(onset_error)
-        beats_confidence_onset = -1.0  # Mark as failed
-    
-    # Analyze confidence scores for insights
-    valid_confidences = [c for c in [beats_confidence_mf, beats_confidence_dg, beats_confidence_onset] if c >= 0]
-    if valid_confidences:
-        avg_confidence = sum(valid_confidences) / len(valid_confidences)
-        min_confidence = min(valid_confidences)
-        max_confidence = max(valid_confidences)
+        rhythm_extractor = es.RhythmExtractor2013(method="multifeature")
+        bpm_raw, beats, confidence_raw, _, beats_intervals = rhythm_extractor(audio)
         
-        if min_confidence < 0.3:
-            debug_lines.append(f"WARNING: Low confidence detected (min={min_confidence:.3f})")
-        if max_confidence > 0.8:
-            debug_lines.append(f"INFO: High confidence detected (max={max_confidence:.3f})")
-        if max_confidence - min_confidence > 0.4:
-            debug_lines.append(f"INFO: High confidence variance (range={max_confidence - min_confidence:.3f})")
-        debug_lines.append(f"Ensemble: avg_confidence={avg_confidence:.3f}, range=[{min_confidence:.3f}, {max_confidence:.3f}]")
-    
-    # Compare confidence scores and return normalized BPM of winning method
-    if beats_confidence_mf >= beats_confidence_dg and beats_confidence_mf >= beats_confidence_onset and beats_confidence_mf >= 0:
-        debug_lines.append(f"Winner: multifeature (confidence={beats_confidence_mf:.3f})")
-        return bpm_mf_normalized, float(bpm_mf_raw), float(beats_confidence_mf), "multifeature", "\n".join(debug_lines)
-    elif beats_confidence_dg >= beats_confidence_onset and beats_confidence_dg >= 0:
-        debug_lines.append(f"Winner: degara (confidence={beats_confidence_dg:.3f})")
-        return bpm_dg_normalized, float(bpm_dg_raw), float(beats_confidence_dg), "degara", "\n".join(debug_lines)
-    elif beats_confidence_onset >= 0:
-        debug_lines.append(f"Winner: onset (confidence={beats_confidence_onset:.3f})")
-        return bpm_onset_norm, float(bpm_onset_raw), float(beats_confidence_onset), "onset", "\n".join(debug_lines)
-    else:
-        # All methods failed, return first available or raise error
-        error_msg = "All BPM extraction methods failed"
+        # Normalize confidence and get quality level
+        confidence_normalized, quality = normalize_confidence(float(confidence_raw))
+        bpm_normalized = normalize_bpm(float(bpm_raw))
+        
+        debug_lines.append(f"BPM={bpm_raw:.2f} (normalized={bpm_normalized:.1f})")
+        debug_lines.append(f"Confidence: raw={confidence_raw:.3f} (range: 0-5.32), normalized={confidence_normalized:.3f} (0-1), quality={quality}")
+        
+        return bpm_normalized, float(bpm_raw), confidence_normalized, quality, "\n".join(debug_lines)
+    except Exception as e:
+        error_msg = f"BPM extraction error: {str(e)}"
         debug_lines.append(error_msg)
-        raise Exception(f"{error_msg}\n" + "\n".join(debug_lines))
+        raise Exception(error_msg)
 
 
-def compute_key(wav_path: str) -> Tuple[str, str, float, str]:
+def compute_key(wav_path: str) -> Tuple[str, str, float, float, str]:
     """Compute musical key using Essentia KeyExtractor with multiple profile types.
     
     Tries multiple key profile types and returns the result with the highest strength value.
@@ -282,10 +241,11 @@ def compute_key(wav_path: str) -> Tuple[str, str, float, str]:
         wav_path: Path to the WAV audio file
     
     Returns:
-        (key, scale, confidence, debug_info) tuple
+        (key, scale, raw_strength, normalized_strength, debug_info) tuple
         - key: The detected key (e.g., "C", "D", "E", etc.)
         - scale: The detected scale ("major" or "minor")
-        - confidence: Confidence score (0.0-1.0)
+        - raw_strength: Raw strength value from Essentia
+        - normalized_strength: Normalized strength (0.0-1.0), assuming KeyExtractor returns 0-1 range
         - debug_info: Debug information string
     """
     debug_lines = []
@@ -322,23 +282,72 @@ def compute_key(wav_path: str) -> Tuple[str, str, float, str]:
     if results:
         # Sort by strength (index 2) in descending order
         results.sort(key=lambda x: x[2], reverse=True)
-        key, scale, strength, winning_profile = results[0]
-        debug_lines.append(f"Winner: {winning_profile} profile (strength={strength:.3f})")
+        key, scale, raw_strength, winning_profile = results[0]
+        
+        # Normalize strength (assume KeyExtractor returns 0-1, but clamp if > 1)
+        normalized_strength = min(1.0, max(0.0, raw_strength))
+        
+        debug_lines.append(f"Winner: {winning_profile} profile (strength={raw_strength:.3f}, normalized={normalized_strength:.3f})")
         if len(results) > 1:
             strength_range = results[0][2] - results[-1][2]
             debug_lines.append(f"Key ensemble: {len(results)} profiles, strength_range={strength_range:.3f}")
-        return key, scale, strength, "\n".join(debug_lines)
+        return key, scale, float(raw_strength), float(normalized_strength), "\n".join(debug_lines)
     
     # Fall back to default KeyExtractor if no profiles worked
     try:
         key_extractor = es.KeyExtractor()
-        key, scale, strength = key_extractor(audio)
-        debug_lines.append(f"Fallback: default KeyExtractor, key={key} {scale}, strength={strength:.3f}")
-        return str(key), str(scale), float(strength), "\n".join(debug_lines)
+        key, scale, raw_strength = key_extractor(audio)
+        normalized_strength = min(1.0, max(0.0, raw_strength))
+        debug_lines.append(f"Fallback: default KeyExtractor, key={key} {scale}, strength={raw_strength:.3f} (normalized={normalized_strength:.3f})")
+        return str(key), str(scale), float(raw_strength), float(normalized_strength), "\n".join(debug_lines)
     except Exception as e:
         error_msg = f"KeyExtractor fallback error: {str(e)}"
         debug_lines.append(error_msg)
         raise Exception(error_msg)
+
+
+def normalize_confidence(confidence: float) -> Tuple[float, str]:
+    """Normalize confidence value to 0-1 range and determine quality level.
+    
+    RhythmExtractor2013(method="multifeature") returns confidence in range 0-5.32.
+    This function normalizes to 0-1 and categorizes quality.
+    
+    Quality guidelines:
+    - [0, 1): very low confidence
+    - [1, 2): low confidence
+    - [2, 3): moderate confidence
+    - [3, 3.5): high confidence
+    - (3.5, 5.32]: excellent confidence
+    
+    Args:
+        confidence: Raw confidence value from Essentia (0-5.32)
+    
+    Returns:
+        Tuple of (normalized_confidence, quality_level) where:
+        - normalized_confidence: Value in [0, 1] range
+        - quality_level: Quality category string
+    """
+    # Clamp negative values to 0
+    if confidence < 0:
+        return 0.0, "very low"
+    
+    # Determine quality level based on raw confidence
+    MAX_CONFIDENCE = 5.32
+    if confidence < 1.0:
+        quality = "very low"
+    elif confidence < 2.0:
+        quality = "low"
+    elif confidence < 3.0:
+        quality = "moderate"
+    elif confidence < 3.5:
+        quality = "high"
+    else:
+        quality = "excellent"
+    
+    # Normalize to 0-1 range
+    normalized = min(1.0, confidence / MAX_CONFIDENCE)
+    
+    return float(normalized), quality
 
 
 def normalize_bpm(bpm: float) -> float:
@@ -360,6 +369,21 @@ def normalize_bpm(bpm: float) -> float:
     
     # Round to 1 decimal place
     return round(normalized, 1)
+
+
+async def get_auth_headers(audience: str) -> dict:
+    """Generates an OIDC token for the target audience for internal Cloud Run calls."""
+    if not GCP_AUTH_AVAILABLE:
+        return {}
+    try:
+        credentials, _ = google.auth.default()
+        auth_request = google.auth.transport.requests.Request()
+        token = google.oauth2.id_token.fetch_id_token(auth_request, audience)
+        return {"Authorization": f"Bearer {token}"}
+    except Exception as e:
+        # If running locally or without proper service account, log error
+        print(f"Error generating auth token: {e}")
+        return {}
 
 
 @app.get("/health")
@@ -408,38 +432,137 @@ async def compute_bpm_from_url(request: BPMRequest):
             debug_info_parts.append(error_msg)
             raise HTTPException(status_code=500, detail=error_msg)
         
-        # Compute BPM using three-method ensemble
+        # Get max_confidence threshold (default 0.65)
+        max_confidence = request.max_confidence if request.max_confidence is not None else 0.65
+        debug_info_parts.append(f"Max confidence threshold: {max_confidence:.2f}")
+        
+        # Compute BPM using multifeature method
+        bpm_normalized = None
+        bpm_raw = None
+        bpm_confidence_normalized = None
+        bpm_quality = None
+        bpm_method = "multifeature"
+        need_fallback_bpm = False
+        
         try:
-            bpm_normalized, bpm_raw, confidence, bpm_method, bpm_debug = compute_bpm(output_path)
-            debug_info_parts.append("=== BPM Analysis ===")
+            bpm_normalized, bpm_raw, bpm_confidence_normalized, bpm_quality, bpm_debug = compute_bpm(output_path)
+            debug_info_parts.append("=== BPM Analysis (Essentia) ===")
             debug_info_parts.append(bpm_debug)
+            
+            # Check if BPM confidence meets threshold
+            if bpm_confidence_normalized >= max_confidence:
+                debug_info_parts.append(f"BPM confidence ({bpm_confidence_normalized:.3f}) >= threshold ({max_confidence:.2f}) - using Essentia result")
+            else:
+                need_fallback_bpm = True
+                debug_info_parts.append(f"BPM confidence ({bpm_confidence_normalized:.3f}) < threshold ({max_confidence:.2f}) - fallback needed")
         except Exception as e:
             error_msg = f"BPM computation error: {str(e)}"
             debug_info_parts.append(error_msg)
-            raise HTTPException(status_code=500, detail=error_msg)
+            need_fallback_bpm = True  # Need fallback if computation failed
         
-        # Compute key
+        # Compute key using Essentia
+        key = "unknown"
+        scale = "unknown"
+        key_strength_raw = 0.0
+        key_confidence_normalized = 0.0
+        need_fallback_key = False
+        
         try:
-            key, scale, key_confidence, key_debug = compute_key(output_path)
-            debug_info_parts.append("=== Key Analysis ===")
+            key, scale, key_strength_raw, key_confidence_normalized, key_debug = compute_key(output_path)
+            debug_info_parts.append("=== Key Analysis (Essentia) ===")
             debug_info_parts.append(key_debug)
+            
+            # Check if key strength meets threshold
+            if key_confidence_normalized >= max_confidence:
+                debug_info_parts.append(f"Key strength ({key_confidence_normalized:.3f}) >= threshold ({max_confidence:.2f}) - using Essentia result")
+            else:
+                need_fallback_key = True
+                debug_info_parts.append(f"Key strength ({key_confidence_normalized:.3f}) < threshold ({max_confidence:.2f}) - fallback needed")
         except Exception as e:
             error_msg = f"Key computation error: {str(e)}"
             debug_info_parts.append(error_msg)
-            # Don't fail the whole request if key fails, but include error in debug
-            key = "unknown"
-            scale = "unknown"
-            key_confidence = 0.0
+            need_fallback_key = True  # Need fallback if computation failed
+        
+        # Call fallback service selectively
+        if need_fallback_bpm or need_fallback_key:
+            fallback_items = []
+            if need_fallback_bpm:
+                fallback_items.append("BPM")
+            if need_fallback_key:
+                fallback_items.append("key")
+            
+            debug_info_parts.append(f"=== Fallback Service Call ({', '.join(fallback_items)}) ===")
+            
+            try:
+                # Get authentication headers
+                auth_headers = await get_auth_headers(FALLBACK_SERVICE_AUDIENCE)
+                
+                # Read the WAV file content into memory
+                with open(output_path, "rb") as wav_file:
+                    wav_content = wav_file.read()
+                
+                files = {"audio_file": ("audio.wav", wav_content, "audio/wav")}
+                data = {
+                    "url": url_str,
+                    "process_bpm": need_fallback_bpm,
+                    "process_key": need_fallback_key
+                }
+                
+                # Make async POST request to fallback service
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    response = await client.post(
+                        f"{FALLBACK_SERVICE_URL}/bpm",
+                        files=files,
+                        data=data,
+                        headers=auth_headers
+                    )
+                    
+                    if response.status_code == 200:
+                        fallback_data = response.json()
+                        debug_info_parts.append("Fallback service: SUCCESS")
+                        
+                        # Update BPM if fallback was needed and response contains BPM data
+                        if need_fallback_bpm and fallback_data.get("bpm_normalized") is not None:
+                            bpm_normalized = fallback_data["bpm_normalized"]
+                            bpm_raw = fallback_data["bpm_raw"]
+                            bpm_confidence_normalized = fallback_data["confidence"]
+                            bpm_method = "librosa_hpss_fallback"
+                            debug_info_parts.append(f"Fallback BPM: {bpm_normalized:.1f} (confidence={bpm_confidence_normalized:.3f})")
+                        elif need_fallback_bpm:
+                            debug_info_parts.append("Fallback BPM: No data returned from fallback service")
+                        
+                        # Update key if fallback was needed and response contains key data
+                        if need_fallback_key and fallback_data.get("key") is not None:
+                            key = fallback_data["key"]
+                            scale = fallback_data["scale"]
+                            key_confidence_normalized = fallback_data["key_confidence"]
+                            debug_info_parts.append(f"Fallback key: {key} {scale} (confidence={key_confidence_normalized:.3f})")
+                        elif need_fallback_key:
+                            debug_info_parts.append("Fallback key: No data returned from fallback service")
+                    else:
+                        debug_info_parts.append(f"Fallback service: HTTP {response.status_code} - {response.text[:200]}")
+                        # Continue with Essentia results if fallback fails
+            except Exception as e:
+                # Log error but don't fail - proceed with Essentia results
+                debug_info_parts.append(f"Fallback service error: {str(e)[:200]}")
+                # Continue with Essentia results if fallback fails
+        
+        # Ensure we have valid values (use defaults if fallback failed and Essentia also failed)
+        if bpm_normalized is None:
+            bpm_normalized = 0.0
+            bpm_raw = 0.0
+            bpm_confidence_normalized = 0.0
+            bpm_method = "error"
         
         return BPMResponse(
             bpm=int(round(bpm_normalized)),
             bpm_raw=round(bpm_raw, 2),
-            bpm_confidence=round(confidence, 2),
+            bpm_confidence=round(bpm_confidence_normalized, 2),
             bpm_method=bpm_method,
             debug_info="\n".join(debug_info_parts),
             key=key,
             scale=scale,
-            key_confidence=round(key_confidence, 2),
+            key_confidence=round(key_confidence_normalized, 2),
         )
     
     except HTTPException:

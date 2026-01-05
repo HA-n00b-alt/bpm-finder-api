@@ -5,9 +5,9 @@ Accepts pre-processed WAV audio files directly via file upload.
 """
 import os
 import tempfile
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Literal
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import numpy as np
 
 app = FastAPI(title="BPM Fallback Service")
@@ -18,12 +18,22 @@ import librosa
 
 
 class FallbackResponse(BaseModel):
-    bpm_normalized: float
-    bpm_raw: float
-    confidence: float
-    key: str
-    scale: str
-    key_confidence: float
+    """Response from fallback service.
+    
+    Fields are Optional to support selective processing:
+    - If only BPM is requested: BPM fields populated, key fields None
+    - If only key is requested: key fields populated, BPM fields None
+    - If both are requested: all fields populated
+    
+    Note: If a field is requested (process_bpm/process_key=True), it will always
+    be populated unless an error occurs (which raises HTTPException).
+    """
+    bpm_normalized: Optional[float] = None
+    bpm_raw: Optional[float] = None
+    confidence: Optional[float] = None
+    key: Optional[str] = None
+    scale: Optional[str] = None
+    key_confidence: Optional[float] = None
 
 
 def normalize_bpm(bpm: float) -> float:
@@ -109,17 +119,28 @@ async def health():
 @app.post("/bpm", response_model=FallbackResponse)
 async def process_bpm(
     audio_file: UploadFile = File(...),
-    url: Optional[str] = Form(None)
+    url: Optional[str] = Form(None),
+    process_bpm: bool = Form(True),
+    process_key: bool = Form(True)
 ):
-    """Process BPM and key from uploaded WAV audio file using high-accuracy librosa methods.
+    """Process BPM and/or key from uploaded WAV audio file using high-accuracy librosa methods.
     
     Args:
         audio_file: Uploaded WAV audio file (mono, 44100Hz)
         url: Optional original URL for logging/debug purposes
+        process_bpm: Whether to process BPM (default: True)
+        process_key: Whether to process key (default: True)
     
     Returns:
-        FallbackResponse with BPM and key analysis
+        FallbackResponse with BPM and/or key analysis (only requested fields populated)
     """
+    # Validate that at least one processing option is requested
+    if not process_bpm and not process_key:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one of process_bpm or process_key must be True"
+        )
+    
     temp_path = None
     
     try:
@@ -144,45 +165,70 @@ async def process_bpm(
         # Load audio with librosa (guaranteed to be mono, 44100Hz WAV)
         audio, sr = librosa.load(temp_path, sr=44100, mono=True)
         
+        # Initialize response values
+        bpm_normalized = None
+        bpm_raw = None
+        confidence = None
+        key = None
+        scale = None
+        key_confidence = None
+        
         # Perform Harmonic-Percussive Source Separation
+        # We always need HPSS if either BPM or key is requested (already validated above)
         harmonic, percussive = librosa.effects.hpss(audio)
         
-        # BPM Extraction (Percussive component)
-        tempo, beats = librosa.beat.beat_track(y=percussive, sr=sr)
-        bpm_raw = float(tempo)
-        bpm_normalized = normalize_bpm(bpm_raw)
-        
-        # Calculate confidence based on beat tracking quality
-        # Use the consistency of detected beats as confidence indicator
-        if len(beats) > 0:
-            # Calculate confidence from beat consistency
-            beat_intervals = np.diff(beats)
-            if len(beat_intervals) > 1:
-                # Lower variance in beat intervals = higher confidence
-                interval_std = np.std(beat_intervals)
-                interval_mean = np.mean(beat_intervals)
-                if interval_mean > 0:
-                    cv = interval_std / interval_mean  # Coefficient of variation
-                    # Apply cap to prevent over-reporting confidence
-                    confidence = min(0.85, max(0.0, 1.0 - cv * 2))
+        # BPM Extraction (Percussive component) - only if requested
+        if process_bpm:
+            try:
+                tempo, beats = librosa.beat.beat_track(y=percussive, sr=sr)
+                bpm_raw = float(tempo)
+                bpm_normalized = normalize_bpm(bpm_raw)
+                
+                # Calculate confidence based on beat tracking quality
+                # Use the consistency of detected beats as confidence indicator
+                if len(beats) > 0:
+                    # Calculate confidence from beat consistency
+                    beat_intervals = np.diff(beats)
+                    if len(beat_intervals) > 1:
+                        # Lower variance in beat intervals = higher confidence
+                        interval_std = np.std(beat_intervals)
+                        interval_mean = np.mean(beat_intervals)
+                        if interval_mean > 0:
+                            cv = interval_std / interval_mean  # Coefficient of variation
+                            # Apply cap to prevent over-reporting confidence
+                            confidence = min(0.85, max(0.0, 1.0 - cv * 2))
+                        else:
+                            confidence = 0.5
+                    else:
+                        confidence = 0.5
                 else:
-                    confidence = 0.5
-            else:
-                confidence = 0.5
-        else:
-            confidence = 0.0
+                    confidence = 0.0
+            except Exception as e:
+                # If BPM processing fails and it was requested, raise error
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"BPM processing failed: {str(e)[:200]}"
+                )
         
-        # Key Extraction (Harmonic component)
-        chroma = librosa.feature.chroma_stft(y=harmonic, sr=sr)
-        key, scale, key_confidence = extract_key_from_chroma(chroma)
+        # Key Extraction (Harmonic component) - only if requested
+        if process_key:
+            try:
+                chroma = librosa.feature.chroma_stft(y=harmonic, sr=sr)
+                key, scale, key_confidence = extract_key_from_chroma(chroma)
+            except Exception as e:
+                # If key processing fails and it was requested, raise error
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Key processing failed: {str(e)[:200]}"
+                )
         
         return FallbackResponse(
             bpm_normalized=bpm_normalized,
-            bpm_raw=round(bpm_raw, 2),
-            confidence=round(confidence, 2),
+            bpm_raw=round(bpm_raw, 2) if bpm_raw is not None else None,
+            confidence=round(confidence, 2) if confidence is not None else None,
             key=key,
             scale=scale,
-            key_confidence=round(key_confidence, 2),
+            key_confidence=round(key_confidence, 2) if key_confidence is not None else None,
         )
     
     except Exception as e:
