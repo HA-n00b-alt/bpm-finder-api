@@ -4,6 +4,8 @@ High-accuracy, high-cost fallback service for low-confidence primary service res
 Accepts pre-processed audio files directly via file upload (batch processing).
 """
 import io
+import os
+import tempfile
 from typing import Optional, Tuple, List
 from fastapi import FastAPI, UploadFile, HTTPException, Request
 from pydantic import BaseModel
@@ -139,15 +141,33 @@ def process_single_audio(
     scale = None
     key_confidence = None
     
-    # Load audio from memory using BytesIO
-    audio_io = io.BytesIO(audio_content)
+    # Load audio from memory
+    # For compressed formats (MP3/AAC), librosa needs a file path, not BytesIO
+    # Use a temporary file that gets cleaned up immediately
+    temp_file = None
     try:
-        audio, sr = librosa.load(audio_io, sr=44100, mono=True)
+        # Create temporary file
+        temp_fd, temp_file = tempfile.mkstemp(suffix='.tmp', dir='/tmp')
+        os.close(temp_fd)  # Close file descriptor, we'll write via path
+        
+        # Write audio content to temporary file
+        with open(temp_file, 'wb') as f:
+            f.write(audio_content)
+        
+        # Load audio using librosa (can now detect format from file extension/path)
+        audio, sr = librosa.load(temp_file, sr=44100, mono=True)
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=f"Audio loading failed: {str(e)[:200]}"
         )
+    finally:
+        # Clean up temporary file immediately after loading
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.unlink(temp_file)
+            except Exception:
+                pass  # Ignore cleanup errors
     
     # Only perform HPSS if we need either BPM or key
     if process_bpm or process_key:

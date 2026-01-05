@@ -24,7 +24,10 @@ COPY requirements.txt .
 # Upgrade pip first (without the flag since old pip doesn't support it)
 RUN python3 -m pip install --no-cache-dir --upgrade pip
 # Now install dependencies (newer pip supports --root-user-action to suppress warning)
-RUN python3 -m pip install --no-cache-dir -r requirements.txt --root-user-action=ignore
+# Verify google-auth installation explicitly
+RUN python3 -m pip install --no-cache-dir -r requirements.txt --root-user-action=ignore && \
+    python3 -c "import google.auth; print('google-auth imported successfully')" || \
+    (echo "ERROR: google-auth failed to import after installation" && exit 1)
 
 # Copy application code
 COPY main.py .

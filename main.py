@@ -14,13 +14,25 @@ from pydantic import BaseModel, HttpUrl, field_validator
 import essentia.standard as es
 
 # Google Cloud authentication for service-to-service calls
+GCP_AUTH_AVAILABLE = False
+GCP_AUTH_ERROR = None
 try:
     import google.auth
     import google.auth.transport.requests
     import google.oauth2.id_token
     GCP_AUTH_AVAILABLE = True
-except ImportError:
-    GCP_AUTH_AVAILABLE = False
+except ImportError as e:
+    # Capture the actual import error for debugging
+    import sys
+    import traceback
+    GCP_AUTH_ERROR = f"ImportError: {str(e)}\nPython path: {sys.path}\nTraceback: {traceback.format_exc()}"
+    print(f"Warning: Failed to import google-auth: {GCP_AUTH_ERROR}", file=sys.stderr)
+except Exception as e:
+    # Catch any other errors during import
+    import sys
+    import traceback
+    GCP_AUTH_ERROR = f"Unexpected error importing google-auth: {str(e)}\nTraceback: {traceback.format_exc()}"
+    print(f"Warning: Unexpected error importing google-auth: {GCP_AUTH_ERROR}", file=sys.stderr)
 
 app = FastAPI(title="BPM Finder API")
 
@@ -484,16 +496,49 @@ async def process_single_url(
 async def get_auth_headers(audience: str) -> dict:
     """Generates an OIDC token for the target audience for internal Cloud Run calls."""
     if not GCP_AUTH_AVAILABLE:
-        return {}
+        error_msg = "GCP_AUTH_AVAILABLE is False - google-auth library not imported"
+        if GCP_AUTH_ERROR:
+            error_msg += f"\nImport error details: {GCP_AUTH_ERROR[:500]}"
+        raise Exception(error_msg)
+    
+    # Run synchronous auth operations in a thread to avoid blocking
+    def _get_token_sync():
+        try:
+            # Get default credentials (uses the service account attached to the Cloud Run service)
+            credentials, project = google.auth.default()
+            
+            if not credentials:
+                raise Exception(f"No credentials found for audience: {audience}")
+            
+            # Refresh credentials if needed
+            if not credentials.valid:
+                auth_request = google.auth.transport.requests.Request()
+                credentials.refresh(auth_request)
+            
+            # Create a request object for fetching the ID token
+            auth_request = google.auth.transport.requests.Request()
+            
+            # Fetch the ID token with the audience (fallback service URL)
+            token = google.oauth2.id_token.fetch_id_token(auth_request, audience)
+            
+            if not token:
+                raise Exception(f"Empty token generated for audience: {audience}")
+            
+            return {"Authorization": f"Bearer {token}"}
+        except Exception as e:
+            # Re-raise with context
+            raise Exception(f"Error generating auth token for {audience}: {str(e)}")
+    
     try:
-        credentials, _ = google.auth.default()
-        auth_request = google.auth.transport.requests.Request()
-        token = google.oauth2.id_token.fetch_id_token(auth_request, audience)
-        return {"Authorization": f"Bearer {token}"}
+        # Run in executor to avoid blocking the event loop
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _get_token_sync)
     except Exception as e:
-        # If running locally or without proper service account, log error
-        print(f"Error generating auth token: {e}")
-        return {}
+        # Log the full error for debugging
+        import traceback
+        error_details = f"Error in get_auth_headers for {audience}: {str(e)}\n{traceback.format_exc()}"
+        print(error_details)
+        raise  # Re-raise so caller can see the error
 
 
 @app.get("/health")
@@ -536,24 +581,46 @@ async def analyze_batch(request: BatchBPMRequest):
             item["debug_info_parts"].append(f"Fallback needed: BPM={item['need_fallback_bpm']}, Key={item['need_fallback_key']}")
         
         try:
-            auth_headers = await get_auth_headers(FALLBACK_SERVICE_AUDIENCE)
+            # Get auth headers and capture any errors
+            auth_error = None
+            try:
+                auth_headers = await get_auth_headers(FALLBACK_SERVICE_AUDIENCE)
+            except Exception as e:
+                auth_error = str(e)
+                auth_headers = {}
+            
+            # Log auth header status (without exposing the token)
+            if auth_headers and "Authorization" in auth_headers:
+                for item in fallback_items:
+                    item["debug_info_parts"].append(f"Auth token generated: Yes (Bearer token present)")
+            else:
+                for item in fallback_items:
+                    error_msg = "Auth token generation failed"
+                    if auth_error:
+                        error_msg += f": {auth_error[:200]}"
+                    else:
+                        error_msg += " - check service account permissions and GCP_AUTH_AVAILABLE"
+                    item["debug_info_parts"].append(error_msg)
             
             # Prepare multipart files for fallback (streaming, not reading into RAM)
             files = []
             data = {}
             file_handles = []  # Keep track for cleanup
+            file_index_to_item_index = []  # Map file index to fallback_items index
             
             for i, item in enumerate(fallback_items):
                 if item["file_path"] and os.path.exists(item["file_path"]):
                     # Open file for streaming upload
                     file_handle = open(item["file_path"], "rb")
                     file_handles.append(file_handle)
+                    file_idx = len(files)  # Index in files array
+                    file_index_to_item_index.append(i)  # Map to fallback_items index
                     files.append(
-                        ("audio_files", (f"audio_{i}.tmp", file_handle, "audio/mpeg"))
+                        ("audio_files", (f"audio_{file_idx}.tmp", file_handle, "audio/mpeg"))
                     )
-                    data[f"process_bpm_{i}"] = str(item["need_fallback_bpm"]).lower()
-                    data[f"process_key_{i}"] = str(item["need_fallback_key"]).lower()
-                    data[f"url_{i}"] = item["url"]
+                    data[f"process_bpm_{file_idx}"] = str(item["need_fallback_bpm"]).lower()
+                    data[f"process_key_{file_idx}"] = str(item["need_fallback_key"]).lower()
+                    data[f"url_{file_idx}"] = item["url"]
                 else:
                     # Log missing file
                     item["debug_info_parts"].append(f"Fallback skipped: file_path missing or doesn't exist")
@@ -587,9 +654,11 @@ async def analyze_batch(request: BatchBPMRequest):
                             fallback_results = response.json()
                             
                             # Update processed items with fallback results
-                            for i, fallback_result in enumerate(fallback_results):
-                                if i < len(fallback_items):
-                                    item = fallback_items[i]
+                            # Match results by file_index_to_item_index mapping
+                            for file_idx, fallback_result in enumerate(fallback_results):
+                                if file_idx < len(file_index_to_item_index):
+                                    item_idx = file_index_to_item_index[file_idx]
+                                    item = fallback_items[item_idx]
                                     item_index = item["index"]
                                     
                                     # Update BPM if fallback was needed and returned
