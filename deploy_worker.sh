@@ -8,6 +8,7 @@ SERVICE_NAME="bpm-worker"
 ARTIFACT_REPO="bpm-repo"
 PUBSUB_TOPIC="bpm-analysis-tasks"
 PUBSUB_SUBSCRIPTION="bpm-analysis-worker-sub"
+PUBSUB_DEAD_LETTER_TOPIC="bpm-analysis-tasks-dlq"
 
 # Image tag
 IMAGE_TAG="${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/${SERVICE_NAME}:latest"
@@ -49,6 +50,18 @@ if ! gcloud pubsub topics describe "${PUBSUB_TOPIC}" \
     echo "✅ Topic created successfully"
 else
     echo "Topic already exists: ${PUBSUB_TOPIC}"
+fi
+
+# Create Dead Letter Topic if it doesn't exist
+echo "📨 Checking Dead Letter Topic..."
+if ! gcloud pubsub topics describe "${PUBSUB_DEAD_LETTER_TOPIC}" \
+    --project="${PROJECT_ID}" &>/dev/null; then
+    echo "Creating Dead Letter Topic: ${PUBSUB_DEAD_LETTER_TOPIC}"
+    gcloud pubsub topics create "${PUBSUB_DEAD_LETTER_TOPIC}" \
+        --project="${PROJECT_ID}"
+    echo "✅ Dead Letter Topic created successfully"
+else
+    echo "Dead Letter Topic already exists: ${PUBSUB_DEAD_LETTER_TOPIC}"
 fi
 echo ""
 
@@ -184,36 +197,46 @@ gcloud run services add-iam-policy-binding "${SERVICE_NAME}" \
     --project "${PROJECT_ID}"
 
 # Create Pub/Sub push subscription if it doesn't exist
-echo "📨 Creating Pub/Sub push subscription with OIDC authentication..."
+echo "📨 Creating Pub/Sub push subscription with OIDC authentication and Dead Letter Topic..."
 if ! gcloud pubsub subscriptions describe "${PUBSUB_SUBSCRIPTION}" \
     --project="${PROJECT_ID}" &>/dev/null; then
     echo "Creating push subscription: ${PUBSUB_SUBSCRIPTION}"
-    # Create with OIDC token authentication
+    # Create with OIDC token authentication and Dead Letter Topic
     # --push-auth-service-account: The SA that will authenticate to Cloud Run
     # --push-auth-token-audience: The Cloud Run service URL (required for OIDC)
+    # --dead-letter-topic: Topic for permanently failed messages
+    # --max-delivery-attempts: Maximum retries before sending to DLQ (default: 5)
     gcloud pubsub subscriptions create "${PUBSUB_SUBSCRIPTION}" \
         --topic="${PUBSUB_TOPIC}" \
         --push-endpoint="${WORKER_URL}/pubsub/process" \
         --push-auth-service-account="${PUSH_SA_EMAIL}" \
         --push-auth-token-audience="${WORKER_URL}" \
         --ack-deadline=600 \
+        --dead-letter-topic="${PUBSUB_DEAD_LETTER_TOPIC}" \
+        --max-delivery-attempts=5 \
         --project="${PROJECT_ID}"
-    echo "✅ Subscription created successfully with OIDC authentication"
+    echo "✅ Subscription created successfully with OIDC authentication and Dead Letter Topic"
     echo "   Push auth service account: ${PUSH_SA_EMAIL}"
     echo "   Token audience: ${WORKER_URL}"
+    echo "   Dead Letter Topic: ${PUBSUB_DEAD_LETTER_TOPIC}"
+    echo "   Max delivery attempts: 5"
 else
     echo "Subscription already exists: ${PUBSUB_SUBSCRIPTION}"
-    echo "Updating push endpoint with OIDC authentication..."
-    # Update with OIDC token authentication
+    echo "Updating push endpoint with OIDC authentication and Dead Letter Topic..."
+    # Update with OIDC token authentication and Dead Letter Topic
     gcloud pubsub subscriptions update "${PUBSUB_SUBSCRIPTION}" \
         --push-endpoint="${WORKER_URL}/pubsub/process" \
         --push-auth-service-account="${PUSH_SA_EMAIL}" \
         --push-auth-token-audience="${WORKER_URL}" \
         --ack-deadline=600 \
+        --dead-letter-topic="${PUBSUB_DEAD_LETTER_TOPIC}" \
+        --max-delivery-attempts=5 \
         --project="${PROJECT_ID}"
-    echo "✅ Subscription updated with OIDC authentication"
+    echo "✅ Subscription updated with OIDC authentication and Dead Letter Topic"
     echo "   Push auth service account: ${PUSH_SA_EMAIL}"
     echo "   Token audience: ${WORKER_URL}"
+    echo "   Dead Letter Topic: ${PUBSUB_DEAD_LETTER_TOPIC}"
+    echo "   Max delivery attempts: 5"
 fi
 echo ""
 

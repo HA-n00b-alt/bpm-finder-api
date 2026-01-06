@@ -14,6 +14,13 @@ from fastapi import FastAPI, Request, HTTPException
 from google.cloud import firestore
 from google.cloud.firestore import Increment
 from concurrent.futures import ThreadPoolExecutor
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+    RetryError
+)
 
 # Import shared processing functions
 from shared_processing import (
@@ -271,8 +278,18 @@ async def process_single_url_task(
         print(f"[{batch_id}:{index}] Result data: BPM={firestore_result.get('bpm_essentia')}, Key={firestore_result.get('key_essentia')}", flush=True)
         loop = asyncio.get_event_loop()
         
+        @retry(
+            stop=stop_after_attempt(5),
+            wait=wait_exponential(multiplier=1, min=1, max=30),
+            retry=retry_if_exception_type((Exception,)),
+            reraise=True
+        )
         def update_result_idempotent():
-            """Update Firestore with idempotency: only increment processed if this index wasn't already written."""
+            """Update Firestore with idempotency: only increment processed if this index wasn't already written.
+            
+            Wrapped with retry logic using tenacity to handle transient API errors.
+            Retries up to 5 times with exponential backoff (1s, 2s, 4s, 8s, 16s, max 30s).
+            """
             try:
                 print(f"[{batch_id}:{index}] [FIRESTORE] Starting idempotent update...", flush=True)
                 
@@ -307,7 +324,7 @@ async def process_single_url_task(
             except Exception as e:
                 import traceback
                 error_details = f"{str(e)}\n{traceback.format_exc()}"
-                print(f"[{batch_id}:{index}] Firestore write error: {error_details}", flush=True)
+                print(f"[{batch_id}:{index}] Firestore write error (will retry): {error_details}", flush=True)
                 raise
         
         print(f"[{batch_id}:{index}] Submitting Firestore update to executor...", flush=True)
@@ -324,7 +341,18 @@ async def process_single_url_task(
                 print(f"[{batch_id}] Progress: {processed_count}/{total_urls}")
                 
                 if processed_count >= total_urls:
+                    @retry(
+                        stop=stop_after_attempt(5),
+                        wait=wait_exponential(multiplier=1, min=1, max=30),
+                        retry=retry_if_exception_type((Exception,)),
+                        reraise=True
+                    )
                     def update_status():
+                        """Update batch status to completed.
+                        
+                        Wrapped with retry logic using tenacity to handle transient API errors.
+                        Retries up to 5 times with exponential backoff (1s, 2s, 4s, 8s, 16s, max 30s).
+                        """
                         batch_ref.update({'status': 'completed'})
                     await loop.run_in_executor(None, update_status)
                     print(f"[{batch_id}] Batch completed!")
@@ -344,14 +372,26 @@ async def process_single_url_task(
             "error": error_details[:500]
         }
         
+        @retry(
+            stop=stop_after_attempt(5),
+            wait=wait_exponential(multiplier=1, min=1, max=30),
+            retry=retry_if_exception_type((Exception,)),
+            reraise=True
+        )
         def update_error():
+            """Update Firestore with error result.
+            
+            Wrapped with retry logic using tenacity to handle transient API errors.
+            Retries up to 5 times with exponential backoff (1s, 2s, 4s, 8s, 16s, max 30s).
+            """
             try:
                 batch_ref.update({
                     f'results.{index}': error_result,
                     'processed': Increment(1)
                 })
             except Exception as update_err:
-                print(f"[{batch_id}:{index}] Failed to write error: {str(update_err)}")
+                print(f"[{batch_id}:{index}] Failed to write error (will retry): {str(update_err)}")
+                raise
         
         await loop.run_in_executor(None, update_error)
         
@@ -360,7 +400,18 @@ async def process_single_url_task(
         if batch_doc.exists:
             batch_data = batch_doc.to_dict()
             if batch_data.get('processed', 0) >= batch_data.get('total_urls', 0):
+                @retry(
+                    stop=stop_after_attempt(5),
+                    wait=wait_exponential(multiplier=1, min=1, max=30),
+                    retry=retry_if_exception_type((Exception,)),
+                    reraise=True
+                )
                 def update_status():
+                    """Update batch status to completed.
+                    
+                    Wrapped with retry logic using tenacity to handle transient API errors.
+                    Retries up to 5 times with exponential backoff (1s, 2s, 4s, 8s, 16s, max 30s).
+                    """
                     batch_ref.update({'status': 'completed'})
                 await loop.run_in_executor(None, update_status)
     
