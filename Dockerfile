@@ -32,6 +32,11 @@ RUN python3 -m pip install --no-cache-dir -r requirements.txt --root-user-action
 # Copy application code
 COPY main.py .
 
+# Pre-compile Python bytecode to reduce cold start time
+# This compiles all .py files to .pyc files during build time
+RUN python3 -m compileall -q /app && \
+    find /app -name "*.pyc" -exec chmod 644 {} \;
+
 # Switch to non-root user
 USER appuser
 

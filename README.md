@@ -22,7 +22,7 @@ A Google Cloud Run microservice that computes BPM (beats per minute) and musical
 - **Separate Results**: Response includes both Essentia and Librosa results separately (Librosa fields are null if not used)
 - **Private Cloud Run Service**: IAM authentication required for access
 - **SSRF Protection**: HTTPS-only requirement with redirect validation
-- **High Concurrency**: Optimized for batch processing with 80 concurrent requests per instance
+- **High Concurrency**: Optimized for batch processing with 80 concurrent requests per instance and 20 concurrent URL downloads per batch request
 
 ## Architecture
 
@@ -35,9 +35,14 @@ A Google Cloud Run microservice that computes BPM (beats per minute) and musical
 - **BPM Method**: Single method:
   - `multifeature`: RhythmExtractor2013 with multifeature method (confidence range: 0-5.32)
 - **Container**: MTG Essentia base image (`ghcr.io/mtg/essentia:latest`) with ffmpeg for codec support
+- **Performance Optimizations**:
+  - Lazy loading of heavy libraries (essentia loads only when needed, reducing cold start time)
+  - Pre-compiled Python bytecode (compiled during Docker build)
+  - CPU boost enabled for faster startup
 - **Deployment**: Google Cloud Run
   - **High Concurrency**: 80 concurrent requests per instance (optimized for batch processing)
-  - **Resources**: 2GB RAM, 2 CPU
+  - **URL Concurrency**: 20 concurrent URL downloads per batch request (configurable via `BATCH_URL_CONCURRENCY` env var)
+  - **Resources**: 2GB RAM, 2 CPU, CPU boost enabled (reduces cold start time)
   - **Timeout**: 300 seconds (for large batch requests)
   - **Max Instances**: 10 (auto-scaling)
 - **Authentication**: Cloud Run IAM (Identity Tokens)
@@ -58,6 +63,10 @@ A Google Cloud Run microservice that computes BPM (beats per minute) and musical
   - **Higher Resources**: 4GB RAM, 2 CPU, CPU boost enabled
   - **Timeout**: 300 seconds (for batch processing)
   - **Max Instances**: 10 (auto-scaling)
+- **Performance Optimizations**:
+  - Lazy loading of heavy libraries (librosa and numpy load only when needed, reducing cold start time)
+  - Pre-compiled Python bytecode (compiled during Docker build)
+  - CPU boost enabled for faster startup
 - **Authentication**: Cloud Run IAM (service-to-service authentication)
 - **Use Case**: High-accuracy, high-cost fallback for low-confidence primary results
 - **Batch Processing**: Accepts multiple files in a single request, processes sequentially
@@ -221,9 +230,9 @@ REGION=us-central1 ./deploy.sh
 **Note**: Make sure you've completed the [One-Time Setup](#one-time-setup) steps before deploying.
 
 The `deploy.sh` script will:
-1. Build the Docker image using Cloud Build
+1. Build the Docker image using Cloud Build (with bytecode compilation and optimizations)
 2. Push to Artifact Registry
-3. Deploy to Cloud Run **without public access** (`--no-allow-unauthenticated`)
+3. Deploy to Cloud Run **without public access** (`--no-allow-unauthenticated`) with CPU boost enabled
 4. Create/verify the service account
 5. Grant `roles/run.invoker` permission to the service account
 
@@ -243,7 +252,7 @@ REGION=us-central1 ./deploy_fallback.sh
 ```
 
 The `deploy_fallback.sh` script will:
-1. Build the Docker image using Cloud Build
+1. Build the Docker image using Cloud Build (with bytecode compilation and optimizations)
 2. Push to Artifact Registry
 3. Deploy to Cloud Run **without public access** with higher resources (4GB RAM, 2 CPU, CPU boost)
 4. Configure service-to-service authentication for primary service calls
@@ -724,13 +733,40 @@ docker run -p 8080:8080 bpm-service
 curl http://localhost:8080/health
 ```
 
+## Performance Optimizations
+
+The services implement several optimizations to reduce cold start time and improve performance:
+
+### Cold Start Optimizations
+
+1. **Lazy Loading**: Heavy libraries (essentia, librosa, numpy) are imported only when actually needed:
+   - `essentia.standard` loads only when `analyze_audio()` is called (primary service)
+   - `librosa` and `numpy` load only when `process_single_audio()` is called (fallback service)
+   - This significantly reduces cold start time by avoiding expensive imports at module load time
+
+2. **Bytecode Compilation**: Python code is pre-compiled to `.pyc` files during Docker build:
+   - Reduces first-request compilation overhead
+   - Faster module loading on cold starts
+
+3. **CPU Boost**: Both services use Cloud Run's CPU boost feature:
+   - Allocates more CPU during container startup
+   - Reduces cold start initialization time
+
+### Runtime Optimizations
+
+1. **Concurrent URL Processing**: Up to 20 URLs are downloaded concurrently per batch request (configurable via `BATCH_URL_CONCURRENCY` env var)
+
+2. **Efficient File I/O**: Uses `aiofiles` for async file operations with internal buffering (no manual buffering needed)
+
+3. **Connection Pooling**: HTTP client with connection pooling for efficient reuse across requests
+
 ## Processing Pipeline
 
 ### Primary Service Flow (Batch Processing)
 
 1. **Concurrent Download**: Fetch all audio URLs concurrently using `asyncio.gather()`:
-   - Stream downloads directly to disk with **non-blocking I/O** (using `asyncio.to_thread` for file writes)
-   - This allows the event loop to handle other requests while writing chunks to disk
+   - Stream downloads directly to disk with **async I/O** (using `aiofiles` with internal buffering)
+   - Up to 20 URLs downloaded concurrently per batch (configurable)
    - SSRF protection: HTTPS-only, redirect validation
    - Max file size: 10MB per file
 

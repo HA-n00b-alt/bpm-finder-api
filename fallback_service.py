@@ -11,13 +11,10 @@ from concurrent.futures import ProcessPoolExecutor
 from typing import Optional, Tuple, List
 from fastapi import FastAPI, UploadFile, HTTPException, Request
 from pydantic import BaseModel
-import numpy as np
+# Lazy load heavy libraries - only import when actually needed (reduces cold start time)
 import aiofiles
 
 app = FastAPI(title="BPM Fallback Service")
-
-# Import librosa at module level (required for Cloud Run startup)
-import librosa
 
 # ProcessPoolExecutor for CPU-bound work (bypasses GIL)
 # Use env var or default to CPU count (clamped to >=1)
@@ -79,7 +76,7 @@ def normalize_bpm(bpm: float) -> float:
     return normalized
 
 
-def extract_key_from_chroma(chroma: np.ndarray) -> Tuple[str, str, float]:
+def extract_key_from_chroma(chroma) -> Tuple[str, str, float]:
     """Extract musical key from chroma features using Krumhansl-Schmuckler algorithm.
     
     Improved version: uses chroma_cqt for better stability, drops low-energy frames.
@@ -90,6 +87,9 @@ def extract_key_from_chroma(chroma: np.ndarray) -> Tuple[str, str, float]:
     Returns:
         (key, scale, confidence) tuple
     """
+    # Lazy load numpy - only import when actually needed
+    import numpy as np
+    
     # Krumhansl-Schmuckler key profile templates (12-element arrays)
     major_template = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
     minor_template = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
@@ -155,6 +155,10 @@ def process_single_audio(
     Returns:
         dict with requested fields populated (to reduce pickling overhead)
     """
+    # Lazy load heavy libraries - only import when actually needed (reduces cold start time)
+    import librosa
+    import numpy as np
+    
     # Initialize response values
     bpm_normalized = None
     bpm_raw = None

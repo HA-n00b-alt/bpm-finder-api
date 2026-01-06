@@ -14,7 +14,8 @@ import httpx
 import aiofiles
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl, field_validator
-import essentia.standard as es
+# Lazy load essentia - heavy C++ library that slows startup
+# Will be imported in analyze_audio() when actually needed
 
 # Google Cloud authentication for service-to-service calls
 GCP_AUTH_AVAILABLE = False
@@ -118,7 +119,7 @@ def get_essentia_semaphore() -> asyncio.Semaphore:
     return _essentia_semaphore
 
 # Per-request URL concurrency limit for batch processing
-BATCH_URL_CONCURRENCY = int(os.getenv("BATCH_URL_CONCURRENCY", "10"))
+BATCH_URL_CONCURRENCY = int(os.getenv("BATCH_URL_CONCURRENCY", "20"))
 
 def get_http_client() -> httpx.AsyncClient:
     """Get or create the global HTTPX AsyncClient with connection pooling."""
@@ -336,10 +337,8 @@ async def download_audio_async(url: str, output_path: str) -> None:
             )
         
         # Stream download directly to file with size limit (async I/O using aiofiles)
-        # Use buffered writes to reduce system calls and improve performance
-        BUFFER_SIZE = 64 * 1024  # 64KB buffer - balances performance and memory
+        # aiofiles handles buffering internally, so we write chunks directly
         total_size = 0
-        buffer = bytearray()
         
         async with aiofiles.open(output_path, "wb") as f:
             async for chunk in response.aiter_bytes():
@@ -356,17 +355,8 @@ async def download_audio_async(url: str, output_path: str) -> None:
                         detail=f"File too large (max {MAX_SIZE / 1024 / 1024:.1f}MB)"
                     )
                 
-                # Add chunk to buffer
-                buffer.extend(chunk)
-                
-                # Write buffer when it reaches threshold
-                if len(buffer) >= BUFFER_SIZE:
-                    await f.write(bytes(buffer))
-                    buffer.clear()
-            
-            # Write any remaining data in buffer
-            if buffer:
-                await f.write(bytes(buffer))
+                # Write chunk directly - aiofiles handles buffering internally
+                await f.write(chunk)
         
         return
     
@@ -459,6 +449,9 @@ def analyze_audio(audio_path: str, max_confidence: float) -> Tuple[
         - need_fallback_bpm, need_fallback_key
         - debug_info
     """
+    # Lazy load essentia - only import when actually needed (reduces cold start time)
+    import essentia.standard as es
+    
     debug_lines = []
     
     try:

@@ -84,6 +84,7 @@ fi
 
 # Deploy to Cloud Run (without public access)
 # High concurrency for batch processing, increased timeout for batch requests
+# CPU boost enabled to reduce cold start time
 echo "🚢 Deploying to Cloud Run..."
 if ! gcloud run deploy "${SERVICE_NAME}" \
     --image "${IMAGE_TAG}" \
@@ -96,6 +97,7 @@ if ! gcloud run deploy "${SERVICE_NAME}" \
     --timeout 300s \
     --max-instances 10 \
     --concurrency 80 \
+    --cpu-boost \
     --project "${PROJECT_ID}"; then
     echo ""
     echo "❌ Error: Cloud Run deployment failed. You may need additional permissions."
