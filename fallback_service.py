@@ -220,8 +220,12 @@ def process_single_audio(
                     interval_mean = np.mean(beat_intervals)
                     if interval_mean > 0:
                         cv = interval_std / interval_mean  # Coefficient of variation
-                        # Apply cap to prevent over-reporting confidence
-                        confidence = min(0.85, max(0.0, 1.0 - cv * 2))
+                        # Calculate confidence from beat consistency
+                        # Lower coefficient of variation = more consistent beats = higher confidence
+                        # Formula: confidence = 1.0 - cv * 2
+                        # When cv = 0 (perfect consistency), confidence = 1.0
+                        # When cv = 0.5 (50% variation), confidence = 0.0
+                        confidence = max(0.0, min(1.0, 1.0 - cv * 2))
                     else:
                         confidence = 0.5
                 else:
