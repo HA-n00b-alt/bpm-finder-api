@@ -158,6 +158,31 @@ gcloud run services add-iam-policy-binding "${SERVICE_NAME}" \
     --role "roles/run.invoker" \
     --project "${PROJECT_ID}"
 
+# Grant main service account Pub/Sub publisher permissions
+echo "🔐 Granting main service account Pub/Sub publisher permissions..."
+# Get the Cloud Run service account for the main service
+MAIN_SA=$(gcloud run services describe "${SERVICE_NAME}" \
+    --region "${REGION}" \
+    --format "value(spec.template.spec.serviceAccountName)" \
+    --project "${PROJECT_ID}")
+
+# If no custom SA, use the default compute SA
+if [ -z "${MAIN_SA}" ] || [ "${MAIN_SA}" = "default" ]; then
+    PROJECT_NUMBER=$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')
+    MAIN_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+fi
+
+echo "Main service account: ${MAIN_SA}"
+
+# Grant Pub/Sub publisher role
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member "serviceAccount:${MAIN_SA}" \
+    --role "roles/pubsub.publisher" \
+    --condition=None \
+    --project "${PROJECT_ID}" || echo "⚠️  Note: Pub/Sub publisher permissions may already be set"
+
+echo "✅ Main service account Pub/Sub publisher permissions configured"
+
 echo ""
 echo "✅ Service account configured!"
 echo ""

@@ -465,8 +465,17 @@ async def call_fallback_service(
 async def process_pubsub_message(request: Request):
     """Process Pub/Sub push message.
     
-    IMPORTANT: This endpoint awaits processing completion before returning 200.
-    This ensures Cloud Run doesn't kill the task, and Pub/Sub can retry on failure.
+    CRITICAL: This endpoint processes SYNCHRONOUSLY and returns 2xx ONLY after Firestore write completes.
+    
+    - NO background tasks (asyncio.create_task is NOT used)
+    - NO early returns (we await process_single_url_task which waits for Firestore)
+    - Returns 204 (No Content) on success - only after Firestore write is done
+    - Returns 500 on failure - so Pub/Sub will retry
+    
+    This ensures:
+    1. Cloud Run doesn't kill the task after request returns
+    2. Pub/Sub can retry if we return non-2xx
+    3. No message loss if container is killed during processing
     """
     try:
         envelope = await request.json()
@@ -490,12 +499,15 @@ async def process_pubsub_message(request: Request):
         if not all([batch_id, url, index is not None]):
             raise HTTPException(status_code=400, detail="Missing required fields")
         
-        print(f"[{batch_id}:{index}] Received Pub/Sub message, processing synchronously...")
+        print(f"[{batch_id}:{index}] Received Pub/Sub message, processing SYNCHRONOUSLY (no background tasks)...")
         
-        # Process synchronously - await completion before returning 200
-        # This ensures:
-        # 1. Cloud Run doesn't kill the task after request returns
-        # 2. Pub/Sub can retry if we return non-2xx
+        # CRITICAL: Process synchronously - await completion before returning ANY status code
+        # process_single_url_task waits for:
+        #   1. Audio download
+        #   2. Audio analysis
+        #   3. Fallback service (if needed)
+        #   4. Firestore write (with transaction)
+        # Only after ALL of the above completes do we return
         try:
             await process_single_url_task(
                 batch_id,
@@ -504,14 +516,17 @@ async def process_pubsub_message(request: Request):
                 max_confidence,
                 debug_level
             )
-            print(f"[{batch_id}:{index}] Processing completed successfully")
-            # Return 200 only after Firestore write is complete
-            return {"status": "completed"}
+            # At this point, Firestore write is complete
+            print(f"[{batch_id}:{index}] Processing completed successfully, Firestore write confirmed")
+            # Return 204 (No Content) - Pub/Sub interprets this as successful ACK
+            # We return 204 (not 200) to signal success without a body
+            from fastapi import Response
+            return Response(status_code=204)
         except Exception as e:
             import traceback
             error_details = f"Processing failed: {str(e)}\n{traceback.format_exc()}"
             print(f"[{batch_id}:{index}] Processing failed: {error_details[:500]}")
-            # Return 500 so Pub/Sub will retry
+            # Return 500 so Pub/Sub will retry the message
             raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
         
     except HTTPException:

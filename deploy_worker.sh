@@ -159,39 +159,89 @@ echo "✅ Deployment complete!"
 echo "Worker URL: ${WORKER_URL}"
 echo ""
 
+# Create dedicated service account for Pub/Sub push authentication
+PUSH_SA_NAME="pubsub-push-invoker"
+PUSH_SA_EMAIL="${PUSH_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+
+echo "🔐 Setting up dedicated service account for Pub/Sub push..."
+if ! gcloud iam service-accounts describe "${PUSH_SA_EMAIL}" \
+    --project="${PROJECT_ID}" &>/dev/null; then
+    echo "Creating service account: ${PUSH_SA_NAME}"
+    gcloud iam service-accounts create "${PUSH_SA_NAME}" \
+        --display-name "Pub/Sub Push Invoker for Worker Service" \
+        --project="${PROJECT_ID}"
+    echo "✅ Service account created"
+else
+    echo "Service account already exists: ${PUSH_SA_NAME}"
+fi
+
+# Grant the push service account permission to invoke the worker service
+echo "🔐 Granting push service account permission to invoke worker service..."
+gcloud run services add-iam-policy-binding "${SERVICE_NAME}" \
+    --region "${REGION}" \
+    --member "serviceAccount:${PUSH_SA_EMAIL}" \
+    --role "roles/run.invoker" \
+    --project "${PROJECT_ID}"
+
 # Create Pub/Sub push subscription if it doesn't exist
-echo "📨 Creating Pub/Sub push subscription..."
+echo "📨 Creating Pub/Sub push subscription with OIDC authentication..."
 if ! gcloud pubsub subscriptions describe "${PUBSUB_SUBSCRIPTION}" \
     --project="${PROJECT_ID}" &>/dev/null; then
     echo "Creating push subscription: ${PUBSUB_SUBSCRIPTION}"
+    # Create with OIDC token authentication
+    # --push-auth-service-account: The SA that will authenticate to Cloud Run
+    # --push-auth-token-audience: The Cloud Run service URL (required for OIDC)
     gcloud pubsub subscriptions create "${PUBSUB_SUBSCRIPTION}" \
         --topic="${PUBSUB_TOPIC}" \
         --push-endpoint="${WORKER_URL}/pubsub/process" \
+        --push-auth-service-account="${PUSH_SA_EMAIL}" \
+        --push-auth-token-audience="${WORKER_URL}" \
         --ack-deadline=600 \
         --project="${PROJECT_ID}"
-    echo "✅ Subscription created successfully"
+    echo "✅ Subscription created successfully with OIDC authentication"
+    echo "   Push auth service account: ${PUSH_SA_EMAIL}"
+    echo "   Token audience: ${WORKER_URL}"
 else
     echo "Subscription already exists: ${PUBSUB_SUBSCRIPTION}"
-    echo "Updating push endpoint..."
+    echo "Updating push endpoint with OIDC authentication..."
+    # Update with OIDC token authentication
     gcloud pubsub subscriptions update "${PUBSUB_SUBSCRIPTION}" \
         --push-endpoint="${WORKER_URL}/pubsub/process" \
+        --push-auth-service-account="${PUSH_SA_EMAIL}" \
+        --push-auth-token-audience="${WORKER_URL}" \
         --ack-deadline=600 \
         --project="${PROJECT_ID}"
-    echo "✅ Subscription updated"
+    echo "✅ Subscription updated with OIDC authentication"
+    echo "   Push auth service account: ${PUSH_SA_EMAIL}"
+    echo "   Token audience: ${WORKER_URL}"
 fi
 echo ""
 
-# Grant Pub/Sub permission to invoke the worker service
-echo "🔐 Granting Pub/Sub permission to invoke worker service..."
-# Get the Pub/Sub service account
-PUBSUB_SA="service-$(gcloud projects describe ${PROJECT_ID} --format='value(projectNumber)')@gcp-sa-pubsub.iam.gserviceaccount.com"
-
-# Grant invoke permission
-gcloud run services add-iam-policy-binding "${SERVICE_NAME}" \
+# Grant worker service account Firestore write permissions
+echo "🔐 Granting worker service account Firestore permissions..."
+# Get the Cloud Run service account for the worker
+WORKER_SA=$(gcloud run services describe "${SERVICE_NAME}" \
     --region "${REGION}" \
-    --member "serviceAccount:${PUBSUB_SA}" \
-    --role "roles/run.invoker" \
-    --project "${PROJECT_ID}"
+    --format "value(spec.template.spec.serviceAccountName)" \
+    --project "${PROJECT_ID}")
+
+# If no custom SA, use the default compute SA
+if [ -z "${WORKER_SA}" ] || [ "${WORKER_SA}" = "default" ]; then
+    PROJECT_NUMBER=$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')
+    WORKER_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+fi
+
+echo "Worker service account: ${WORKER_SA}"
+
+# Grant Firestore user role (allows read/write)
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member "serviceAccount:${WORKER_SA}" \
+    --role "roles/datastore.user" \
+    --condition=None \
+    --project "${PROJECT_ID}" || echo "⚠️  Note: Firestore permissions may already be set"
+
+echo "✅ Worker service account Firestore permissions configured"
+echo ""
 
 echo ""
 echo "✅ Worker service configured!"
