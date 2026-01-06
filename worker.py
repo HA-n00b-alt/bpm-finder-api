@@ -261,20 +261,44 @@ async def process_single_url_task(
         )
         firestore_result["debug_txt"] = debug_txt if debug_txt else None
         
-        # Write result to Firestore
+        # Write result to Firestore with idempotency check (using transaction)
         print(f"[{batch_id}:{index}] Writing to Firestore...", flush=True)
         print(f"[{batch_id}:{index}] Result data: BPM={firestore_result.get('bpm_essentia')}, Key={firestore_result.get('key_essentia')}", flush=True)
         loop = asyncio.get_event_loop()
         
-        def update_result():
+        def update_result_idempotent():
+            """Update Firestore with idempotency: only increment processed if this index wasn't already written."""
             try:
-                print(f"[{batch_id}:{index}] [FIRESTORE] Starting update...", flush=True)
-                batch_ref.update({
-                    f'results.{index}': firestore_result,
-                    'processed': Increment(1)
-                })
-                print(f"[{batch_id}:{index}] [FIRESTORE] Update call completed", flush=True)
+                print(f"[{batch_id}:{index}] [FIRESTORE] Starting idempotent update...", flush=True)
+                
+                # Use a transaction to ensure idempotency
+                transaction = db.transaction()
+                
+                @firestore.transactional
+                def update_in_transaction(transaction):
+                    batch_doc = batch_ref.get(transaction=transaction)
+                    if not batch_doc.exists:
+                        raise Exception(f"Batch {batch_id} not found")
+                    
+                    batch_data = batch_doc.to_dict()
+                    results = batch_data.get('results', {})
+                    
+                    # Check if this index was already processed (idempotency check)
+                    if str(index) in results:
+                        print(f"[{batch_id}:{index}] [FIRESTORE] Index {index} already processed, skipping increment", flush=True)
+                        return False  # Already processed
+                    
+                    # Update with transaction
+                    transaction.update(batch_ref, {
+                        f'results.{index}': firestore_result,
+                        'processed': Increment(1)
+                    })
+                    return True  # Newly processed
+                
+                was_new = update_in_transaction(transaction)
+                print(f"[{batch_id}:{index}] [FIRESTORE] Transaction completed (new: {was_new})", flush=True)
                 print(f"[{batch_id}:{index}] Firestore write successful", flush=True)
+                return was_new
             except Exception as e:
                 import traceback
                 error_details = f"{str(e)}\n{traceback.format_exc()}"
@@ -282,22 +306,23 @@ async def process_single_url_task(
                 raise
         
         print(f"[{batch_id}:{index}] Submitting Firestore update to executor...", flush=True)
-        await loop.run_in_executor(None, update_result)
-        print(f"[{batch_id}:{index}] Firestore update executor returned", flush=True)
+        was_new = await loop.run_in_executor(None, update_result_idempotent)
+        print(f"[{batch_id}:{index}] Firestore update executor returned (was_new: {was_new})", flush=True)
         
-        # Check if batch is complete
-        batch_doc = await loop.run_in_executor(None, batch_ref.get)
-        if batch_doc.exists:
-            batch_data = batch_doc.to_dict()
-            processed_count = batch_data.get('processed', 0)
-            total_urls = batch_data.get('total_urls', 0)
-            print(f"[{batch_id}] Progress: {processed_count}/{total_urls}")
-            
-            if processed_count >= total_urls:
-                def update_status():
-                    batch_ref.update({'status': 'completed'})
-                await loop.run_in_executor(None, update_status)
-                print(f"[{batch_id}] Batch completed!")
+        # Check if batch is complete (only if this was a new result)
+        if was_new:
+            batch_doc = await loop.run_in_executor(None, batch_ref.get)
+            if batch_doc.exists:
+                batch_data = batch_doc.to_dict()
+                processed_count = batch_data.get('processed', 0)
+                total_urls = batch_data.get('total_urls', 0)
+                print(f"[{batch_id}] Progress: {processed_count}/{total_urls}")
+                
+                if processed_count >= total_urls:
+                    def update_status():
+                        batch_ref.update({'status': 'completed'})
+                    await loop.run_in_executor(None, update_status)
+                    print(f"[{batch_id}] Batch completed!")
         
         print(f"[{batch_id}:{index}] Task complete ✓")
         
@@ -438,7 +463,11 @@ async def call_fallback_service(
 
 @app.post("/pubsub/process")
 async def process_pubsub_message(request: Request):
-    """Process Pub/Sub push message."""
+    """Process Pub/Sub push message.
+    
+    IMPORTANT: This endpoint awaits processing completion before returning 200.
+    This ensures Cloud Run doesn't kill the task, and Pub/Sub can retry on failure.
+    """
     try:
         envelope = await request.json()
         
@@ -461,43 +490,39 @@ async def process_pubsub_message(request: Request):
         if not all([batch_id, url, index is not None]):
             raise HTTPException(status_code=400, detail="Missing required fields")
         
-        print(f"[{batch_id}:{index}] Received Pub/Sub message")
+        print(f"[{batch_id}:{index}] Received Pub/Sub message, processing synchronously...")
         
-        # Create async task
-        async def process_with_error_handling():
-            try:
-                await process_single_url_task(
-                    batch_id,
-                    url,
-                    index,
-                    max_confidence,
-                    debug_level
-                )
-            except Exception as e:
-                import traceback
-                error_details = f"Task failed: {str(e)}\n{traceback.format_exc()}"
-                print(f"[{batch_id}:{index}] Task error: {error_details[:500]}")
-                raise
+        # Process synchronously - await completion before returning 200
+        # This ensures:
+        # 1. Cloud Run doesn't kill the task after request returns
+        # 2. Pub/Sub can retry if we return non-2xx
+        try:
+            await process_single_url_task(
+                batch_id,
+                url,
+                index,
+                max_confidence,
+                debug_level
+            )
+            print(f"[{batch_id}:{index}] Processing completed successfully")
+            # Return 200 only after Firestore write is complete
+            return {"status": "completed"}
+        except Exception as e:
+            import traceback
+            error_details = f"Processing failed: {str(e)}\n{traceback.format_exc()}"
+            print(f"[{batch_id}:{index}] Processing failed: {error_details[:500]}")
+            # Return 500 so Pub/Sub will retry
+            raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
         
-        task = asyncio.create_task(process_with_error_handling())
-        
-        def task_done_callback(fut):
-            try:
-                fut.result()
-            except Exception as e:
-                import traceback
-                print(f"[{batch_id}:{index}] Task callback error: {traceback.format_exc()[:500]}")
-        
-        task.add_done_callback(task_done_callback)
-        
-        print(f"[{batch_id}:{index}] Task accepted and queued")
-        return {"status": "accepted"}
-        
+    except HTTPException:
+        # Re-raise HTTP exceptions (including our 500)
+        raise
     except Exception as e:
         import traceback
         error_details = f"Error processing Pub/Sub: {str(e)}\n{traceback.format_exc()}"
-        print(error_details[:500])
-        return {"status": "error", "message": str(e)}
+        print(f"Pub/Sub endpoint error: {error_details[:500]}")
+        # Return 500 so Pub/Sub will retry
+        raise HTTPException(status_code=500, detail=f"Error processing message: {str(e)}")
 
 
 @app.get("/health")

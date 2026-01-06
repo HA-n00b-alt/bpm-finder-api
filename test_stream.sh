@@ -35,3 +35,4 @@ curl -s -N -X GET "${SERVICE_URL}/stream/${BATCH_ID}" \
     echo "$line" | python3 -m json.tool 2>/dev/null || echo "$line"
 done
 
+

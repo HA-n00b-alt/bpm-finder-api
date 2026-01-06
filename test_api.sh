@@ -1,19 +1,23 @@
 #!/bin/bash
+set -euo pipefail
 
 # Test script for BPM Finder API (Async Streaming Architecture)
 # 
-# Usage: ./test_api.sh [max_confidence] [debug_level]
+# Usage: ./test_api.sh [max_confidence] [debug_level] [service_url]
 #   max_confidence: Confidence threshold (0.0-1.0), default: 0.65
 #   debug_level: minimal, normal (default), detailed
+#   service_url: Override service URL (optional)
 #
 # The script tests the new async streaming architecture:
 # 1. Submits batch via POST /analyze/batch (returns batch_id immediately)
 # 2. Streams results via GET /stream/{batch_id} (NDJSON format)
 # 3. Optionally checks final status via GET /batch/{batch_id}
+# 4. Provides detailed debugging information
 
-SERVICE_URL="https://bpm-service-pgkjwjbhqq-ey.a.run.app"
+SERVICE_URL="${3:-https://bpm-service-pgkjwjbhqq-ey.a.run.app}"
 MAX_CONFIDENCE="${1:-0.65}"
 DEBUG_LEVEL="${2:-normal}"
+PROJECT_ID="${PROJECT_ID:-bpm-api-microservice}"
 
 # Test URLs
 TEST_URLS=(
@@ -24,14 +28,17 @@ TEST_URLS=(
     "https://audio-ssl.itunes.apple.com/itunes-assets/AudioPreview115/v4/60/04/f7/6004f766-8053-0ef6-36a5-0e19f2533d13/mzaf_10236136789037090616.plus.aac.p.m4a"
 )
 
-echo "Testing BPM Finder API (Async Streaming Architecture)..."
-echo "Service: $SERVICE_URL"
+echo "=========================================="
+echo "BPM Finder API Test (Async Streaming)"
+echo "=========================================="
+echo "Service URL: $SERVICE_URL"
+echo "Project ID: $PROJECT_ID"
 echo "Max Confidence Threshold: $MAX_CONFIDENCE"
 echo "Debug Level: $DEBUG_LEVEL"
 echo "Number of URLs: ${#TEST_URLS[@]}"
 echo ""
 
-# Get authentication token
+# Get authentication token first
 echo "Getting authentication token..."
 TOKEN=$(gcloud auth print-identity-token 2>/dev/null)
 
@@ -39,6 +46,18 @@ if [ -z "$TOKEN" ]; then
     echo "Error: Failed to get authentication token"
     exit 1
 fi
+
+# Verify service is reachable
+echo "🔍 Checking service health..."
+HEALTH_RESPONSE=$(curl -s -w "\n%{http_code}" -X GET "${SERVICE_URL}/health" \
+    -H "Authorization: Bearer $TOKEN" 2>/dev/null || echo -e "\n000")
+HEALTH_CODE=$(echo "$HEALTH_RESPONSE" | tail -n1)
+if [ "$HEALTH_CODE" = "200" ]; then
+    echo "✅ Service is healthy"
+else
+    echo "⚠️  Warning: Health check returned HTTP $HEALTH_CODE"
+fi
+echo ""
 
 # Build JSON payload with URLs array
 JSON_PAYLOAD="{\"urls\": ["
@@ -74,6 +93,11 @@ echo ""
 if [ "$STATUS_CODE" -ne 200 ]; then
     echo "❌ Error submitting batch (HTTP $STATUS_CODE):"
     echo "$RESPONSE_BODY"
+    echo ""
+    echo "Debugging tips:"
+    echo "  - Check service logs: gcloud logging read \"resource.type=cloud_run_revision AND resource.labels.service_name=bpm-service\" --limit 50 --project $PROJECT_ID"
+    echo "  - Verify authentication: gcloud auth print-identity-token"
+    echo "  - Check service URL: $SERVICE_URL"
     rm -f "$TEMP_RESPONSE"
     exit 1
 fi
@@ -161,6 +185,17 @@ curl -s -N --max-time 300 -X GET "${SERVICE_URL}/stream/${BATCH_ID}" \
     if [ $ELAPSED -ge 30 ] && [ "$CURRENT_COUNT" -eq 0 ]; then
         if [ $((ELAPSED - LAST_WARNING_TIME)) -ge 30 ]; then
             echo "[${ELAPSED}s] ⚠️  Warning: No results yet after ${ELAPSED} seconds..."
+            echo "    Checking worker service logs..."
+            echo "    Run: gcloud logging read \"resource.type=cloud_run_revision AND resource.labels.service_name=bpm-worker AND textPayload=~'$BATCH_ID'\" --limit 20 --project $PROJECT_ID"
+            LAST_WARNING_TIME=$ELAPSED
+        fi
+    fi
+    
+    # Show warning if processing seems stuck (no new results for 60 seconds)
+    if [ $ELAPSED -ge 60 ] && [ "$CURRENT_COUNT" -gt 0 ]; then
+        if [ $((ELAPSED - LAST_WARNING_TIME)) -ge 60 ]; then
+            echo "[${ELAPSED}s] ⚠️  Warning: No new results for 60 seconds. Current count: $CURRENT_COUNT"
+            echo "    Check Firestore: gcloud firestore documents get batches/$BATCH_ID --project $PROJECT_ID"
             LAST_WARNING_TIME=$ELAPSED
         fi
     fi
@@ -192,10 +227,18 @@ echo "Final Status:"
 echo "$FINAL_STATUS" | python3 -m json.tool 2>/dev/null || echo "$FINAL_STATUS"
 echo ""
 
+echo "=========================================="
 echo "✅ Test complete!"
+echo "=========================================="
 echo "Batch ID: $BATCH_ID"
 echo "Total elapsed time: ${TOTAL_ELAPSED}s"
 echo "  - Submission: ${SUBMIT_ELAPSED}s"
 echo "  - Streaming: $((END_TIME - STREAM_START_TIME))s"
 echo ""
-echo "You can reconnect to the stream anytime: ${SERVICE_URL}/stream/${BATCH_ID}"
+echo "Useful commands for debugging:"
+echo "  - Reconnect to stream: curl -H \"Authorization: Bearer \$(gcloud auth print-identity-token)\" ${SERVICE_URL}/stream/${BATCH_ID}"
+echo "  - Check batch status: curl -H \"Authorization: Bearer \$(gcloud auth print-identity-token)\" ${SERVICE_URL}/batch/${BATCH_ID}"
+echo "  - View primary service logs: gcloud logging read \"resource.type=cloud_run_revision AND resource.labels.service_name=bpm-service\" --limit 50 --project $PROJECT_ID"
+echo "  - View worker service logs: gcloud logging read \"resource.type=cloud_run_revision AND resource.labels.service_name=bpm-worker\" --limit 50 --project $PROJECT_ID"
+echo "  - View Pub/Sub messages: gcloud pubsub subscriptions pull bpm-analysis-worker-sub --limit 10 --project $PROJECT_ID"
+echo ""

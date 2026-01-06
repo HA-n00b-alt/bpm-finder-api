@@ -76,20 +76,19 @@ fi
 echo ""
 
 # Build and push image using Cloud Build
+# Use temporary build context to avoid mutating the repo
 echo "📦 Building and pushing Docker image..."
-# Temporarily rename Dockerfile.worker to Dockerfile for build
-if [ -f Dockerfile.worker ]; then
-    cp Dockerfile Dockerfile.backup 2>/dev/null || true
-    cp Dockerfile.worker Dockerfile
-fi
+TEMP_DIR=$(mktemp -d)
+cp worker.py "${TEMP_DIR}/"
+cp shared_processing.py "${TEMP_DIR}/"
+cp requirements.txt "${TEMP_DIR}/requirements.txt"
+cp Dockerfile.worker "${TEMP_DIR}/Dockerfile"
 
 if ! gcloud builds submit \
     --tag "${IMAGE_TAG}" \
-    --region "${REGION}"; then
-    # Restore original Dockerfile on error
-    if [ -f Dockerfile.backup ]; then
-        mv Dockerfile.backup Dockerfile
-    fi
+    --region "${REGION}" \
+    "${TEMP_DIR}"; then
+    rm -rf "${TEMP_DIR}"
     echo ""
     echo "❌ Error: Cloud Build failed. You may need additional permissions."
     echo ""
@@ -114,6 +113,10 @@ if ! gcloud builds submit \
     exit 1
 fi
 
+rm -rf "${TEMP_DIR}"
+echo "✅ Image built and pushed successfully"
+echo ""
+
 # Deploy to Cloud Run (allow unauthenticated for Pub/Sub push)
 # High resources for audio processing, high concurrency for parallel tasks
 echo "🚢 Deploying to Cloud Run..."
@@ -121,7 +124,7 @@ if ! gcloud run deploy "${SERVICE_NAME}" \
     --image "${IMAGE_TAG}" \
     --region "${REGION}" \
     --platform managed \
-    --allow-unauthenticated \
+    --no-allow-unauthenticated \
     --port 8080 \
     --memory 4Gi \
     --cpu 4 \
@@ -129,6 +132,7 @@ if ! gcloud run deploy "${SERVICE_NAME}" \
     --max-instances 20 \
     --concurrency 10 \
     --cpu-boost \
+    --set-env-vars "GOOGLE_CLOUD_PROJECT=${PROJECT_ID}" \
     --project "${PROJECT_ID}"; then
     echo ""
     echo "❌ Error: Cloud Run deployment failed. You may need additional permissions."

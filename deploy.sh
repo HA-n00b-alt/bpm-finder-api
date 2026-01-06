@@ -54,10 +54,19 @@ fi
 echo ""
 
 # Build and push image using Cloud Build
+# Use temporary build context to avoid mutating the repo
 echo "📦 Building and pushing Docker image..."
+TEMP_DIR=$(mktemp -d)
+cp main.py "${TEMP_DIR}/"
+cp shared_processing.py "${TEMP_DIR}/"
+cp requirements.txt "${TEMP_DIR}/requirements.txt"
+cp Dockerfile "${TEMP_DIR}/Dockerfile"
+
 if ! gcloud builds submit \
     --tag "${IMAGE_TAG}" \
-    --region "${REGION}"; then
+    --region "${REGION}" \
+    "${TEMP_DIR}"; then
+    rm -rf "${TEMP_DIR}"
     echo ""
     echo "❌ Error: Cloud Build failed. You may need additional permissions."
     echo ""
@@ -82,6 +91,10 @@ if ! gcloud builds submit \
     exit 1
 fi
 
+rm -rf "${TEMP_DIR}"
+echo "✅ Image built and pushed successfully"
+echo ""
+
 # Deploy to Cloud Run (without public access)
 # High concurrency for batch processing, increased timeout for batch requests
 # CPU boost enabled to reduce cold start time
@@ -98,6 +111,7 @@ if ! gcloud run deploy "${SERVICE_NAME}" \
     --max-instances 10 \
     --concurrency 80 \
     --cpu-boost \
+    --set-env-vars "GOOGLE_CLOUD_PROJECT=${PROJECT_ID}" \
     --project "${PROJECT_ID}"; then
     echo ""
     echo "❌ Error: Cloud Run deployment failed. You may need additional permissions."

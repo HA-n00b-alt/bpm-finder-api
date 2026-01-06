@@ -13,34 +13,27 @@ from typing import Optional, Tuple, List
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 import httpx
-import aiofiles
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, HttpUrl, field_validator
 from google.cloud import pubsub_v1, firestore
-# Lazy load essentia - heavy C++ library that slows startup
-# Will be imported in analyze_audio() when actually needed
 
-# Google Cloud authentication for service-to-service calls
-GCP_AUTH_AVAILABLE = False
-GCP_AUTH_ERROR = None
-try:
-    import google.auth
-    import google.auth.transport.requests
-    import google.oauth2.id_token
-    GCP_AUTH_AVAILABLE = True
-except ImportError as e:
-    # Capture the actual import error for debugging
-    import sys
-    import traceback
-    GCP_AUTH_ERROR = f"ImportError: {str(e)}\nPython path: {sys.path}\nTraceback: {traceback.format_exc()}"
-    print(f"Warning: Failed to import google-auth: {GCP_AUTH_ERROR}", file=sys.stderr)
-except Exception as e:
-    # Catch any other errors during import
-    import sys
-    import traceback
-    GCP_AUTH_ERROR = f"Unexpected error importing google-auth: {str(e)}\nTraceback: {traceback.format_exc()}"
-    print(f"Warning: Unexpected error importing google-auth: {GCP_AUTH_ERROR}", file=sys.stderr)
+# Import shared processing functions
+from shared_processing import (
+    download_audio_async as shared_download_audio_async,
+    analyze_audio,
+    get_auth_headers as shared_get_auth_headers,
+    generate_debug_output,
+    FallbackCircuitBreaker,
+    FALLBACK_SERVICE_URL,
+    FALLBACK_SERVICE_AUDIENCE,
+    FALLBACK_REQUEST_TIMEOUT_COLD_START,
+    FALLBACK_REQUEST_TIMEOUT_WARM,
+    FALLBACK_MAX_RETRIES,
+    FALLBACK_RETRY_DELAY,
+)
+
+# Google Cloud authentication is handled by shared_processing.get_auth_headers
 
 app = FastAPI(title="BPM Finder API")
 
@@ -52,57 +45,7 @@ PUBSUB_TOPIC = f"projects/{PROJECT_ID}/topics/bpm-analysis-tasks"
 publisher = pubsub_v1.PublisherClient()
 db = firestore.Client()
 
-# Download limits
-CONNECT_TIMEOUT = 5.0  # seconds
-TOTAL_TIMEOUT = 20.0  # seconds
-MAX_SIZE = 10 * 1024 * 1024  # 10MB
-MAX_AUDIO_DURATION = 35.0  # seconds - cap analysis to first 35s
-
-# Fallback Service Configuration
-FALLBACK_SERVICE_URL = "https://bpm-fallback-service-340051416180.europe-west3.run.app"
-FALLBACK_SERVICE_AUDIENCE = FALLBACK_SERVICE_URL
-FALLBACK_TIMEOUT = 120.0  # seconds - total timeout for fallback request
-FALLBACK_REQUEST_TIMEOUT_COLD_START = 120.0  # seconds - timeout for first attempt (handles cold starts ~95s)
-FALLBACK_REQUEST_TIMEOUT_WARM = 60.0  # seconds - timeout for retries (warm instances are faster)
-FALLBACK_MAX_RETRIES = 3  # Maximum retry attempts for transient failures
-FALLBACK_RETRY_DELAY = 2.0  # seconds - delay between retries (increased for cold start recovery)
-
-# Circuit breaker state for fallback service
-class FallbackCircuitBreaker:
-    """Simple circuit breaker for fallback service calls."""
-    def __init__(self, failure_threshold=5, recovery_timeout=60):
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self.failure_count = 0
-        self.last_failure_time = None
-        self.state = "closed"  # closed, open, half_open
-    
-    def record_success(self):
-        """Record a successful call."""
-        self.failure_count = 0
-        self.state = "closed"
-    
-    def record_failure(self):
-        """Record a failed call."""
-        self.failure_count += 1
-        self.last_failure_time = time.time()
-        if self.failure_count >= self.failure_threshold:
-            self.state = "open"
-    
-    def can_attempt(self) -> bool:
-        """Check if we can attempt a call."""
-        if self.state == "closed":
-            return True
-        elif self.state == "open":
-            # Check if recovery timeout has passed
-            if self.last_failure_time and (time.time() - self.last_failure_time) >= self.recovery_timeout:
-                self.state = "half_open"
-                return True
-            return False
-        else:  # half_open
-            return True
-
-# Global circuit breaker instance
+# Global circuit breaker instance (using shared implementation)
 fallback_circuit_breaker = FallbackCircuitBreaker()
 
 # Global HTTPX client with connection pooling for reuse across requests
@@ -164,7 +107,7 @@ async def startup_event():
     try:
         # Try to get auth headers (this will fail if auth is misconfigured)
         try:
-            auth_headers = await get_auth_headers(FALLBACK_SERVICE_AUDIENCE)
+            auth_headers = await shared_get_auth_headers(FALLBACK_SERVICE_AUDIENCE)
         except Exception as e:
             print(f"Warning: Fallback service auth check failed at startup: {str(e)[:200]}")
             print("Fallback service calls will be skipped until auth is configured.")
@@ -280,323 +223,21 @@ class BatchStatusResponse(BaseModel):
     results: dict
 
 
-def validate_redirect_url(url: str) -> bool:
-    """Validate that a redirect URL uses HTTPS."""
-    return url.startswith("https://")
-
-
+# Wrapper for download_audio_async that converts Exception to HTTPException for FastAPI
 async def download_audio_async(url: str, output_path: str) -> None:
-    """Download audio file with SSRF protection and size limits using async streaming."""
-    # Use global HTTP client with connection pooling
+    """Download audio file with SSRF protection and size limits using async streaming.
+    
+    Wraps shared_processing.download_audio_async to convert Exception to HTTPException.
+    """
     client = get_http_client()
-    timeout = httpx.Timeout(
-            connect=CONNECT_TIMEOUT,
-            read=TOTAL_TIMEOUT,
-            write=TOTAL_TIMEOUT,
-            pool=CONNECT_TIMEOUT
-    )
-    
-    # Use global client (connection pooling enabled)
-    # Note: follow_redirects=False is set in global client, we handle redirects manually
-    current_url = url
-    redirect_count = 0
-    max_redirects = 10
-    
-    # Follow redirects manually, validating each one
-    while redirect_count < max_redirects:
-        # httpx streams by default when using aiter_bytes() - no stream parameter needed
-        response = await client.get(current_url, timeout=timeout)
-        
-        # If redirect, validate and follow
-        if response.status_code in (301, 302, 303, 307, 308):
-            redirect_url = response.headers.get("location")
-            # Close redirect response (we don't need the body, only headers)
-            await response.aclose()
-            
-            if not redirect_url:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Invalid redirect: missing Location header"
-                )
-            
-            # Resolve relative URLs
-            if redirect_url.startswith("/"):
-                parsed = urlparse(current_url)
-                redirect_url = f"{parsed.scheme}://{parsed.netloc}{redirect_url}"
-            elif not redirect_url.startswith("http"):
-                parsed = urlparse(current_url)
-                redirect_url = f"{parsed.scheme}://{parsed.netloc}/{redirect_url.lstrip('/')}"
-            
-            # Validate redirect URL
-            if not validate_redirect_url(redirect_url):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Redirect to non-HTTPS URL not allowed"
-                )
-            
-            current_url = redirect_url
-            redirect_count += 1
-            continue
-        
-        # If not a redirect, we have the final response
-        if response.status_code != 200:
-            # Close response before raising error (we don't need the body)
-            await response.aclose()
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=f"Download failed: HTTP {response.status_code}"
-            )
-        
-        # Check final URL uses HTTPS
-        final_url = str(response.url)
-        if not validate_redirect_url(final_url):
-            raise HTTPException(
-                status_code=400,
-                detail="Final URL must use HTTPS"
-            )
-        
-        # Check content length
-        content_length = response.headers.get("content-length")
-        if content_length and int(content_length) > MAX_SIZE:
-            raise HTTPException(
-                status_code=400,
-                detail=f"File too large (max {MAX_SIZE / 1024 / 1024:.1f}MB)"
-            )
-        
-        # Stream download directly to file with size limit (async I/O using aiofiles)
-        # aiofiles handles buffering internally, so we write chunks directly
-        total_size = 0
-        
-        async with aiofiles.open(output_path, "wb") as f:
-            async for chunk in response.aiter_bytes():
-                total_size += len(chunk)
-                if total_size > MAX_SIZE:
-                    # Clean up partial file
-                    await f.close()
-                    try:
-                        os.unlink(output_path)
-                    except Exception:
-                        pass
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"File too large (max {MAX_SIZE / 1024 / 1024:.1f}MB)"
-                    )
-                
-                # Write chunk directly - aiofiles handles buffering internally
-                await f.write(chunk)
-        
-        return
-    
-    # Too many redirects
-    raise HTTPException(
-        status_code=400,
-        detail="Too many redirects"
-    )
-
-
-def normalize_confidence(confidence: float) -> Tuple[float, str]:
-    """Normalize confidence value to 0-1 range and determine quality level.
-    
-    RhythmExtractor2013(method="multifeature") returns confidence in range 0-5.32.
-    This function normalizes to 0-1 and categorizes quality.
-    
-    Quality guidelines:
-    - [0, 1): very low confidence
-    - [1, 2): low confidence
-    - [2, 3): moderate confidence
-    - [3, 3.5): high confidence
-    - (3.5, 5.32]: excellent confidence
-    
-    Args:
-        confidence: Raw confidence value from Essentia (0-5.32)
-    
-    Returns:
-        Tuple of (normalized_confidence, quality_level) where:
-        - normalized_confidence: Value in [0, 1] range
-        - quality_level: Quality category string
-    """
-    # Clamp negative values to 0
-    if confidence < 0:
-        return 0.0, "very low"
-    
-    # Determine quality level based on raw confidence
-    MAX_CONFIDENCE = 5.32
-    if confidence < 1.0:
-        quality = "very low"
-    elif confidence < 2.0:
-        quality = "low"
-    elif confidence < 3.0:
-        quality = "moderate"
-    elif confidence < 3.5:
-        quality = "high"
-    else:
-        quality = "excellent"
-    
-    # Normalize to 0-1 range
-    normalized = min(1.0, confidence / MAX_CONFIDENCE)
-    
-    return float(normalized), quality
-
-
-def normalize_bpm(bpm: float) -> float:
-    """Normalize BPM by applying corrections only for extreme outliers.
-    
-    Args:
-        bpm: The BPM value to normalize
-    
-    Returns:
-        Normalized BPM value (float, no rounding - rounding happens once at response level)
-    """
-    normalized = bpm
-    
-    # Apply corrections only for extreme outliers
-    if normalized < 40:
-        normalized *= 2
-    elif normalized > 220:
-        normalized /= 2
-    
-    return normalized
-
-
-def analyze_audio(audio_path: str, max_confidence: float) -> Tuple[
-    Optional[float], Optional[float], Optional[float], Optional[str], Optional[str],
-    Optional[str], Optional[str], Optional[float], Optional[float],
-    bool, bool, str
-]:
-    """Analyze audio file: compute BPM and key from same loaded audio array.
-    
-    Args:
-        audio_path: Path to the audio file (MP3/AAC - Essentia handles decoding)
-        max_confidence: Confidence threshold for fallback decision
-    
-    Returns:
-        Tuple of:
-        - bpm_normalized, bpm_raw, bpm_confidence_normalized, bpm_quality, bpm_method
-        - key, scale, key_strength_raw, key_confidence_normalized
-        - need_fallback_bpm, need_fallback_key
-        - debug_info
-    """
-    # Lazy load essentia - only import when actually needed (reduces cold start time)
-    import essentia.standard as es
-    
-    debug_lines = []
-    
     try:
-        # Load audio once - Essentia handles MP3/AAC decoding directly
-        loader = es.MonoLoader(
-            filename=audio_path,
-            sampleRate=44100
+        await shared_download_audio_async(url, output_path, client)
+    except Exception as e:
+        # Convert generic Exception to HTTPException for FastAPI
+        raise HTTPException(
+            status_code=400,
+            detail=str(e)
         )
-        audio = loader()
-        
-        # Cap duration to MAX_AUDIO_DURATION seconds by trimming the array
-        max_samples = int(MAX_AUDIO_DURATION * 44100)
-        if len(audio) > max_samples:
-            audio = audio[:max_samples]
-            debug_lines.append(f"Audio loaded: {len(audio)/44100:.1f}s (trimmed from original, capped at {MAX_AUDIO_DURATION}s)")
-        else:
-            debug_lines.append(f"Audio loaded: {len(audio)/44100:.1f}s")
-    except Exception as e:
-        error_msg = f"Essentia audio loading error: {str(e)}"
-        debug_lines.append(error_msg)
-        return None, None, None, None, "error", "unknown", "unknown", 0.0, 0.0, True, True, "\n".join(debug_lines)
-    
-    # BPM extraction using multifeature method
-    bpm_normalized = None
-    bpm_raw = None
-    bpm_confidence_normalized = None
-    bpm_quality = None
-    bpm_method = "multifeature"
-    need_fallback_bpm = False
-    
-    try:
-        rhythm_extractor = es.RhythmExtractor2013(method="multifeature")
-        bpm_raw, beats, confidence_raw, _, beats_intervals = rhythm_extractor(audio)
-        
-        # Normalize confidence and get quality level
-        bpm_confidence_normalized, bpm_quality = normalize_confidence(float(confidence_raw))
-        bpm_normalized = normalize_bpm(float(bpm_raw))
-        
-        debug_lines.append(f"BPM={bpm_raw:.2f} (normalized={round(bpm_normalized, 1):.1f})")
-        debug_lines.append(f"Confidence: raw={confidence_raw:.3f} (range: 0-5.32), normalized={bpm_confidence_normalized:.3f} (0-1), quality={bpm_quality}")
-        
-        # Check if BPM confidence meets threshold
-        if bpm_confidence_normalized >= max_confidence:
-            debug_lines.append(f"BPM confidence ({bpm_confidence_normalized:.3f}) >= threshold ({max_confidence:.2f}) - using Essentia result")
-        else:
-            need_fallback_bpm = True
-            debug_lines.append(f"BPM confidence ({bpm_confidence_normalized:.3f}) < threshold ({max_confidence:.2f}) - fallback needed")
-    except Exception as e:
-        error_msg = f"BPM extraction error: {str(e)}"
-        debug_lines.append(error_msg)
-        need_fallback_bpm = True
-    
-    # Key extraction using same audio array
-    key = "unknown"
-    scale = "unknown"
-    key_strength_raw = 0.0
-    key_confidence_normalized = 0.0
-    need_fallback_key = False
-    
-    try:
-        # Try multiple key profile types
-        key_profiles = ['temperley', 'krumhansl', 'edma', 'edmm']
-        results = []
-        
-        for profile in key_profiles:
-            try:
-                # Try with profileType only (some Essentia versions don't support pcpSize/numHarmonics)
-                key_extractor = es.KeyExtractor(profileType=profile)
-                key_result, scale_result, strength = key_extractor(audio)
-                results.append((str(key_result), str(scale_result), float(strength), profile))
-                debug_lines.append(f"key_profile={profile}: key={key_result} {scale_result}, strength={strength:.3f}")
-            except Exception as e:
-                # Profile not available in this Essentia version, skip
-                debug_lines.append(f"key_profile={profile}: error={str(e)}")
-                continue
-        
-        # If we have results, return the one with highest strength
-        if results:
-            # Sort by strength (index 2) in descending order
-            results.sort(key=lambda x: x[2], reverse=True)
-            key, scale, key_strength_raw, winning_profile = results[0]
-            
-            # Normalize strength (assume KeyExtractor returns 0-1, but clamp if > 1)
-            key_confidence_normalized = min(1.0, max(0.0, key_strength_raw))
-            
-            debug_lines.append(f"Winner: {winning_profile} profile (strength={key_strength_raw:.3f}, normalized={key_confidence_normalized:.3f})")
-            if len(results) > 1:
-                strength_range = results[0][2] - results[-1][2]
-                debug_lines.append(f"Key ensemble: {len(results)} profiles, strength_range={strength_range:.3f}")
-        else:
-            # Fall back to default KeyExtractor if no profiles worked
-            try:
-                key_extractor = es.KeyExtractor()
-                key, scale, key_strength_raw = key_extractor(audio)
-                key_confidence_normalized = min(1.0, max(0.0, key_strength_raw))
-                debug_lines.append(f"Fallback: default KeyExtractor, key={key} {scale}, strength={key_strength_raw:.3f} (normalized={key_confidence_normalized:.3f})")
-            except Exception as e:
-                error_msg = f"KeyExtractor fallback error: {str(e)}"
-                debug_lines.append(error_msg)
-                need_fallback_key = True
-        
-        # Check if key strength meets threshold
-        if key_confidence_normalized >= max_confidence:
-            debug_lines.append(f"Key strength ({key_confidence_normalized:.3f}) >= threshold ({max_confidence:.2f}) - using Essentia result")
-        else:
-            need_fallback_key = True
-            debug_lines.append(f"Key strength ({key_confidence_normalized:.3f}) < threshold ({max_confidence:.2f}) - fallback needed")
-    except Exception as e:
-        error_msg = f"Key computation error: {str(e)}"
-        debug_lines.append(error_msg)
-        need_fallback_key = True
-    
-    return (
-        bpm_normalized, bpm_raw, bpm_confidence_normalized, bpm_quality, bpm_method,
-        key, scale, key_strength_raw, key_confidence_normalized,
-        need_fallback_bpm, need_fallback_key,
-        "\n".join(debug_lines)
-    )
 
 
 async def process_single_url(
@@ -633,7 +274,8 @@ async def process_single_url(
         # Download audio (async streaming) with timing
         try:
             timing["download_start"] = time.time()
-            await download_audio_async(url_str, input_path)
+            client = get_http_client()
+            await shared_download_audio_async(url_str, input_path, client)
             timing["download_end"] = time.time()
             timing["download_duration"] = timing["download_end"] - timing["download_start"]
             debug_info_parts.append(f"URL fetch: SUCCESS ({url_str[:50]}...)")
@@ -651,6 +293,8 @@ async def process_single_url(
             
             error_msg = f"URL fetch error: {str(e)}"
             debug_info_parts.append(error_msg)
+            # Note: We don't raise HTTPException here because this is used in batch processing
+            # The error will be returned in the result dict
             return index, {
                 "index": index,
                 "url": url_str,
@@ -757,52 +401,8 @@ async def process_single_url(
         pass
 
 
-async def get_auth_headers(audience: str) -> dict:
-    """Generates an OIDC token for the target audience for internal Cloud Run calls."""
-    if not GCP_AUTH_AVAILABLE:
-        error_msg = "GCP_AUTH_AVAILABLE is False - google-auth library not imported"
-        if GCP_AUTH_ERROR:
-            error_msg += f"\nImport error details: {GCP_AUTH_ERROR[:500]}"
-        raise Exception(error_msg)
-    
-    # Run synchronous auth operations in a thread to avoid blocking
-    def _get_token_sync():
-        try:
-            # Get default credentials (uses the service account attached to the Cloud Run service)
-            credentials, project = google.auth.default()
-            
-            if not credentials:
-                raise Exception(f"No credentials found for audience: {audience}")
-            
-            # Refresh credentials if needed
-            if not credentials.valid:
-                auth_request = google.auth.transport.requests.Request()
-                credentials.refresh(auth_request)
-            
-            # Create a request object for fetching the ID token
-            auth_request = google.auth.transport.requests.Request()
-            
-            # Fetch the ID token with the audience (fallback service URL)
-            token = google.oauth2.id_token.fetch_id_token(auth_request, audience)
-            
-            if not token:
-                raise Exception(f"Empty token generated for audience: {audience}")
-            
-            return {"Authorization": f"Bearer {token}"}
-        except Exception as e:
-            # Re-raise with context
-            raise Exception(f"Error generating auth token for {audience}: {str(e)}")
-    
-    try:
-        # Run in executor to avoid blocking the event loop
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, _get_token_sync)
-    except Exception as e:
-        # Log the full error for debugging
-        import traceback
-        error_details = f"Error in get_auth_headers for {audience}: {str(e)}\n{traceback.format_exc()}"
-        print(error_details)
-        raise  # Re-raise so caller can see the error
+# Use shared get_auth_headers implementation
+get_auth_headers = shared_get_auth_headers
 
 
 
@@ -813,55 +413,8 @@ async def health():
     return {"ok": True}
 
 
-def generate_debug_output(debug_info_parts: List[str], timing: dict, fallback_timing: Optional[dict], debug_level: str) -> str:
-    """Generate debug output based on debug_level.
-    
-    Args:
-        debug_info_parts: List of debug message strings
-        timing: Dict with download and essentia timing
-        fallback_timing: Optional dict with fallback service timing
-        debug_level: "minimal", "normal", or "detailed"
-    
-    Returns:
-        Formatted debug string
-    """
-    if debug_level == "minimal":
-        # Only errors and final results
-        filtered = [line for line in debug_info_parts if "error" in line.lower() or "SUCCESS" in line or "Fallback" in line]
-        if filtered:
-            return "\n".join(filtered)
-        return ""
-    
-    elif debug_level == "normal":
-        # Include telemetry summary
-        output = "\n".join(debug_info_parts)
-        telemetry = []
-        if timing.get("download_duration"):
-            telemetry.append(f"Download: {timing['download_duration']:.2f}s")
-        if timing.get("essentia_duration"):
-            telemetry.append(f"Essentia analysis: {timing['essentia_duration']:.2f}s")
-        if fallback_timing and fallback_timing.get("duration"):
-            telemetry.append(f"Fallback service: {fallback_timing['duration']:.2f}s")
-        if telemetry:
-            output += f"\n=== Telemetry ===\n" + ", ".join(telemetry)
-        return output
-    
-    else:  # detailed
-        # Full output with all timing details
-        output = "\n".join(debug_info_parts)
-        telemetry = []
-        if timing.get("download_start") and timing.get("download_end"):
-            telemetry.append(f"Download: {timing['download_duration']:.3f}s (start: {timing['download_start']:.3f}, end: {timing['download_end']:.3f})")
-        if timing.get("essentia_start") and timing.get("essentia_end"):
-            telemetry.append(f"Essentia analysis: {timing['essentia_duration']:.3f}s (start: {timing['essentia_start']:.3f}, end: {timing['essentia_end']:.3f})")
-        if fallback_timing:
-            if fallback_timing.get("start") and fallback_timing.get("end"):
-                telemetry.append(f"Fallback service: {fallback_timing['duration']:.3f}s (start: {fallback_timing['start']:.3f}, end: {fallback_timing['end']:.3f})")
-            elif fallback_timing.get("duration"):
-                telemetry.append(f"Fallback service: {fallback_timing['duration']:.3f}s")
-        if telemetry:
-            output += f"\n=== Telemetry ===\n" + "\n".join(telemetry)
-        return output
+# Use shared generate_debug_output implementation
+# (generate_debug_output is already imported from shared_processing)
 
 
 @app.post("/analyze/batch", response_model=BatchSubmissionResponse)
