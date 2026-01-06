@@ -183,6 +183,16 @@ gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
 
 echo "✅ Main service account Pub/Sub publisher permissions configured"
 
+# Grant Firestore user role (allows read/write)
+echo "🔐 Granting main service account Firestore permissions..."
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member "serviceAccount:${MAIN_SA}" \
+    --role "roles/datastore.user" \
+    --condition=None \
+    --project "${PROJECT_ID}" || echo "⚠️  Note: Firestore permissions may already be set"
+
+echo "✅ Main service account Firestore permissions configured"
+
 echo ""
 echo "✅ Service account configured!"
 echo ""
