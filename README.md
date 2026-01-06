@@ -1,10 +1,11 @@
 # BPM Finder API
 
-A Google Cloud Run microservice that computes BPM (beats per minute) and musical key from audio preview URLs. **Batch processing enabled** for efficient analysis of multiple URLs concurrently. The service is deployed as a **private** Cloud Run service, requiring Google Cloud IAM authentication.
+A Google Cloud Run microservice that computes BPM (beats per minute) and musical key from audio preview URLs. **Async streaming architecture** with real-time NDJSON results. The service is deployed as a **private** Cloud Run service, requiring Google Cloud IAM authentication.
 
 ## Features
 
-- **Batch Processing**: Process multiple audio URLs concurrently in a single request
+- **Async Streaming Architecture**: Submit batch, get `batch_id` immediately (<500ms), stream results in real-time via NDJSON
+- **Batch Processing**: Process multiple audio URLs concurrently via Pub/Sub workers
 - **Single-Method BPM Extraction**: Uses Essentia's `RhythmExtractor2013(method="multifeature")` for BPM detection
 - **Direct Compressed Audio Analysis**: Essentia handles MP3/AAC decoding directly (no ffmpeg conversion step)
 - **Duration Capping**: Analyzes first 35 seconds only for latency/cost optimization
@@ -22,9 +23,17 @@ A Google Cloud Run microservice that computes BPM (beats per minute) and musical
 - **Separate Results**: Response includes both Essentia and Librosa results separately (Librosa fields are null if not used)
 - **Private Cloud Run Service**: IAM authentication required for access
 - **SSRF Protection**: HTTPS-only requirement with redirect validation
-- **High Concurrency**: Optimized for batch processing with 80 concurrent requests per instance and 20 concurrent URL downloads per batch request
+- **High Concurrency**: Worker service handles 200 parallel tasks (20 instances × 10 concurrency)
+- **Real-time Results**: Results stream as they complete via NDJSON format
+- **Persistent Storage**: Results stored in Firestore, can reconnect to stream anytime
 
 ## Architecture
+
+The system uses an **async event-driven architecture** with three main components:
+
+1. **Primary API Service** (`bpm-service`): Accepts batch requests, publishes to Pub/Sub, streams results
+2. **Worker Service** (`bpm-worker`): Processes Pub/Sub messages, writes results to Firestore
+3. **Pub/Sub + Firestore**: Message queue and persistent storage
 
 ### Primary Service (`bpm-service`)
 
@@ -40,14 +49,40 @@ A Google Cloud Run microservice that computes BPM (beats per minute) and musical
   - Pre-compiled Python bytecode (compiled during Docker build)
   - CPU boost enabled for faster startup
 - **Deployment**: Google Cloud Run
-  - **High Concurrency**: 80 concurrent requests per instance (optimized for batch processing)
-  - **URL Concurrency**: 20 concurrent URL downloads per batch request (configurable via `BATCH_URL_CONCURRENCY` env var)
   - **Resources**: 2GB RAM, 2 CPU, CPU boost enabled (reduces cold start time)
-  - **Timeout**: 300 seconds (for large batch requests)
+  - **Timeout**: 300 seconds
   - **Max Instances**: 10 (auto-scaling)
+  - **Concurrency**: 80 concurrent requests per instance
 - **Authentication**: Cloud Run IAM (Identity Tokens)
-- **Fallback Integration**: Selectively calls fallback service based on `max_confidence` threshold (default 0.65)
-  - Single batch request for all low-confidence items
+- **Endpoints**:
+  - `POST /analyze/batch`: Submit batch, returns `batch_id` immediately
+  - `GET /stream/{batch_id}`: Stream results as NDJSON (real-time)
+  - `GET /batch/{batch_id}`: Get batch status and all results
+- **Integration**: Publishes tasks to Pub/Sub, reads results from Firestore
+
+### Worker Service (`bpm-worker`)
+
+- **Runtime**: Python 3 + FastAPI + Uvicorn
+- **Purpose**: Process individual URLs from Pub/Sub messages
+- **Audio Processing**: Same as primary service (Essentia for BPM/key detection)
+- **Container**: MTG Essentia base image (`ghcr.io/mtg/essentia:latest`) with ffmpeg
+- **Deployment**: Google Cloud Run
+  - **High Resources**: 4GB RAM, 4 CPU, CPU boost enabled
+  - **Timeout**: 600 seconds (for individual URL processing)
+  - **Max Instances**: 20 (auto-scaling)
+  - **Concurrency**: 10 concurrent requests per instance (200 parallel tasks total)
+- **Authentication**: Public endpoint (Pub/Sub push subscription)
+- **Integration**: 
+  - Receives Pub/Sub push messages via `/pubsub/process`
+  - Writes results to Firestore as they complete
+  - Calls fallback service when needed (same logic as primary service)
+
+### Pub/Sub & Firestore
+
+- **Pub/Sub Topic**: `bpm-analysis-tasks` - Queues individual URL processing tasks
+- **Pub/Sub Subscription**: `bpm-analysis-worker-sub` - Push subscription to worker service
+- **Firestore Collection**: `batches/{batch_id}` - Stores batch status and results
+- **Message Format**: `{batch_id, url, index, max_confidence, debug_level}`
 
 ### Fallback Service (`bpm-fallback-service`)
 
@@ -165,6 +200,8 @@ gcloud services enable \
     run.googleapis.com \
     cloudbuild.googleapis.com \
     artifactregistry.googleapis.com \
+    pubsub.googleapis.com \
+    firestore.googleapis.com \
     --project=${PROJECT_ID}
 ```
 
@@ -236,6 +273,30 @@ The `deploy.sh` script will:
 4. Create/verify the service account
 5. Grant `roles/run.invoker` permission to the service account
 
+### Deploy Worker Service
+
+**IMPORTANT**: Deploy the worker service **before** deploying the primary service, as the primary service publishes to Pub/Sub.
+
+```bash
+# Set your project ID
+export PROJECT_ID="your-project-id"
+
+# Deploy worker service
+./deploy_worker.sh
+
+# Or override region
+REGION=us-central1 ./deploy_worker.sh
+```
+
+The `deploy_worker.sh` script will:
+1. Enable Pub/Sub and Firestore APIs
+2. Create Pub/Sub topic `bpm-analysis-tasks`
+3. Build the Docker image using Cloud Build (with bytecode compilation and optimizations)
+4. Push to Artifact Registry
+5. Deploy to Cloud Run **with public access** (required for Pub/Sub push)
+6. Create Pub/Sub push subscription pointing to worker service
+7. Grant Pub/Sub service account permission to invoke worker
+
 ### Deploy Fallback Service
 
 To deploy the high-accuracy fallback service:
@@ -257,7 +318,7 @@ The `deploy_fallback.sh` script will:
 3. Deploy to Cloud Run **without public access** with higher resources (4GB RAM, 2 CPU, CPU boost)
 4. Configure service-to-service authentication for primary service calls
 
-**Important**: The primary service must be able to authenticate to the fallback service. The primary service uses its default Cloud Run service account to generate OIDC tokens for calling the fallback service.
+**Important**: The worker service must be able to authenticate to the fallback service. The worker service uses its default Cloud Run service account to generate OIDC tokens for calling the fallback service.
 
 ### Get Service URL
 
@@ -278,7 +339,7 @@ gcloud run services describe ${SERVICE_NAME} \
 
 ### Using the Test Script
 
-A test script is provided for easy testing:
+A test script is provided for easy testing of the async streaming architecture:
 
 ```bash
 # Test with default settings (max_confidence=0.65, debug_level=normal)
@@ -292,23 +353,35 @@ A test script is provided for easy testing:
 ```
 
 The test script will:
-1. Get an authentication token using `gcloud auth print-identity-token`
-2. Make a batch request to the `/analyze/batch` endpoint with the specified parameters
-3. Display the formatted JSON response
+1. Submit batch via `POST /analyze/batch` and get `batch_id` immediately
+2. Stream results via `GET /stream/{batch_id}` (NDJSON format)
+3. Display results as they arrive in real-time
+4. Check final status via `GET /batch/{batch_id}`
 
-**Expected Response Structure:**
-- Each item in the response array contains separate fields for Essentia and Librosa results
-- Essentia fields are always populated (primary service analysis)
-- Librosa fields are only populated when the fallback service was called (null otherwise)
-- Check `debug_txt` for detailed information about which method was used and why
+**Expected Flow:**
+1. Batch submission returns `batch_id` in <500ms
+2. First result arrives in 5-10 seconds
+3. Results stream every 2-3 seconds as they complete
+4. Final "complete" message when all URLs are processed
+
+**Streaming Results Format (NDJSON):**
+- `{"type":"status","status":"processing","total":5,"processed":0}`
+- `{"type":"result","index":0,"bpm_essentia":128,"key_essentia":"C",...}`
+- `{"type":"progress","processed":2,"total":5}`
+- `{"type":"complete","batch_id":"...","total":5}`
+
+**Reconnect to Stream:**
+You can reconnect to a stream anytime using the batch_id:
+```bash
+./test_stream.sh <batch_id>
+```
 
 **Optional Debug Scripts:**
 
 For debugging purposes, optional test scripts are available:
+- `test_stream.sh`: Stream results for a specific batch_id
 - `test_fallback_direct.sh`: Test the fallback service directly (requires manual configuration)
 - `test_fallback_auth.sh`: Test fallback service authentication (requires manual configuration)
-
-These scripts are not required for normal operation, as the primary service handles all fallback calls automatically.
 
 ### Test Health Endpoint
 
@@ -328,9 +401,9 @@ Expected response:
 {"ok": true}
 ```
 
-### Test Batch Analysis Endpoint
+### Test Async Streaming Endpoint
 
-**Batch Processing Example**
+**Submit Batch and Stream Results**
 
 ```bash
 # Get identity token
@@ -339,8 +412,8 @@ TOKEN=$(gcloud auth print-identity-token)
 # Replace with your actual service URL
 SERVICE_URL="https://your-service-url.run.app"
 
-# Batch process multiple URLs
-curl -X POST \
+# Step 1: Submit batch
+RESPONSE=$(curl -s -X POST \
     -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
     -d '{
@@ -352,10 +425,24 @@ curl -X POST \
       "max_confidence": 0.65,
       "debug_level": "normal"
     }' \
-    "${SERVICE_URL}/analyze/batch" | python3 -m json.tool
+    "${SERVICE_URL}/analyze/batch")
+
+# Extract batch_id
+BATCH_ID=$(echo "$RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin)['batch_id'])")
+
+echo "Batch ID: $BATCH_ID"
+echo "Response: $RESPONSE" | python3 -m json.tool
+
+# Step 2: Stream results (NDJSON)
+curl -s -N -X GET "${SERVICE_URL}/stream/${BATCH_ID}" \
+    -H "Authorization: Bearer $TOKEN" | while IFS= read -r line; do
+    if [ -n "$line" ]; then
+        echo "$line" | python3 -m json.tool
+    fi
+done
 ```
 
-Expected response (array of results, one per URL):
+Expected response format (NDJSON stream):
 ```json
 [
   {
@@ -422,7 +509,7 @@ Health check endpoint.
 
 ### `POST /analyze/batch`
 
-Batch process multiple audio URLs: compute BPM and key for each URL concurrently.
+Submit batch for async processing: publishes tasks to Pub/Sub and returns `batch_id` immediately.
 
 **Request Body:**
 ```json
@@ -446,7 +533,108 @@ Batch process multiple audio URLs: compute BPM and key for each URL concurrently
   - `"detailed"`: Full debug info + detailed timing with timestamps
 
 **Response:**
-Array of `BPMResponse` objects, one per input URL (maintains order):
+Returns immediately with batch submission details:
+
+```json
+{
+  "batch_id": "123e4567-e89b-12d3-a456-426614174000",
+  "total_urls": 5,
+  "status": "processing",
+  "stream_url": "/stream/123e4567-e89b-12d3-a456-426614174000"
+}
+```
+
+**Processing:**
+- Tasks are published to Pub/Sub immediately
+- Worker service processes URLs asynchronously
+- Results are written to Firestore as they complete
+- Use `/stream/{batch_id}` to receive results in real-time
+
+### `GET /stream/{batch_id}`
+
+Stream batch results as NDJSON (Newline Delimited JSON). Polls Firestore every 500ms and yields results as they become available.
+
+**Response:** Streaming NDJSON with the following message types:
+
+**Status Message:**
+```json
+{"type":"status","status":"processing","total":5,"processed":2}
+```
+
+**Result Message:**
+```json
+{
+  "type": "result",
+  "index": 0,
+  "url": "https://...",
+  "bpm_essentia": 128,
+  "bpm_raw_essentia": 128.0,
+  "bpm_confidence_essentia": 0.77,
+  "bpm_librosa": null,
+  "bpm_raw_librosa": null,
+  "bpm_confidence_librosa": null,
+  "key_essentia": "C",
+  "scale_essentia": "major",
+  "keyscale_confidence_essentia": 0.86,
+  "key_librosa": null,
+  "scale_librosa": null,
+  "keyscale_confidence_librosa": null,
+  "debug_txt": "..."
+}
+```
+
+**Progress Message:**
+```json
+{"type":"progress","processed":3,"total":5}
+```
+
+**Complete Message:**
+```json
+{"type":"complete","batch_id":"...","total":5}
+```
+
+**Error Message:**
+```json
+{"type":"error","message":"Batch not found"}
+```
+
+**Usage:**
+- Connect to stream endpoint and read NDJSON lines
+- Results arrive as they complete (typically 5-10s for first result, then every 2-3s)
+- Stream closes when batch is complete
+- Can reconnect anytime using the same `batch_id`
+
+### `GET /batch/{batch_id}`
+
+Get batch status and all results from Firestore.
+
+**Response:**
+```json
+{
+  "batch_id": "123e4567-e89b-12d3-a456-426614174000",
+  "status": "completed",
+  "total_urls": 5,
+  "processed": 5,
+  "results": {
+    "0": {
+      "index": 0,
+      "url": "https://...",
+      "bpm_essentia": 128,
+      ...
+    },
+    "1": { ... },
+    ...
+  }
+}
+```
+
+**Status Values:**
+- `"processing"`: Batch is still being processed
+- `"completed"`: All URLs have been processed
+
+### Legacy Response Format
+
+For reference, the old synchronous response format (array of results):
 
 ```json
 [

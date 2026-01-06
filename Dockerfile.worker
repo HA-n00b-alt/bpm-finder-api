@@ -29,8 +29,8 @@ RUN python3 -m pip install --no-cache-dir -r requirements.txt --root-user-action
     python3 -c "import google.auth; print('google-auth imported successfully')" || \
     (echo "ERROR: google-auth failed to import after installation" && exit 1)
 
-# Copy application code (primary API service: main.py only)
-COPY main.py ./
+# Copy application code (worker service: worker.py and shared_processing.py)
+COPY worker.py shared_processing.py ./
 
 # Pre-compile Python bytecode to reduce cold start time
 # This compiles all .py files to .pyc files during build time
@@ -43,6 +43,6 @@ USER appuser
 # Expose port 8080 (Cloud Run requirement)
 EXPOSE 8080
 
-# Run uvicorn with main.py (primary API service)
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+# Run uvicorn with worker.py (worker service)
+CMD ["uvicorn", "worker:app", "--host", "0.0.0.0", "--port", "8080"]
 

@@ -7,13 +7,17 @@ import tempfile
 import asyncio
 import io
 import time
+import uuid
+import json
 from typing import Optional, Tuple, List
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 import httpx
 import aiofiles
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, HttpUrl, field_validator
+from google.cloud import pubsub_v1, firestore
 # Lazy load essentia - heavy C++ library that slows startup
 # Will be imported in analyze_audio() when actually needed
 
@@ -39,6 +43,14 @@ except Exception as e:
     print(f"Warning: Unexpected error importing google-auth: {GCP_AUTH_ERROR}", file=sys.stderr)
 
 app = FastAPI(title="BPM Finder API")
+
+# Google Cloud configuration
+PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT") or os.getenv("PROJECT_ID", "bpm-api-microservice")
+PUBSUB_TOPIC = f"projects/{PROJECT_ID}/topics/bpm-analysis-tasks"
+
+# Initialize Pub/Sub and Firestore clients
+publisher = pubsub_v1.PublisherClient()
+db = firestore.Client()
 
 # Download limits
 CONNECT_TIMEOUT = 5.0  # seconds
@@ -251,6 +263,21 @@ class BPMResponse(BaseModel):
     
     # Debug information
     debug_txt: Optional[str] = None
+
+
+class BatchSubmissionResponse(BaseModel):
+    batch_id: str
+    total_urls: int
+    status: str
+    stream_url: str
+
+
+class BatchStatusResponse(BaseModel):
+    batch_id: str
+    status: str
+    total_urls: int
+    processed: int
+    results: dict
 
 
 def validate_redirect_url(url: str) -> bool:
@@ -837,344 +864,212 @@ def generate_debug_output(debug_info_parts: List[str], timing: dict, fallback_ti
         return output
 
 
-@app.post("/analyze/batch", response_model=List[BPMResponse])
+@app.post("/analyze/batch", response_model=BatchSubmissionResponse)
 async def analyze_batch(request: BatchBPMRequest):
-    """Batch process multiple audio URLs: compute BPM and key for each.
+    """Submit batch for processing: publish tasks to Pub/Sub and return batch_id immediately.
     
-    Processes URLs concurrently (with concurrency limit), then sends a single batch request to fallback
-    service for items that need it.
+    Processing happens asynchronously via worker service. Use /stream/{batch_id} to receive results.
     """
     max_confidence = request.max_confidence if request.max_confidence is not None else 0.65
     debug_level = request.debug_level if request.debug_level else "normal"
     
-    # Semaphore to limit per-request URL concurrency
-    batch_semaphore = asyncio.Semaphore(BATCH_URL_CONCURRENCY)
+    # Generate batch_id
+    batch_id = str(uuid.uuid4())
+    total_urls = len(request.urls)
     
-    async def process_with_limit(url, max_conf, index):
-        """Wrapper to apply concurrency limit to process_single_url."""
-        async with batch_semaphore:
-            return await process_single_url(url, max_conf, index)
+    # Create batch document in Firestore
+    batch_ref = db.collection('batches').document(batch_id)
+    batch_ref.set({
+        'batch_id': batch_id,
+        'total_urls': total_urls,
+        'processed': 0,
+        'status': 'processing',
+        'created_at': firestore.SERVER_TIMESTAMP,
+        'results': {}
+    })
     
-    # Process all URLs concurrently with concurrency limit
-    tasks = [
-        process_with_limit(url, max_confidence, i)
-        for i, url in enumerate(request.urls)
-    ]
-    results = await asyncio.gather(*tasks)
-    
-    # Sort by index to maintain order
-    results.sort(key=lambda x: x[0])
-    processed_items = [item for _, item in results]
-    
-    # Collect items that need fallback
-    fallback_items = [
-        item for item in processed_items
-        if item["need_fallback_bpm"] or item["need_fallback_key"]
-    ]
-    
-    # Track fallback service timing
-    fallback_timing = {
-        "start": None,
-        "end": None,
-        "duration": None,
-    }
-    
-    # Single batch request to fallback service if needed
-    if fallback_items:
-        # Log fallback attempt
-        for item in fallback_items:
-            item["debug_info_parts"].append(f"=== Fallback Service ===")
-            item["debug_info_parts"].append(f"Fallback needed: BPM={item['need_fallback_bpm']}, Key={item['need_fallback_key']}")
+    # Publish each URL as a separate message to Pub/Sub
+    for index, url in enumerate(request.urls):
+        message_data = {
+            'batch_id': batch_id,
+            'url': str(url),
+            'index': index,
+            'max_confidence': max_confidence,
+            'debug_level': debug_level
+        }
+        message_bytes = json.dumps(message_data).encode('utf-8')
         
         try:
-            # Get auth headers and capture any errors
-            auth_error = None
-            try:
-                auth_headers = await get_auth_headers(FALLBACK_SERVICE_AUDIENCE)
-            except Exception as e:
-                auth_error = str(e)
-                auth_headers = {}
-            
-            # Log auth header status (without exposing the token)
-            if auth_headers and "Authorization" in auth_headers:
-                for item in fallback_items:
-                    item["debug_info_parts"].append(f"Auth token generated: Yes (Bearer token present)")
-            else:
-                for item in fallback_items:
-                    error_msg = "Auth token generation failed"
-                    if auth_error:
-                        error_msg += f": {auth_error[:200]}"
-                    else:
-                        error_msg += " - check service account permissions and GCP_AUTH_AVAILABLE"
-                    item["debug_info_parts"].append(error_msg)
-            
-            # Prepare multipart files for fallback (streaming, not reading into RAM)
-            files = []
-            data = {}
-            file_handles = []  # Keep track for cleanup
-            file_index_to_item_index = []  # Map file index to fallback_items index
-            
-            # Open files asynchronously to avoid blocking the event loop
-            loop = asyncio.get_event_loop()
-            for i, item in enumerate(fallback_items):
-                if item["file_path"]:
-                    # Check file existence asynchronously
-                    file_exists = await loop.run_in_executor(None, os.path.exists, item["file_path"])
-                    if file_exists:
-                        # Open file for streaming upload (non-blocking using executor)
-                        file_handle = await loop.run_in_executor(None, open, item["file_path"], "rb")
-                        file_handles.append(file_handle)
-                        file_idx = len(files)  # Index in files array
-                        file_index_to_item_index.append(i)  # Map to fallback_items index
-                        # httpx requires each file to have a unique tuple entry
-                        # Multiple files with same field name are sent as separate entries
-                        files.append(
-                            ("audio_files", (f"audio_{file_idx}.tmp", file_handle, "audio/mpeg"))
-                        )
-                        data[f"process_bpm_{file_idx}"] = str(item["need_fallback_bpm"]).lower()
-                        data[f"process_key_{file_idx}"] = str(item["need_fallback_key"]).lower()
-                        data[f"url_{file_idx}"] = item["url"]
-                    else:
-                        # Log missing file
-                        item["debug_info_parts"].append(f"Fallback skipped: file_path missing or doesn't exist")
-                else:
-                    # Log missing file path
-                    item["debug_info_parts"].append(f"Fallback skipped: file_path missing or doesn't exist")
-            
-            # Make batch request to fallback service
-            if files:  # Only make request if we have files to send
-                # Check circuit breaker
-                if not fallback_circuit_breaker.can_attempt():
-                    for item in fallback_items:
-                        item["debug_info_parts"].append("Fallback service circuit breaker is OPEN - skipping fallback call")
-                    # Clean up file handles before returning
-                    for fh in file_handles:
-                        try:
-                            fh.close()
-                        except Exception:
-                            pass
-                else:
-                    try:
-                        for item in fallback_items:
-                            item["debug_info_parts"].append(f"Calling fallback service: {FALLBACK_SERVICE_URL}/process_batch")
-                        
-                        # Log what we're sending
-                        for item in fallback_items:
-                            item["debug_info_parts"].append(f"Sending {len(files)} files to fallback service")
-                        
-                        # Retry logic for transient failures
-                        last_exception = None
-                        response = None
-                        fallback_timing["start"] = time.time()
-                        
-                        for attempt in range(FALLBACK_MAX_RETRIES):
-                            # Progressive timeout: longer for first attempt (cold start), shorter for retries (warm)
-                            request_timeout = FALLBACK_REQUEST_TIMEOUT_COLD_START if attempt == 0 else FALLBACK_REQUEST_TIMEOUT_WARM
-                            
-                            try:
-                                # Create timeout with per-request timeout
-                                timeout = httpx.Timeout(
-                                    connect=5.0,
-                                    read=request_timeout,
-                                    write=request_timeout,
-                                    pool=5.0
-                                )
-                                
-                                # Use global HTTP client with connection pooling
-                                client = get_http_client()
-                                response = await client.post(
-                                    f"{FALLBACK_SERVICE_URL}/process_batch",
-                                    files=files,
-                                    data=data,
-                                    headers=auth_headers,
-                                    timeout=timeout
-                                )
-                                
-                                # Success - record and break
-                                fallback_circuit_breaker.record_success()
-                                break
-                                
-                            except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as e:
-                                last_exception = e
-                                error_type = type(e).__name__
-                                error_msg = str(e) if str(e) else f"{error_type} occurred"
-                                if attempt < FALLBACK_MAX_RETRIES - 1:
-                                    # Wait before retry (exponential backoff)
-                                    retry_delay = FALLBACK_RETRY_DELAY * (2 ** attempt)  # 2s, 4s, 8s
-                                    await asyncio.sleep(retry_delay)
-                                    for item in fallback_items:
-                                        item["debug_info_parts"].append(
-                                            f"Fallback retry attempt {attempt + 2}/{FALLBACK_MAX_RETRIES} (error: {error_type}, timeout: {request_timeout}s)"
-                                        )
-                                else:
-                                    # All retries exhausted
-                                    fallback_circuit_breaker.record_failure()
-                                    for item in fallback_items:
-                                        item["debug_info_parts"].append(
-                                            f"Fallback service: All {FALLBACK_MAX_RETRIES} retries exhausted. Last error: {error_type}: {error_msg[:150]}"
-                                        )
-                                    raise
-                            except Exception as e:
-                                # Non-retryable error
-                                last_exception = e
-                                fallback_circuit_breaker.record_failure()
-                                raise
-                        
-                        fallback_timing["end"] = time.time()
-                        fallback_timing["duration"] = fallback_timing["end"] - fallback_timing["start"]
-                        
-                        # Close file handles after successful request
-                        for fh in file_handles:
-                            try:
-                                fh.close()
-                            except Exception:
-                                pass
-                    
-                    except Exception as e:
-                        # Log error but continue with Essentia results
-                        error_type = type(e).__name__
-                        error_msg = str(e) if str(e) else f"{error_type} occurred"
-                        # Include more context for timeout/connection errors
-                        if isinstance(e, (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError)):
-                            error_msg = f"{error_type}: {error_msg} (fallback service may be unreachable or overloaded)"
-                        error_msg = error_msg[:300]  # Allow slightly longer error messages
-                        for item in fallback_items:
-                            processed_items[item["index"]]["debug_info_parts"].append(
-                                f"Fallback service exception: {error_msg}"
-                            )
-                        # Ensure file handles are closed even on error
-                        for fh in file_handles:
-                            try:
-                                fh.close()
-                            except Exception:
-                                pass
-                        response = None
-                    
-                    # Process response if we got one
-                    if response is not None:
-                        # Log response status
-                        for item in fallback_items:
-                            item["debug_info_parts"].append(f"Fallback service response: HTTP {response.status_code}")
-                        
-                        if response.status_code == 200:
-                            fallback_results = response.json()
-                            
-                            # Log what we received for debugging
-                            for item in fallback_items:
-                                item["debug_info_parts"].append(f"Fallback results received: {len(fallback_results)} items")
-                            
-                            # Update processed items with fallback results
-                            # Match results by file_index_to_item_index mapping
-                            for file_idx, fallback_result in enumerate(fallback_results):
-                                if file_idx < len(file_index_to_item_index):
-                                    item_idx = file_index_to_item_index[file_idx]
-                                    item = fallback_items[item_idx]
-                                    item_index = item["index"]
-                                    
-                                    # Log the result we're processing
-                                    item["debug_info_parts"].append(
-                                        f"Processing fallback result {file_idx}: bpm_normalized={fallback_result.get('bpm_normalized')}, "
-                                        f"bpm_raw={fallback_result.get('bpm_raw')}, confidence={fallback_result.get('confidence')}"
-                                    )
-                                    
-                                    # Update Librosa BPM fields if fallback was needed and returned
-                                    if item["need_fallback_bpm"] and fallback_result.get("bpm_normalized") is not None:
-                                        processed_items[item_index]["bpm_librosa"] = int(round(fallback_result["bpm_normalized"]))
-                                        processed_items[item_index]["bpm_raw_librosa"] = round(fallback_result["bpm_raw"], 2) if fallback_result.get("bpm_raw") else None
-                                        processed_items[item_index]["bpm_confidence_librosa"] = round(fallback_result["confidence"], 2) if fallback_result.get("confidence") else None
-                                        processed_items[item_index]["debug_info_parts"].append(
-                                            f"Fallback BPM: {round(fallback_result['bpm_normalized'], 1):.1f} (confidence={fallback_result['confidence']:.3f})"
-                                        )
-                                    elif item["need_fallback_bpm"]:
-                                        processed_items[item_index]["debug_info_parts"].append(
-                                            f"Fallback BPM: No result returned (bpm_normalized={fallback_result.get('bpm_normalized')}, response keys: {list(fallback_result.keys())})"
-                                        )
-                                    
-                                    # Update Librosa key fields if fallback was needed and returned
-                                    if item["need_fallback_key"] and fallback_result.get("key") is not None:
-                                        processed_items[item_index]["key_librosa"] = fallback_result["key"]
-                                        processed_items[item_index]["scale_librosa"] = fallback_result["scale"]
-                                        processed_items[item_index]["keyscale_confidence_librosa"] = round(fallback_result["key_confidence"], 2) if fallback_result.get("key_confidence") else None
-                                        processed_items[item_index]["debug_info_parts"].append(
-                                            f"Fallback key: {fallback_result['key']} {fallback_result['scale']} (confidence={fallback_result['key_confidence']:.3f})"
-                                        )
-                                    elif item["need_fallback_key"]:
-                                        processed_items[item_index]["debug_info_parts"].append(
-                                            f"Fallback key: No result returned (key={fallback_result.get('key')}, response keys: {list(fallback_result.keys())})"
-                                        )
-                                else:
-                                    # Log if we have more results than expected
-                                    for item in fallback_items:
-                                        item["debug_info_parts"].append(
-                                            f"Warning: Fallback result index {file_idx} exceeds mapping length {len(file_index_to_item_index)}"
-                                        )
-                        else:
-                            # Log non-200 response
-                            error_text = response.text[:200] if hasattr(response, 'text') else str(response.content)[:200]
-                            for item in fallback_items:
-                                item["debug_info_parts"].append(
-                                    f"Fallback service error: HTTP {response.status_code} - {error_text}"
-                                )
-            else:
-                # No files to send
-                for item in fallback_items:
-                    item["debug_info_parts"].append("Fallback skipped: No valid files to send")
+            future = publisher.publish(PUBSUB_TOPIC, message_bytes)
+            future.result()  # Wait for publish to complete
         except Exception as e:
-            # Log error but continue with Essentia results
-            error_msg = str(e)[:200]
-            for item in fallback_items:
-                processed_items[item["index"]]["debug_info_parts"].append(
-                    f"Fallback preparation error: {error_msg}"
-                )
+            # Log error but continue with other URLs
+            print(f"Error publishing message for URL {index}: {str(e)}")
+            # Update Firestore with error
+            batch_ref.update({
+                f'results.{index}': {
+                    'index': index,
+                    'url': str(url),
+                    'error': f'Failed to publish to Pub/Sub: {str(e)}'
+                }
+            })
     
-    # Build final responses and cleanup
-    final_responses = []
-    for item in processed_items:
-        # Use fallback timing if this item used fallback, otherwise None
-        item_fallback_timing = fallback_timing if (item.get("need_fallback_bpm") or item.get("need_fallback_key")) and fallback_timing.get("duration") else None
-        
-        # Generate debug output based on debug_level
-        debug_txt = generate_debug_output(
-            item.get("debug_info_parts", []),
-            item.get("timing", {}),
-            item_fallback_timing,
-            debug_level
-        )
-        
-        final_responses.append(BPMResponse(
-            # Essentia BPM results
-            bpm_essentia=item.get("bpm_essentia"),
-            bpm_raw_essentia=item.get("bpm_raw_essentia"),
-            bpm_confidence_essentia=item.get("bpm_confidence_essentia"),
-            
-            # Librosa BPM results
-            bpm_librosa=item.get("bpm_librosa"),
-            bpm_raw_librosa=item.get("bpm_raw_librosa"),
-            bpm_confidence_librosa=item.get("bpm_confidence_librosa"),
-            
-            # Essentia key results
-            key_essentia=item.get("key_essentia"),
-            scale_essentia=item.get("scale_essentia"),
-            keyscale_confidence_essentia=item.get("keyscale_confidence_essentia"),
-            
-            # Librosa key results
-            key_librosa=item.get("key_librosa"),
-            scale_librosa=item.get("scale_librosa"),
-            keyscale_confidence_librosa=item.get("keyscale_confidence_librosa"),
-            
-            # Debug information
-            debug_txt=debug_txt if debug_txt else None,
-        ))
-        
-        # Cleanup temp file (ensure cleanup even if fallback failed) - async to avoid blocking
-        if item.get("file_path"):
-            loop = asyncio.get_event_loop()
-            try:
-                # Check existence and delete asynchronously
-                file_exists = await loop.run_in_executor(None, os.path.exists, item["file_path"])
-                if file_exists:
-                    await loop.run_in_executor(None, os.unlink, item["file_path"])
-            except Exception:
-                pass
+    return BatchSubmissionResponse(
+        batch_id=batch_id,
+        total_urls=total_urls,
+        status='processing',
+        stream_url=f'/stream/{batch_id}'
+    )
 
-    return final_responses
+
+@app.get("/stream/{batch_id}")
+async def stream_batch_results(batch_id: str):
+    """Stream batch results as NDJSON (Newline Delimited JSON).
+    
+    Polls Firestore every 500ms and yields results as they become available.
+    """
+    batch_ref = db.collection('batches').document(batch_id)
+    sent_indices = set()
+    
+    async def generate_stream():
+        loop = asyncio.get_event_loop()
+        start_time = time.time()
+        last_keepalive = start_time
+        max_stream_time = 600  # 10 minutes max stream time
+        
+        while True:
+            try:
+                current_time = time.time()
+                elapsed = current_time - start_time
+                
+                # Check max stream time
+                if elapsed > max_stream_time:
+                    yield json.dumps({
+                        "type": "error",
+                        "message": f"Stream timeout after {max_stream_time}s"
+                    }) + "\n"
+                    break
+                
+                # Send keepalive every 30 seconds to prevent connection timeout
+                if current_time - last_keepalive >= 30:
+                    yield json.dumps({
+                        "type": "keepalive",
+                        "elapsed": int(elapsed)
+                    }) + "\n"
+                    last_keepalive = current_time
+                
+                # Get batch document from Firestore (run in executor to avoid blocking)
+                batch_doc = await loop.run_in_executor(None, batch_ref.get)
+                
+                if not batch_doc.exists:
+                    # Batch not found
+                    yield json.dumps({
+                        "type": "error",
+                        "message": f"Batch {batch_id} not found"
+                    }) + "\n"
+                    break
+                
+                batch_data = batch_doc.to_dict()
+                status = batch_data.get('status', 'processing')
+                total_urls = batch_data.get('total_urls', 0)
+                processed = batch_data.get('processed', 0)
+                results = batch_data.get('results', {})
+                
+                # Send status update (only if status changed or every 10 seconds)
+                should_send_status = (
+                    len(sent_indices) == 0 or  # First status
+                    processed > len(sent_indices) or  # New results available
+                    int(elapsed) % 10 == 0  # Every 10 seconds
+                )
+                
+                if should_send_status:
+                    yield json.dumps({
+                        "type": "status",
+                        "status": status,
+                        "total": total_urls,
+                        "processed": processed,
+                        "elapsed": int(elapsed)
+                    }) + "\n"
+                
+                # Send new results
+                for index_str, result in results.items():
+                    index = int(index_str)
+                    if index not in sent_indices:
+                        sent_indices.add(index)
+                        # Format result for streaming
+                        stream_result = {
+                            "type": "result",
+                            "index": index,
+                            "url": result.get("url"),
+                            "bpm_essentia": result.get("bpm_essentia"),
+                            "bpm_raw_essentia": result.get("bpm_raw_essentia"),
+                            "bpm_confidence_essentia": result.get("bpm_confidence_essentia"),
+                            "bpm_librosa": result.get("bpm_librosa"),
+                            "bpm_raw_librosa": result.get("bpm_raw_librosa"),
+                            "bpm_confidence_librosa": result.get("bpm_confidence_librosa"),
+                            "key_essentia": result.get("key_essentia"),
+                            "scale_essentia": result.get("scale_essentia"),
+                            "keyscale_confidence_essentia": result.get("keyscale_confidence_essentia"),
+                            "key_librosa": result.get("key_librosa"),
+                            "scale_librosa": result.get("scale_librosa"),
+                            "keyscale_confidence_librosa": result.get("keyscale_confidence_librosa"),
+                            "debug_txt": result.get("debug_txt"),
+                            "error": result.get("error")
+                        }
+                        yield json.dumps(stream_result) + "\n"
+                
+                # Send progress update only when processed count changes
+                if processed > 0 and processed != len(sent_indices):
+                    yield json.dumps({
+                        "type": "progress",
+                        "processed": processed,
+                        "total": total_urls
+                    }) + "\n"
+                
+                # Check if complete
+                if status == "completed":
+                    yield json.dumps({
+                        "type": "complete",
+                        "batch_id": batch_id,
+                        "total": total_urls,
+                        "elapsed": int(elapsed)
+                    }) + "\n"
+                    break
+                
+                # Wait before next poll
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                import traceback
+                error_msg = f"Error streaming batch: {str(e)}\n{traceback.format_exc()}"
+                yield json.dumps({
+                    "type": "error",
+                    "message": error_msg[:500]  # Limit error message length
+                }) + "\n"
+                break
+    
+    return StreamingResponse(
+        generate_stream(),
+        media_type="application/x-ndjson"
+    )
+
+
+@app.get("/batch/{batch_id}", response_model=BatchStatusResponse)
+async def get_batch_status(batch_id: str):
+    """Get batch status and results from Firestore."""
+    batch_ref = db.collection('batches').document(batch_id)
+    loop = asyncio.get_event_loop()
+    batch_doc = await loop.run_in_executor(None, batch_ref.get)
+    
+    if not batch_doc.exists:
+        raise HTTPException(status_code=404, detail=f"Batch {batch_id} not found")
+    
+    batch_data = batch_doc.to_dict()
+    
+    return BatchStatusResponse(
+        batch_id=batch_id,
+        status=batch_data.get('status', 'processing'),
+        total_urls=batch_data.get('total_urls', 0),
+        processed=batch_data.get('processed', 0),
+        results=batch_data.get('results', {})
+    )
