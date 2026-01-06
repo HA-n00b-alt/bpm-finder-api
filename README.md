@@ -13,7 +13,7 @@ A Google Cloud Run microservice that computes BPM (beats per minute) and musical
   - BPM fallback: Triggered when BPM confidence < `max_confidence` threshold
   - Key fallback: Triggered when key strength < `max_confidence` threshold
   - Can call fallback for BPM only, key only, both, or neither
-  - **Single batch fallback request** for all low-confidence items
+  - **Per-worker fallback calls**: Each worker task calls fallback service independently when needed
 - **Configurable Confidence Threshold**: `max_confidence` parameter (default 0.65) controls when fallback is triggered
 - **Configurable Debug Output**: `debug_level` parameter (`minimal`, `normal`, `detailed`) controls debug information verbosity
 - **Musical Key Detection**: Multiple Essentia key profile types with automatic selection of best result
@@ -98,13 +98,15 @@ The system uses an **async event-driven architecture** with three main component
   - **Higher Resources**: 4GB RAM, 2 CPU, CPU boost enabled
   - **Timeout**: 300 seconds (for batch processing)
   - **Max Instances**: 10 (auto-scaling)
+  - **Total Capacity**: 20 concurrent fallback requests (10 instances × 2 concurrency)
 - **Performance Optimizations**:
   - Lazy loading of heavy libraries (librosa and numpy load only when needed, reducing cold start time)
   - Pre-compiled Python bytecode (compiled during Docker build)
   - CPU boost enabled for faster startup
 - **Authentication**: Cloud Run IAM (service-to-service authentication)
 - **Use Case**: High-accuracy, high-cost fallback for low-confidence primary results
-- **Batch Processing**: Accepts multiple files in a single request, processes sequentially
+- **Confidence Calculation**: Uses beat interval consistency (coefficient of variation) to calculate confidence (0.0-1.0 range, no artificial caps)
+- **Call Pattern**: Each worker task calls fallback service independently when Essentia confidence is below threshold
 
 ## Prerequisites
 
@@ -712,10 +714,10 @@ For reference, the old synchronous response format (array of results):
   - If Librosa fields are null, Essentia results met the confidence threshold and should be used
 
 **Processing Behavior:**
-- URLs are processed **concurrently** using `asyncio.gather()`
+- URLs are processed **concurrently** by independent worker tasks via Pub/Sub
 - Audio is analyzed for **first 35 seconds only** (latency/cost optimization)
-- Low-confidence items are collected and sent in a **single batch request** to fallback service
-- Response array maintains the same order as input URLs
+- Each worker task calls fallback service independently when Essentia confidence is below threshold
+- Results are written to Firestore as they complete and streamed to clients in real-time
 
 **Performance Recommendations:**
 - **Recommended max batch size: 20 songs** for optimal performance and reliability
@@ -976,17 +978,12 @@ The services implement several optimizations to reduce cold start time and impro
    - **Key Analysis**: Use Essentia `KeyExtractor` with multiple profile types (temperley, krumhansl, edma, edmm) and select best result
      - Check if normalized strength >= `max_confidence` threshold
 
-3. **Collect Low-Confidence Items**: After all primary analyses complete:
-   - Identify items where BPM confidence < `max_confidence` and/or key strength < `max_confidence`
-   - Collect only these items for fallback processing
+3. **Per-Worker Fallback Calls** (if needed):
+   - Each worker task independently checks if Essentia confidence < `max_confidence` threshold
+   - If below threshold, worker calls fallback service for that specific item
+   - Fallback service processes one file per request (not batched across workers)
 
-4. **Single Batch Fallback Request** (if any items need fallback):
-   - Send one batch request to fallback service with all low-confidence items
-   - Stream file handles directly (not reading full files into RAM)
-   - Include processing flags (BPM only, key only, or both) for each item
-   - Uses multipart form data with file streaming for efficient memory usage
-
-5. **Update Results**: Overwrite only the results that needed fallback (BPM, key, or both)
+4. **Update Results**: Worker writes results to Firestore, including fallback results if used
 
 6. **Normalize BPM**: Adjust for extreme outliers only:
    - If BPM < 40: multiply by 2
@@ -1126,7 +1123,7 @@ If the fallback service is not being triggered when expected:
 2. **Verify fallback URL**: Ensure `FALLBACK_SERVICE_URL` in `main.py` matches the deployed fallback service URL
 3. **Check authentication**: The primary service needs permission to call the fallback service. Ensure the primary service's default Cloud Run service account has `roles/run.invoker` permission on the fallback service
 4. **Check debug_info**: The `debug_info` field in the response will indicate if fallback was triggered and any errors encountered
-5. **Batch processing**: In batch mode, only items with low confidence are sent to fallback in a single batch request
+5. **Per-worker fallback**: Each worker task independently calls fallback service when needed (not batched across workers)
 
 ### Fallback service authentication errors
 

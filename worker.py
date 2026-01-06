@@ -227,8 +227,10 @@ async def process_single_url_task(
         }
         
         # Handle fallback if needed
+        fallback_timing = None
         if need_fallback_bpm or need_fallback_key:
             print(f"[{batch_id}:{index}] Calling fallback service...")
+            fallback_start = time.time()
             fallback_result = await call_fallback_service(
                 input_path,
                 url,
@@ -237,9 +239,12 @@ async def process_single_url_task(
                 max_confidence,
                 debug_level
             )
+            fallback_end = time.time()
+            fallback_duration = fallback_end - fallback_start
+            fallback_timing = {"duration": fallback_duration}
             
             if fallback_result:
-                print(f"[{batch_id}:{index}] Fallback complete")
+                print(f"[{batch_id}:{index}] Fallback complete ({fallback_duration:.2f}s)")
                 if need_fallback_bpm and fallback_result.get("bpm_normalized") is not None:
                     firestore_result["bpm_librosa"] = int(round(fallback_result["bpm_normalized"]))
                     firestore_result["bpm_raw_librosa"] = round(fallback_result["bpm_raw"], 2) if fallback_result.get("bpm_raw") else None
@@ -250,13 +255,13 @@ async def process_single_url_task(
                     firestore_result["scale_librosa"] = fallback_result["scale"]
                     firestore_result["keyscale_confidence_librosa"] = round(fallback_result["key_confidence"], 2) if fallback_result.get("key_confidence") else None
             else:
-                print(f"[{batch_id}:{index}] Fallback failed or skipped")
+                print(f"[{batch_id}:{index}] Fallback failed or skipped ({fallback_duration:.2f}s)")
         
         # Generate debug output
         debug_txt = generate_debug_output(
             debug_info_parts,
             timing,
-            None,
+            fallback_timing,
             debug_level
         )
         firestore_result["debug_txt"] = debug_txt if debug_txt else None
