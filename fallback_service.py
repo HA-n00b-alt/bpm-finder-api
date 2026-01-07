@@ -8,6 +8,7 @@ import os
 import tempfile
 import asyncio
 import time
+import warnings
 from concurrent.futures import ProcessPoolExecutor
 from typing import Optional, Tuple, List
 from fastapi import FastAPI, UploadFile, HTTPException, Request
@@ -155,8 +156,10 @@ def process_single_audio(
     
     Returns:
         dict with requested fields populated (to reduce pickling overhead)
+        OR dict with "error": True if processing failed
     """
     # Telemetry tracking
+    overall_start = time.time()
     telemetry = {
         "librosa_import_start": None,
         "librosa_import_end": None,
@@ -175,68 +178,266 @@ def process_single_audio(
         "key_duration": None,
         "total_duration": None
     }
-    overall_start = time.time()
     
-    # Lazy load heavy libraries - only import when actually needed (reduces cold start time)
-    telemetry["librosa_import_start"] = time.time()
-    import librosa
-    import numpy as np
-    telemetry["librosa_import_end"] = time.time()
-    telemetry["librosa_import_duration"] = telemetry["librosa_import_end"] - telemetry["librosa_import_start"]
-    
-    # Initialize response values
-    bpm_normalized = None
-    bpm_raw = None
-    confidence = None
-    key = None
-    scale = None
-    key_confidence = None
-    
-    # Load audio using librosa
-    # OPTIMIZATION: Limit duration to 60 seconds - enough for BPM/key detection, dramatically reduces load time
-    # For preview files, this is typically sufficient. For full tracks, we only need a sample.
     try:
+        # Outer try-except to catch any unexpected errors
+        # Suppress librosa warnings (PySoundFile fallback, deprecation warnings)
+        # These are harmless but noisy in logs
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, module="librosa")
+            warnings.filterwarnings("ignore", category=FutureWarning, module="librosa")
+            
+            # Lazy load heavy libraries - only import when actually needed (reduces cold start time)
+            telemetry["librosa_import_start"] = time.time()
+            import librosa
+            import numpy as np
+            telemetry["librosa_import_end"] = time.time()
+            telemetry["librosa_import_duration"] = telemetry["librosa_import_end"] - telemetry["librosa_import_start"]
+        
+        # Initialize response values
+        bpm_normalized = None
+        bpm_raw = None
+        confidence = None
+        key = None
+        scale = None
+        key_confidence = None
+        
+        # Load audio - use Essentia MonoLoader for fast MP3 decoding (C++), then pass to librosa
+        # OPTIMIZATION: Essentia's MonoLoader uses ffmpeg directly (C++), much faster than librosa's Python audioread wrapper
+        # We decode with Essentia, then pass the numpy array directly to librosa functions (no file I/O)
         telemetry["audio_load_start"] = time.time()
-        # Load only first 60 seconds - sufficient for accurate BPM/key detection
-        # This can reduce load time from 40s to ~5-10s for long files
-        audio, sr = librosa.load(audio_file_path, sr=44100, mono=True, duration=60.0)
+        
+        # Try to use Essentia MonoLoader for fast decoding (if available)
+        audio = None
+        sr = 44100
+        use_essentia = False
+        
+        try:
+            import essentia.standard as es
+            # Use Essentia MonoLoader - fast C++ implementation using ffmpeg directly
+            loader = es.MonoLoader(filename=audio_file_path, sampleRate=sr)
+            audio = loader()
+            use_essentia = True
+            print(f"[TELEMETRY] Audio decoded via Essentia MonoLoader: {len(audio)} samples", flush=True)
+        except ImportError:
+            # Essentia not available - fall back to librosa
+            print(f"[TELEMETRY] Essentia not available, using librosa", flush=True)
+        except Exception as e:
+            # Essentia failed - fall back to librosa
+            print(f"[WARNING] Essentia MonoLoader failed: {str(e)[:100]}, falling back to librosa", flush=True)
+        
+        # If Essentia didn't work, use librosa (with warning suppression)
+        if audio is None:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=UserWarning, module="librosa")
+                warnings.filterwarnings("ignore", category=FutureWarning, module="librosa")
+                # Load only first 60 seconds - sufficient for accurate BPM/key detection
+                audio, sr = librosa.load(audio_file_path, sr=sr, mono=True, duration=60.0)
+        
+        # Limit to 60 seconds if Essentia loaded full file (for consistency and performance)
+        max_samples = int(60.0 * sr)
+        if len(audio) > max_samples:
+            audio = audio[:max_samples]
+            print(f"[TELEMETRY] Audio trimmed to 60 seconds: {len(audio)} samples", flush=True)
+        
         telemetry["audio_load_end"] = time.time()
         telemetry["audio_load_duration"] = telemetry["audio_load_end"] - telemetry["audio_load_start"]
-        print(f"[TELEMETRY] Audio load: {telemetry['audio_load_duration']:.2f}s (limited to 60s)", flush=True)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Audio loading failed: {str(e)[:200]}"
-        )
+        load_method = "Essentia" if use_essentia else "librosa"
+        print(f"[TELEMETRY] Audio load ({load_method}): {telemetry['audio_load_duration']:.2f}s ({len(audio)/sr:.1f}s)", flush=True)
+        # Only perform HPSS if both BPM and key are needed (expensive operation)
+        # If only one is needed, use the original audio directly
+        if process_bpm and process_key:
+            # Both needed: perform HPSS once
+            # OPTIMIZATION: Use faster HPSS parameters
+            # - margin: Controls separation strength (default 1.0), lower = faster but less separation
+            # - kernel_size: Size of median filter (default 31), smaller = faster
+            try:
+                telemetry["hpss_start"] = time.time()
+                harmonic, percussive = librosa.effects.hpss(
+                    audio,
+                    margin=(1.0, 5.0),  # Default, but explicit
+                    kernel_size=31  # Default, but explicit
+                )
+                telemetry["hpss_end"] = time.time()
+                telemetry["hpss_duration"] = telemetry["hpss_end"] - telemetry["hpss_start"]
+                print(f"[TELEMETRY] HPSS: {telemetry['hpss_duration']:.2f}s", flush=True)
+            except Exception as e:
+                # CRITICAL: Cannot raise HTTPException here - it's not picklable and breaks ProcessPoolExecutor
+                # Return error dict instead, parent process will handle it
+                telemetry["total_duration"] = time.time() - overall_start
+                return {
+                    "error": True,
+                    "error_type": "hpss_failed",
+                    "error_message": f"HPSS processing failed: {str(e)[:200]}",
+                    "bpm_normalized": None,
+                    "bpm_raw": None,
+                    "confidence": None,
+                    "key": None,
+                    "scale": None,
+                    "key_confidence": None,
+                    "telemetry": telemetry,
+                }
+        elif process_bpm:
+            # Only BPM: use original audio (beat tracking works on full audio)
+            percussive = audio
+            harmonic = None
+        elif process_key:
+            # Only key: use original audio (chroma works on full audio)
+            harmonic = audio
+            percussive = None
+        else:
+            # Should not happen (validated at endpoint), but return empty dict
+            telemetry["total_duration"] = time.time() - overall_start
+            return {
+                "bpm_normalized": None,
+                "bpm_raw": None,
+                "confidence": None,
+                "key": None,
+                "scale": None,
+                "key_confidence": None,
+                "telemetry": telemetry,
+            }
+        
+        # BPM Extraction - only if requested
+        if process_bpm:
+            try:
+                telemetry["bpm_start"] = time.time()
+                # Use percussive component if HPSS was done, otherwise use original audio
+                bpm_audio = percussive if percussive is not None else audio
+                # OPTIMIZATION: Use faster parameters for beat tracking
+                # - units='time' is faster than default 'frames'
+                # - start_bpm and std_bpm can help if we have a rough estimate, but we don't
+                # - hop_length=512 is default, but we can use larger for speed (less accuracy)
+                # For now, keep default accuracy but optimize HPSS if both are needed
+                tempo, beats = librosa.beat.beat_track(
+                    y=bpm_audio,
+                    sr=sr,
+                    units='time',  # Return beats in time (seconds) - slightly faster
+                    hop_length=512  # Default, but explicit for clarity
+                )
+                bpm_raw = float(tempo)
+                bpm_normalized = normalize_bpm(bpm_raw)
+                telemetry["bpm_end"] = time.time()
+                telemetry["bpm_duration"] = telemetry["bpm_end"] - telemetry["bpm_start"]
+                print(f"[TELEMETRY] BPM processing: {telemetry['bpm_duration']:.2f}s", flush=True)
+                
+                # Calculate confidence based on beat tracking quality
+                # Use the consistency of detected beats as confidence indicator
+                if len(beats) > 0:
+                    # Calculate confidence from beat consistency
+                    beat_intervals = np.diff(beats)
+                    if len(beat_intervals) > 1:
+                        # Lower variance in beat intervals = higher confidence
+                        interval_std = np.std(beat_intervals)
+                        interval_mean = np.mean(beat_intervals)
+                        if interval_mean > 0:
+                            cv = interval_std / interval_mean  # Coefficient of variation
+                            # Calculate confidence from beat consistency
+                            # Lower coefficient of variation = more consistent beats = higher confidence
+                            # Formula: confidence = 1.0 - cv * 2
+                            # When cv = 0 (perfect consistency), confidence = 1.0
+                            # When cv = 0.5 (50% variation), confidence = 0.0
+                            confidence = max(0.0, min(1.0, 1.0 - cv * 2))
+                        else:
+                            confidence = 0.5
+                    else:
+                        confidence = 0.5
+                else:
+                    confidence = 0.0
+            except Exception as e:
+                # CRITICAL: Cannot raise HTTPException here - it's not picklable and breaks ProcessPoolExecutor
+                # Return error dict instead, parent process will handle it
+                telemetry["total_duration"] = time.time() - overall_start
+                return {
+                    "error": True,
+                    "error_type": "bpm_processing_failed",
+                    "error_message": f"BPM processing failed: {str(e)[:200]}",
+                    "bpm_normalized": None,
+                    "bpm_raw": None,
+                    "confidence": None,
+                    "key": key if key else None,
+                    "scale": scale if scale else None,
+                    "key_confidence": key_confidence if key_confidence else None,
+                    "telemetry": telemetry,
+                }
     
-    # Only perform HPSS if both BPM and key are needed (expensive operation)
-    # If only one is needed, use the original audio directly
-    if process_bpm and process_key:
-        # Both needed: perform HPSS once
-        # OPTIMIZATION: Use faster HPSS parameters
-        # - margin: Controls separation strength (default 1.0), lower = faster but less separation
-        # - kernel_size: Size of median filter (default 31), smaller = faster
-        telemetry["hpss_start"] = time.time()
-        harmonic, percussive = librosa.effects.hpss(
-            audio,
-            margin=(1.0, 5.0),  # Default, but explicit
-            kernel_size=31  # Default, but explicit
-        )
-        telemetry["hpss_end"] = time.time()
-        telemetry["hpss_duration"] = telemetry["hpss_end"] - telemetry["hpss_start"]
-        print(f"[TELEMETRY] HPSS: {telemetry['hpss_duration']:.2f}s", flush=True)
-    elif process_bpm:
-        # Only BPM: use original audio (beat tracking works on full audio)
-        percussive = audio
-        harmonic = None
-    elif process_key:
-        # Only key: use original audio (chroma works on full audio)
-        harmonic = audio
-        percussive = None
-    else:
-        # Should not happen (validated at endpoint), but return empty dict
+        # Key Extraction - only if requested
+        if process_key:
+            try:
+                telemetry["key_start"] = time.time()
+                # Use harmonic component if HPSS was done, otherwise use original audio
+                key_audio = harmonic if harmonic is not None else audio
+                # Use chroma_cqt for better stability (more robust to timbre variations)
+                # Optimized parameters for speed: larger hop_length (less time resolution needed for key),
+                # reduced n_octaves (key detection doesn't need full frequency range),
+                # fmin set to C2 (65.41 Hz) to avoid processing very low frequencies
+                chroma = librosa.feature.chroma_cqt(
+                    y=key_audio,
+                    sr=sr,
+                    hop_length=2048,      # Default: 512, 4x larger = ~4x faster, still sufficient for key detection
+                    fmin=65.41,            # C2 - reasonable lower bound for musical key detection
+                    n_octaves=5,           # Default: 6, reduced by 1 octave = faster, still covers full musical range
+                    bins_per_octave=12     # Default: 12, keep for accuracy
+                )
+                key, scale, key_confidence = extract_key_from_chroma(chroma)
+                telemetry["key_end"] = time.time()
+                telemetry["key_duration"] = telemetry["key_end"] - telemetry["key_start"]
+                print(f"[TELEMETRY] Key processing: {telemetry['key_duration']:.2f}s", flush=True)
+            except Exception as e:
+                # CRITICAL: Cannot raise HTTPException here - it's not picklable and breaks ProcessPoolExecutor
+                # Return error dict instead, parent process will handle it
+                telemetry["total_duration"] = time.time() - overall_start
+                return {
+                    "error": True,
+                    "error_type": "key_processing_failed",
+                    "error_message": f"Key processing failed: {str(e)[:200]}",
+                    "bpm_normalized": bpm_normalized,
+                    "bpm_raw": round(bpm_raw, 2) if bpm_raw is not None else None,
+                    "confidence": round(confidence, 2) if confidence is not None else None,
+                    "key": None,
+                    "scale": None,
+                    "key_confidence": None,
+                    "telemetry": telemetry,
+                }
+    
+        # Calculate total duration (after all processing)
         telemetry["total_duration"] = time.time() - overall_start
+        
+        # Log comprehensive telemetry
+        print(f"[TELEMETRY] Total processing time: {telemetry['total_duration']:.2f}s", flush=True)
+        print(f"[TELEMETRY] Breakdown:", flush=True)
+        if telemetry.get("librosa_import_duration"):
+            print(f"  - Librosa import: {telemetry['librosa_import_duration']:.2f}s ({telemetry['librosa_import_duration']/telemetry['total_duration']*100:.1f}%)", flush=True)
+        if telemetry.get("audio_load_duration"):
+            print(f"  - Audio load: {telemetry['audio_load_duration']:.2f}s ({telemetry['audio_load_duration']/telemetry['total_duration']*100:.1f}%)", flush=True)
+        if telemetry.get("hpss_duration"):
+            print(f"  - HPSS: {telemetry['hpss_duration']:.2f}s ({telemetry['hpss_duration']/telemetry['total_duration']*100:.1f}%)", flush=True)
+        if telemetry.get("bpm_duration"):
+            print(f"  - BPM processing: {telemetry['bpm_duration']:.2f}s ({telemetry['bpm_duration']/telemetry['total_duration']*100:.1f}%)", flush=True)
+        if telemetry.get("key_duration"):
+            print(f"  - Key processing: {telemetry['key_duration']:.2f}s ({telemetry['key_duration']/telemetry['total_duration']*100:.1f}%)", flush=True)
+    
+        # Return plain dict to reduce pickling overhead (Pydantic model built in parent process)
         return {
+            "bpm_normalized": bpm_normalized,
+            "bpm_raw": round(bpm_raw, 2) if bpm_raw is not None else None,
+            "confidence": round(confidence, 2) if confidence is not None else None,
+            "key": key,
+            "scale": scale,
+            "key_confidence": round(key_confidence, 2) if key_confidence is not None else None,
+            "telemetry": telemetry,
+        }
+    except Exception as e:
+        # Catch any unexpected errors anywhere in the function
+        # CRITICAL: Cannot raise HTTPException here - it's not picklable and breaks ProcessPoolExecutor
+        import traceback
+        error_details = f"{str(e)}\n{traceback.format_exc()}"
+        telemetry["total_duration"] = time.time() - overall_start
+        print(f"[ERROR] Unexpected error in process_single_audio: {error_details[:500]}", flush=True)
+        return {
+            "error": True,
+            "error_type": "unexpected_error",
+            "error_message": f"Unexpected error: {str(e)[:200]}",
             "bpm_normalized": None,
             "bpm_raw": None,
             "confidence": None,
@@ -245,116 +446,6 @@ def process_single_audio(
             "key_confidence": None,
             "telemetry": telemetry,
         }
-    
-    # BPM Extraction - only if requested
-    if process_bpm:
-        try:
-            telemetry["bpm_start"] = time.time()
-            # Use percussive component if HPSS was done, otherwise use original audio
-            bpm_audio = percussive if percussive is not None else audio
-            # OPTIMIZATION: Use faster parameters for beat tracking
-            # - units='time' is faster than default 'frames'
-            # - start_bpm and std_bpm can help if we have a rough estimate, but we don't
-            # - hop_length=512 is default, but we can use larger for speed (less accuracy)
-            # For now, keep default accuracy but optimize HPSS if both are needed
-            tempo, beats = librosa.beat.beat_track(
-                y=bpm_audio,
-                sr=sr,
-                units='time',  # Return beats in time (seconds) - slightly faster
-                hop_length=512  # Default, but explicit for clarity
-            )
-            bpm_raw = float(tempo)
-            bpm_normalized = normalize_bpm(bpm_raw)
-            telemetry["bpm_end"] = time.time()
-            telemetry["bpm_duration"] = telemetry["bpm_end"] - telemetry["bpm_start"]
-            print(f"[TELEMETRY] BPM processing: {telemetry['bpm_duration']:.2f}s", flush=True)
-            
-            # Calculate confidence based on beat tracking quality
-            # Use the consistency of detected beats as confidence indicator
-            if len(beats) > 0:
-                # Calculate confidence from beat consistency
-                beat_intervals = np.diff(beats)
-                if len(beat_intervals) > 1:
-                    # Lower variance in beat intervals = higher confidence
-                    interval_std = np.std(beat_intervals)
-                    interval_mean = np.mean(beat_intervals)
-                    if interval_mean > 0:
-                        cv = interval_std / interval_mean  # Coefficient of variation
-                        # Calculate confidence from beat consistency
-                        # Lower coefficient of variation = more consistent beats = higher confidence
-                        # Formula: confidence = 1.0 - cv * 2
-                        # When cv = 0 (perfect consistency), confidence = 1.0
-                        # When cv = 0.5 (50% variation), confidence = 0.0
-                        confidence = max(0.0, min(1.0, 1.0 - cv * 2))
-                    else:
-                        confidence = 0.5
-                else:
-                    confidence = 0.5
-            else:
-                confidence = 0.0
-        except Exception as e:
-            # If BPM processing fails and it was requested, raise error
-            raise HTTPException(
-                status_code=500,
-                detail=f"BPM processing failed: {str(e)[:200]}"
-            )
-    
-    # Key Extraction - only if requested
-    if process_key:
-        try:
-            telemetry["key_start"] = time.time()
-            # Use harmonic component if HPSS was done, otherwise use original audio
-            key_audio = harmonic if harmonic is not None else audio
-            # Use chroma_cqt for better stability (more robust to timbre variations)
-            # Optimized parameters for speed: larger hop_length (less time resolution needed for key),
-            # reduced n_octaves (key detection doesn't need full frequency range),
-            # fmin set to C2 (65.41 Hz) to avoid processing very low frequencies
-            chroma = librosa.feature.chroma_cqt(
-                y=key_audio,
-                sr=sr,
-                hop_length=2048,      # Default: 512, 4x larger = ~4x faster, still sufficient for key detection
-                fmin=65.41,            # C2 - reasonable lower bound for musical key detection
-                n_octaves=5,           # Default: 6, reduced by 1 octave = faster, still covers full musical range
-                bins_per_octave=12     # Default: 12, keep for accuracy
-            )
-            key, scale, key_confidence = extract_key_from_chroma(chroma)
-            telemetry["key_end"] = time.time()
-            telemetry["key_duration"] = telemetry["key_end"] - telemetry["key_start"]
-            print(f"[TELEMETRY] Key processing: {telemetry['key_duration']:.2f}s", flush=True)
-        except Exception as e:
-            # If key processing fails and it was requested, raise error
-            raise HTTPException(
-                status_code=500,
-                detail=f"Key processing failed: {str(e)[:200]}"
-            )
-    
-    # Calculate total duration
-    telemetry["total_duration"] = time.time() - overall_start
-    
-    # Log comprehensive telemetry
-    print(f"[TELEMETRY] Total processing time: {telemetry['total_duration']:.2f}s", flush=True)
-    print(f"[TELEMETRY] Breakdown:", flush=True)
-    if telemetry.get("librosa_import_duration"):
-        print(f"  - Librosa import: {telemetry['librosa_import_duration']:.2f}s ({telemetry['librosa_import_duration']/telemetry['total_duration']*100:.1f}%)", flush=True)
-    if telemetry.get("audio_load_duration"):
-        print(f"  - Audio load: {telemetry['audio_load_duration']:.2f}s ({telemetry['audio_load_duration']/telemetry['total_duration']*100:.1f}%)", flush=True)
-    if telemetry.get("hpss_duration"):
-        print(f"  - HPSS: {telemetry['hpss_duration']:.2f}s ({telemetry['hpss_duration']/telemetry['total_duration']*100:.1f}%)", flush=True)
-    if telemetry.get("bpm_duration"):
-        print(f"  - BPM processing: {telemetry['bpm_duration']:.2f}s ({telemetry['bpm_duration']/telemetry['total_duration']*100:.1f}%)", flush=True)
-    if telemetry.get("key_duration"):
-        print(f"  - Key processing: {telemetry['key_duration']:.2f}s ({telemetry['key_duration']/telemetry['total_duration']*100:.1f}%)", flush=True)
-    
-    # Return plain dict to reduce pickling overhead (Pydantic model built in parent process)
-    return {
-        "bpm_normalized": bpm_normalized,
-        "bpm_raw": round(bpm_raw, 2) if bpm_raw is not None else None,
-        "confidence": round(confidence, 2) if confidence is not None else None,
-        "key": key,
-        "scale": scale,
-        "key_confidence": round(key_confidence, 2) if key_confidence is not None else None,
-        "telemetry": telemetry,
-    }
 
 
 @app.get("/health")
@@ -404,6 +495,13 @@ async def process_batch(
                 print(f"DEBUG: Form key: {key}, type: {type(value)}")
         
         print(f"DEBUG: Total audio_files extracted: {len(audio_files)}")
+        
+        # Validate that we have at least one audio file
+        if not audio_files:
+            raise HTTPException(
+                status_code=400,
+                detail="No audio files provided in request"
+            )
         
         # Extract processing flags
         process_flags = {}
@@ -503,26 +601,26 @@ async def process_batch(
         process_pool = get_process_pool()
         loop = asyncio.get_event_loop()
         
-        # Create tasks for concurrent processing
-        futures = []
-        task_indices = []  # Track original index for each task
+        # Initialize results array with empty FallbackResponse objects upfront
+        # This ensures every index has a valid response, even if processing fails
+        results = [FallbackResponse() for _ in range(len(audio_files))]
+        
+        # Use dict to track processing tasks - maintains explicit index-to-future mapping
+        # This prevents index misalignment that can occur with separate lists
+        processing_tasks = {}
+        
         for idx, item in enumerate(streamed_files):
             if isinstance(item, Exception):
-                # Streaming failed - return empty response
-                future = asyncio.Future()
-                future.set_result({"error": True})
-                futures.append(future)
-                task_indices.append(idx)
+                # Streaming failed - keep empty response (already initialized)
+                print(f"[ERROR] Streaming failed for index {idx}: {str(item)[:200]}", flush=True)
                 continue
                 
             if isinstance(item, tuple):
                 i, temp_path, process_bpm, process_key = item
                 if temp_path is None:
-                    # Empty response - create a completed future
-                    future = asyncio.Future()
-                    future.set_result({"error": True})
-                    futures.append(future)
-                    task_indices.append(i)
+                    # Skipped item (no processing requested) - keep empty response
+                    # Use "SKIP" marker to distinguish from errors
+                    continue
                 else:
                     # Track temp file for cleanup
                     temp_files[i] = temp_path
@@ -534,26 +632,54 @@ async def process_batch(
                         process_bpm,
                         process_key
                     )
-                    futures.append(future)
-                    task_indices.append(i)
+                    # Map index to future explicitly
+                    processing_tasks[i] = future
         
         # Wait for all tasks to complete concurrently, handling errors per item
-        results = [None] * len(audio_files)
-        completed = await asyncio.gather(*futures, return_exceptions=True)
-        
-        # Process results in order, handling exceptions and converting dicts to Pydantic models
-        for idx, result in zip(task_indices, completed):
-            if isinstance(result, HTTPException):
-                # Re-raise HTTP exceptions (these are expected errors)
-                raise result
-            elif isinstance(result, Exception) or (isinstance(result, dict) and result.get("error")):
-                # Per-item error handling: return empty response for failed items
-                results[idx] = FallbackResponse()
-            elif isinstance(result, dict):
-                # Convert dict to Pydantic model (built in parent process to reduce pickling)
-                results[idx] = FallbackResponse(**result)
-            else:
-                results[idx] = result
+        if processing_tasks:
+            # Create list of futures and track their indices
+            task_indices = list(processing_tasks.keys())
+            task_futures = [processing_tasks[idx] for idx in task_indices]
+            completed = await asyncio.gather(*task_futures, return_exceptions=True)
+            
+            # Process results in order, handling exceptions and converting dicts to Pydantic models
+            for idx, result in zip(task_indices, completed):
+                if isinstance(result, Exception):
+                    # Exception from process pool - log and keep empty response
+                    import traceback
+                    error_details = f"Process pool error: {str(result)}\n{traceback.format_exc()}"
+                    print(f"[ERROR] Process pool exception for index {idx}: {error_details[:500]}", flush=True)
+                    # Keep empty response (already initialized)
+                elif result is None:
+                    # process_single_audio unexpectedly returned None - log and keep empty response
+                    print(f"[ERROR] process_single_audio returned None for index {idx}", flush=True)
+                    # Keep empty response (already initialized)
+                elif isinstance(result, dict) and result.get("error"):
+                    # Error dict returned from process_single_audio (e.g., audio load failed, BPM/key processing failed)
+                    error_type = result.get("error_type", "unknown_error")
+                    error_message = result.get("error_message", "Unknown error")
+                    print(f"[ERROR] Processing error for index {idx} ({error_type}): {error_message}", flush=True)
+                    # Keep empty response (already initialized)
+                elif isinstance(result, dict):
+                    # Success - convert dict to Pydantic model (built in parent process to reduce pickling)
+                    # Only include fields that are in the FallbackResponse model
+                    valid_fields = {
+                        "bpm_normalized", "bpm_raw", "confidence", 
+                        "key", "scale", "key_confidence"
+                    }
+                    result_clean = {k: v for k, v in result.items() if k in valid_fields}
+                    try:
+                        results[idx] = FallbackResponse(**result_clean)
+                    except Exception as e:
+                        # If validation fails, log and keep empty response
+                        print(f"[ERROR] Failed to create FallbackResponse for index {idx}: {str(e)}", flush=True)
+                        print(f"[ERROR] Result dict keys: {list(result.keys())}", flush=True)
+                        print(f"[ERROR] Filtered keys: {list(result_clean.keys())}", flush=True)
+                        # Keep empty response (already initialized)
+                else:
+                    # Unexpected result type - log and keep empty response
+                    print(f"[ERROR] Unexpected result type for index {idx}: {type(result)}", flush=True)
+                    # Keep empty response (already initialized)
         
     except Exception as e:
         # Log the full error for debugging

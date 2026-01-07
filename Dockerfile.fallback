@@ -1,15 +1,18 @@
-# Use Python base image for librosa
-FROM python:3.11-slim
+# Use MTG Essentia base image - provides Essentia for fast MP3 decoding
+# Essentia's MonoLoader (C++) is much faster than librosa's Python audioread wrapper
+# We use Essentia to decode MP3, then pass numpy array directly to librosa for processing
+FROM ghcr.io/mtg/essentia:latest
 
 # Install system dependencies for librosa
-# - libsndfile1: for WAV file reading
+# - libsndfile1: for WAV file reading (soundfile backend)
 # - libgomp1: GNU OpenMP runtime library required by Numba (librosa dependency)
-# - ffmpeg: for MP3/AAC decoding from memory (BytesIO) - librosa needs it for compressed formats
+# - ffmpeg: already in Essentia image, but ensure it's available
+# - python3-pip: ensure pip is available
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     libsndfile1 \
     libgomp1 \
-    ffmpeg \
+    python3-pip \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
