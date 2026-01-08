@@ -133,6 +133,7 @@ LAST_WARNING_TIME=0
 # Use a temporary file to track result count across subshells
 RESULT_FILE=$(mktemp)
 echo "0" > "$RESULT_FILE"
+STATUS_DIR=$(mktemp -d)
 
 curl -s -N --max-time 300 -X GET "${SERVICE_URL}/stream/${BATCH_ID}" \
     -H "Authorization: Bearer $TOKEN" 2>&1 | while IFS= read -r line; do
@@ -152,13 +153,28 @@ curl -s -N --max-time 300 -X GET "${SERVICE_URL}/stream/${BATCH_ID}" \
             echo "[${ELAPSED}s] 📊 $STATUS"
             ;;
         "result")
-            CURRENT_COUNT=$(cat "$RESULT_FILE" 2>/dev/null || echo "0")
-            NEW_COUNT=$((CURRENT_COUNT + 1))
-            echo "$NEW_COUNT" > "$RESULT_FILE"
             INDEX=$(echo "$line" | python3 -c "import sys, json; print(json.load(sys.stdin).get('index', '?'))" 2>/dev/null)
+            STATUS_FIELD=$(echo "$line" | python3 -c "import sys, json; print(json.load(sys.stdin).get('status', 'final'))" 2>/dev/null)
+            STATUS_FILE="${STATUS_DIR}/${INDEX}"
+            if [ "$STATUS_FIELD" = "final" ]; then
+                PREV_STATUS=$(cat "$STATUS_FILE" 2>/dev/null || echo "")
+                if [ "$PREV_STATUS" != "final" ]; then
+                    CURRENT_COUNT=$(cat "$RESULT_FILE" 2>/dev/null || echo "0")
+                    NEW_COUNT=$((CURRENT_COUNT + 1))
+                    echo "$NEW_COUNT" > "$RESULT_FILE"
+                fi
+            fi
+            echo "$STATUS_FIELD" > "$STATUS_FILE"
             BPM=$(echo "$line" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('bpm_essentia') or d.get('bpm_librosa') or 'N/A')" 2>/dev/null)
             KEY=$(echo "$line" | python3 -c "import sys, json; d=json.load(sys.stdin); k=d.get('key_essentia') or d.get('key_librosa') or 'N/A'; s=d.get('scale_essentia') or d.get('scale_librosa') or ''; print(f\"{k} {s}\".strip())" 2>/dev/null)
-            echo "[${ELAPSED}s] ✅ Result #${INDEX}: BPM=${BPM}, Key=${KEY}"
+            if [ "$STATUS_FIELD" = "partial" ]; then
+                ICON="⏳"
+                LABEL="Partial"
+            else
+                ICON="✅"
+                LABEL="Final"
+            fi
+            echo "[${ELAPSED}s] ${ICON} ${LABEL} #${INDEX}: BPM=${BPM}, Key=${KEY}"
             ;;
         "progress")
             PROGRESS=$(echo "$line" | python3 -c "import sys, json; d=json.load(sys.stdin); print(f\"Progress: {d.get('processed')}/{d.get('total')}\")" 2>/dev/null)
@@ -169,6 +185,7 @@ curl -s -N --max-time 300 -X GET "${SERVICE_URL}/stream/${BATCH_ID}" \
             TOTAL_ELAPSED=$((CURRENT_TIME - START_TIME))
             echo "[${ELAPSED}s] 🎉 Batch complete! Total results: $TOTAL (Total time: ${TOTAL_ELAPSED}s)"
             rm -f "$RESULT_FILE"
+            rm -rf "$STATUS_DIR"
             exit 0
             ;;
         "error")
@@ -205,6 +222,7 @@ done
 CURRENT_TIME=$(date +%s)
 STREAM_ELAPSED=$((CURRENT_TIME - STREAM_START_TIME))
 rm -f "$RESULT_FILE"
+rm -rf "$STATUS_DIR"
 
 if [ $STREAM_ELAPSED -ge 300 ]; then
     echo ""

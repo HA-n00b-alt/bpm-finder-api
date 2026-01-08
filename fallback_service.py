@@ -9,6 +9,8 @@ import tempfile
 import asyncio
 import time
 import warnings
+import multiprocessing as mp
+import resource
 from concurrent.futures import ProcessPoolExecutor
 from typing import Optional, Tuple, List
 from fastapi import FastAPI, UploadFile, HTTPException, Request
@@ -17,6 +19,8 @@ from pydantic import BaseModel
 import aiofiles
 
 app = FastAPI(title="BPM Fallback Service")
+PROCESS_START = time.time()
+_first_request = True
 
 # ProcessPoolExecutor for CPU-bound work (bypasses GIL)
 # Use env var or default to CPU count (clamped to >=1)
@@ -27,8 +31,27 @@ def get_process_pool():
     global _process_pool
     if _process_pool is None:
         max_workers = int(os.getenv("PROCESS_POOL_WORKERS", max(1, os.cpu_count() or 1)))
-        _process_pool = ProcessPoolExecutor(max_workers=max_workers)
+        # Use spawn to avoid fork-related crashes with native libs (librosa/essentia/numba).
+        ctx = mp.get_context("spawn")
+        _process_pool = ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx)
     return _process_pool
+
+
+def log_telemetry(message: str) -> None:
+    print(f"[TELEMETRY] {message}", flush=True)
+
+
+def get_rss_kb() -> Optional[int]:
+    try:
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except Exception:
+        return None
+
+
+@app.on_event("startup")
+async def startup_event():
+    startup_s = time.time() - PROCESS_START
+    log_telemetry(f"fallback_startup_s={startup_s:.2f}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -142,6 +165,235 @@ def extract_key_from_chroma(chroma) -> Tuple[str, str, float]:
     return best_key, best_scale, confidence
 
 
+def process_audio_array(
+    audio,
+    sr: int,
+    process_bpm: bool,
+    process_key: bool,
+    telemetry: dict,
+    overall_start: float
+) -> dict:
+    """Process a pre-loaded audio array."""
+    try:
+        # Suppress librosa warnings (PySoundFile fallback, deprecation warnings)
+        # These are harmless but noisy in logs
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, module="librosa")
+            warnings.filterwarnings("ignore", category=FutureWarning, module="librosa")
+            
+            # Lazy load heavy libraries - only import when actually needed (reduces cold start time)
+            telemetry["librosa_import_start"] = time.time()
+            import librosa
+            import numpy as np
+            telemetry["librosa_import_end"] = time.time()
+            telemetry["librosa_import_duration"] = telemetry["librosa_import_end"] - telemetry["librosa_import_start"]
+        
+        # Initialize response values
+        bpm_normalized = None
+        bpm_raw = None
+        confidence = None
+        key = None
+        scale = None
+        key_confidence = None
+        
+        # Ensure audio is a 1D float32 array
+        audio = np.asarray(audio, dtype=np.float32)
+        if audio.ndim > 1:
+            audio = np.mean(audio, axis=0)
+
+        # Downsample for faster processing (prefer cheap decimation when possible)
+        target_sr = int(os.getenv("FALLBACK_TARGET_SR", "22050"))
+        if sr > target_sr:
+            if sr % target_sr == 0:
+                factor = sr // target_sr
+                audio = audio[::factor]
+                sr = target_sr
+                log_telemetry(f"fallback_downsample method=decimate factor={factor} sr={sr}")
+            else:
+                resample_start = time.time()
+                audio = librosa.resample(audio, orig_sr=sr, target_sr=target_sr)
+                sr = target_sr
+                resample_s = time.time() - resample_start
+                log_telemetry(f"fallback_downsample method=resample sr={sr} s={resample_s:.2f}")
+        
+        # Limit to reduce compute time
+        max_seconds = float(os.getenv("FALLBACK_MAX_SECONDS", "30"))
+        max_samples = int(max_seconds * sr)
+        if len(audio) > max_samples:
+            audio = audio[:max_samples]
+            print(f"[TELEMETRY] Audio trimmed to {max_seconds:.1f}s: {len(audio)} samples", flush=True)
+        
+        # Only perform HPSS if both BPM and key are needed (expensive operation)
+        if process_bpm and process_key:
+            try:
+                telemetry["hpss_start"] = time.time()
+                harmonic, percussive = librosa.effects.hpss(
+                    audio,
+                    margin=(1.0, 5.0),
+                    kernel_size=31
+                )
+                telemetry["hpss_end"] = time.time()
+                telemetry["hpss_duration"] = telemetry["hpss_end"] - telemetry["hpss_start"]
+                print(f"[TELEMETRY] HPSS: {telemetry['hpss_duration']:.2f}s", flush=True)
+            except Exception as e:
+                telemetry["total_duration"] = time.time() - overall_start
+                return {
+                    "error": True,
+                    "error_type": "hpss_failed",
+                    "error_message": f"HPSS processing failed: {str(e)[:200]}",
+                    "bpm_normalized": None,
+                    "bpm_raw": None,
+                    "confidence": None,
+                    "key": None,
+                    "scale": None,
+                    "key_confidence": None,
+                    "telemetry": telemetry,
+                }
+        elif process_bpm:
+            percussive = audio
+            harmonic = None
+        elif process_key:
+            harmonic = audio
+            percussive = None
+        else:
+            telemetry["total_duration"] = time.time() - overall_start
+            return {
+                "bpm_normalized": None,
+                "bpm_raw": None,
+                "confidence": None,
+                "key": None,
+                "scale": None,
+                "key_confidence": None,
+                "telemetry": telemetry,
+            }
+        
+        if process_bpm:
+            try:
+                telemetry["bpm_start"] = time.time()
+                bpm_audio = percussive if percussive is not None else audio
+                hop_length = int(os.getenv("FALLBACK_BPM_HOP_LENGTH", "1024"))
+                tempo, beats = librosa.beat.beat_track(
+                    y=bpm_audio,
+                    sr=sr,
+                    units='time',
+                    hop_length=hop_length
+                )
+                bpm_raw = float(tempo)
+                bpm_normalized = normalize_bpm(bpm_raw)
+                telemetry["bpm_end"] = time.time()
+                telemetry["bpm_duration"] = telemetry["bpm_end"] - telemetry["bpm_start"]
+                print(f"[TELEMETRY] BPM processing: {telemetry['bpm_duration']:.2f}s", flush=True)
+                
+                if len(beats) > 0:
+                    beat_intervals = np.diff(beats)
+                    if len(beat_intervals) > 1:
+                        interval_std = np.std(beat_intervals)
+                        interval_mean = np.mean(beat_intervals)
+                        if interval_mean > 0:
+                            cv = interval_std / interval_mean
+                            confidence = max(0.0, min(1.0, 1.0 - cv * 2))
+                        else:
+                            confidence = 0.5
+                    else:
+                        confidence = 0.5
+                else:
+                    confidence = 0.0
+            except Exception as e:
+                telemetry["total_duration"] = time.time() - overall_start
+                return {
+                    "error": True,
+                    "error_type": "bpm_processing_failed",
+                    "error_message": f"BPM processing failed: {str(e)[:200]}",
+                    "bpm_normalized": None,
+                    "bpm_raw": None,
+                    "confidence": None,
+                    "key": key if key else None,
+                    "scale": scale if scale else None,
+                    "key_confidence": key_confidence if key_confidence else None,
+                    "telemetry": telemetry,
+                }
+        
+        if process_key:
+            try:
+                telemetry["key_start"] = time.time()
+                key_audio = harmonic if harmonic is not None else audio
+                chroma = librosa.feature.chroma_cqt(
+                    y=key_audio,
+                    sr=sr,
+                    hop_length=2048,
+                    fmin=65.41,
+                    n_octaves=5,
+                    bins_per_octave=12
+                )
+                key, scale, key_confidence = extract_key_from_chroma(chroma)
+                telemetry["key_end"] = time.time()
+                telemetry["key_duration"] = telemetry["key_end"] - telemetry["key_start"]
+                print(f"[TELEMETRY] Key processing: {telemetry['key_duration']:.2f}s", flush=True)
+            except Exception as e:
+                telemetry["total_duration"] = time.time() - overall_start
+                return {
+                    "error": True,
+                    "error_type": "key_processing_failed",
+                    "error_message": f"Key processing failed: {str(e)[:200]}",
+                    "bpm_normalized": bpm_normalized,
+                    "bpm_raw": round(bpm_raw, 2) if bpm_raw is not None else None,
+                    "confidence": round(confidence, 2) if confidence is not None else None,
+                    "key": None,
+                    "scale": None,
+                    "key_confidence": None,
+                    "telemetry": telemetry,
+                }
+        
+        telemetry["total_duration"] = time.time() - overall_start
+        
+        print(f"[TELEMETRY] Total processing time: {telemetry['total_duration']:.2f}s", flush=True)
+        print(f"[TELEMETRY] Breakdown:", flush=True)
+        if telemetry.get("librosa_import_duration"):
+            print(f"  - Librosa import: {telemetry['librosa_import_duration']:.2f}s ({telemetry['librosa_import_duration']/telemetry['total_duration']*100:.1f}%)", flush=True)
+        if telemetry.get("audio_load_duration"):
+            print(f"  - Audio load: {telemetry['audio_load_duration']:.2f}s ({telemetry['audio_load_duration']/telemetry['total_duration']*100:.1f}%)", flush=True)
+        if telemetry.get("hpss_duration"):
+            print(f"  - HPSS: {telemetry['hpss_duration']:.2f}s ({telemetry['hpss_duration']/telemetry['total_duration']*100:.1f}%)", flush=True)
+        if telemetry.get("bpm_duration"):
+            print(f"  - BPM processing: {telemetry['bpm_duration']:.2f}s ({telemetry['bpm_duration']/telemetry['total_duration']*100:.1f}%)", flush=True)
+        if telemetry.get("key_duration"):
+            print(f"  - Key processing: {telemetry['key_duration']:.2f}s ({telemetry['key_duration']/telemetry['total_duration']*100:.1f}%)", flush=True)
+        log_telemetry(
+            f"fallback_processing payload={telemetry.get('payload_type', 'unknown')} "
+            f"audio_load_s={telemetry.get('audio_load_duration')} "
+            f"bpm_s={telemetry.get('bpm_duration')} "
+            f"key_s={telemetry.get('key_duration')} "
+            f"total_s={telemetry.get('total_duration')}"
+        )
+        
+        return {
+            "bpm_normalized": bpm_normalized,
+            "bpm_raw": round(bpm_raw, 2) if bpm_raw is not None else None,
+            "confidence": round(confidence, 2) if confidence is not None else None,
+            "key": key,
+            "scale": scale,
+            "key_confidence": round(key_confidence, 2) if key_confidence is not None else None,
+            "telemetry": telemetry,
+        }
+    except Exception as e:
+        import traceback
+        error_details = f"{str(e)}\n{traceback.format_exc()}"
+        telemetry["total_duration"] = time.time() - overall_start
+        print(f"[ERROR] Unexpected error in process_audio_array: {error_details[:500]}", flush=True)
+        return {
+            "error": True,
+            "error_type": "unexpected_error",
+            "error_message": f"Unexpected error: {str(e)[:200]}",
+            "bpm_normalized": None,
+            "bpm_raw": None,
+            "confidence": None,
+            "key": None,
+            "scale": None,
+            "key_confidence": None,
+            "telemetry": telemetry,
+        }
+
+
 def process_single_audio(
     audio_file_path: str,
     process_bpm: bool,
@@ -176,35 +428,12 @@ def process_single_audio(
         "key_start": None,
         "key_end": None,
         "key_duration": None,
-        "total_duration": None
+        "total_duration": None,
+        "payload_type": "file"
     }
     
     try:
-        # Outer try-except to catch any unexpected errors
-        # Suppress librosa warnings (PySoundFile fallback, deprecation warnings)
-        # These are harmless but noisy in logs
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=UserWarning, module="librosa")
-            warnings.filterwarnings("ignore", category=FutureWarning, module="librosa")
-            
-            # Lazy load heavy libraries - only import when actually needed (reduces cold start time)
-            telemetry["librosa_import_start"] = time.time()
-            import librosa
-            import numpy as np
-            telemetry["librosa_import_end"] = time.time()
-            telemetry["librosa_import_duration"] = telemetry["librosa_import_end"] - telemetry["librosa_import_start"]
-        
-        # Initialize response values
-        bpm_normalized = None
-        bpm_raw = None
-        confidence = None
-        key = None
-        scale = None
-        key_confidence = None
-        
-        # Load audio - use Essentia MonoLoader for fast MP3 decoding (C++), then pass to librosa
-        # OPTIMIZATION: Essentia's MonoLoader uses ffmpeg directly (C++), much faster than librosa's Python audioread wrapper
-        # We decode with Essentia, then pass the numpy array directly to librosa functions (no file I/O)
+        # Load audio - use Essentia MonoLoader for fast decoding (C++), then pass to librosa
         telemetry["audio_load_start"] = time.time()
         
         # Try to use Essentia MonoLoader for fast decoding (if available)
@@ -232,201 +461,14 @@ def process_single_audio(
                 warnings.filterwarnings("ignore", category=UserWarning, module="librosa")
                 warnings.filterwarnings("ignore", category=FutureWarning, module="librosa")
                 # Load only first 60 seconds - sufficient for accurate BPM/key detection
+                import librosa
                 audio, sr = librosa.load(audio_file_path, sr=sr, mono=True, duration=60.0)
-        
-        # Limit to 60 seconds if Essentia loaded full file (for consistency and performance)
-        max_samples = int(60.0 * sr)
-        if len(audio) > max_samples:
-            audio = audio[:max_samples]
-            print(f"[TELEMETRY] Audio trimmed to 60 seconds: {len(audio)} samples", flush=True)
         
         telemetry["audio_load_end"] = time.time()
         telemetry["audio_load_duration"] = telemetry["audio_load_end"] - telemetry["audio_load_start"]
         load_method = "Essentia" if use_essentia else "librosa"
         print(f"[TELEMETRY] Audio load ({load_method}): {telemetry['audio_load_duration']:.2f}s ({len(audio)/sr:.1f}s)", flush=True)
-        # Only perform HPSS if both BPM and key are needed (expensive operation)
-        # If only one is needed, use the original audio directly
-        if process_bpm and process_key:
-            # Both needed: perform HPSS once
-            # OPTIMIZATION: Use faster HPSS parameters
-            # - margin: Controls separation strength (default 1.0), lower = faster but less separation
-            # - kernel_size: Size of median filter (default 31), smaller = faster
-            try:
-                telemetry["hpss_start"] = time.time()
-                harmonic, percussive = librosa.effects.hpss(
-                    audio,
-                    margin=(1.0, 5.0),  # Default, but explicit
-                    kernel_size=31  # Default, but explicit
-                )
-                telemetry["hpss_end"] = time.time()
-                telemetry["hpss_duration"] = telemetry["hpss_end"] - telemetry["hpss_start"]
-                print(f"[TELEMETRY] HPSS: {telemetry['hpss_duration']:.2f}s", flush=True)
-            except Exception as e:
-                # CRITICAL: Cannot raise HTTPException here - it's not picklable and breaks ProcessPoolExecutor
-                # Return error dict instead, parent process will handle it
-                telemetry["total_duration"] = time.time() - overall_start
-                return {
-                    "error": True,
-                    "error_type": "hpss_failed",
-                    "error_message": f"HPSS processing failed: {str(e)[:200]}",
-                    "bpm_normalized": None,
-                    "bpm_raw": None,
-                    "confidence": None,
-                    "key": None,
-                    "scale": None,
-                    "key_confidence": None,
-                    "telemetry": telemetry,
-                }
-        elif process_bpm:
-            # Only BPM: use original audio (beat tracking works on full audio)
-            percussive = audio
-            harmonic = None
-        elif process_key:
-            # Only key: use original audio (chroma works on full audio)
-            harmonic = audio
-            percussive = None
-        else:
-            # Should not happen (validated at endpoint), but return empty dict
-            telemetry["total_duration"] = time.time() - overall_start
-            return {
-                "bpm_normalized": None,
-                "bpm_raw": None,
-                "confidence": None,
-                "key": None,
-                "scale": None,
-                "key_confidence": None,
-                "telemetry": telemetry,
-            }
-        
-        # BPM Extraction - only if requested
-        if process_bpm:
-            try:
-                telemetry["bpm_start"] = time.time()
-                # Use percussive component if HPSS was done, otherwise use original audio
-                bpm_audio = percussive if percussive is not None else audio
-                # OPTIMIZATION: Use faster parameters for beat tracking
-                # - units='time' is faster than default 'frames'
-                # - start_bpm and std_bpm can help if we have a rough estimate, but we don't
-                # - hop_length=512 is default, but we can use larger for speed (less accuracy)
-                # For now, keep default accuracy but optimize HPSS if both are needed
-                tempo, beats = librosa.beat.beat_track(
-                    y=bpm_audio,
-                    sr=sr,
-                    units='time',  # Return beats in time (seconds) - slightly faster
-                    hop_length=512  # Default, but explicit for clarity
-                )
-                bpm_raw = float(tempo)
-                bpm_normalized = normalize_bpm(bpm_raw)
-                telemetry["bpm_end"] = time.time()
-                telemetry["bpm_duration"] = telemetry["bpm_end"] - telemetry["bpm_start"]
-                print(f"[TELEMETRY] BPM processing: {telemetry['bpm_duration']:.2f}s", flush=True)
-                
-                # Calculate confidence based on beat tracking quality
-                # Use the consistency of detected beats as confidence indicator
-                if len(beats) > 0:
-                    # Calculate confidence from beat consistency
-                    beat_intervals = np.diff(beats)
-                    if len(beat_intervals) > 1:
-                        # Lower variance in beat intervals = higher confidence
-                        interval_std = np.std(beat_intervals)
-                        interval_mean = np.mean(beat_intervals)
-                        if interval_mean > 0:
-                            cv = interval_std / interval_mean  # Coefficient of variation
-                            # Calculate confidence from beat consistency
-                            # Lower coefficient of variation = more consistent beats = higher confidence
-                            # Formula: confidence = 1.0 - cv * 2
-                            # When cv = 0 (perfect consistency), confidence = 1.0
-                            # When cv = 0.5 (50% variation), confidence = 0.0
-                            confidence = max(0.0, min(1.0, 1.0 - cv * 2))
-                        else:
-                            confidence = 0.5
-                    else:
-                        confidence = 0.5
-                else:
-                    confidence = 0.0
-            except Exception as e:
-                # CRITICAL: Cannot raise HTTPException here - it's not picklable and breaks ProcessPoolExecutor
-                # Return error dict instead, parent process will handle it
-                telemetry["total_duration"] = time.time() - overall_start
-                return {
-                    "error": True,
-                    "error_type": "bpm_processing_failed",
-                    "error_message": f"BPM processing failed: {str(e)[:200]}",
-                    "bpm_normalized": None,
-                    "bpm_raw": None,
-                    "confidence": None,
-                    "key": key if key else None,
-                    "scale": scale if scale else None,
-                    "key_confidence": key_confidence if key_confidence else None,
-                    "telemetry": telemetry,
-                }
-    
-        # Key Extraction - only if requested
-        if process_key:
-            try:
-                telemetry["key_start"] = time.time()
-                # Use harmonic component if HPSS was done, otherwise use original audio
-                key_audio = harmonic if harmonic is not None else audio
-                # Use chroma_cqt for better stability (more robust to timbre variations)
-                # Optimized parameters for speed: larger hop_length (less time resolution needed for key),
-                # reduced n_octaves (key detection doesn't need full frequency range),
-                # fmin set to C2 (65.41 Hz) to avoid processing very low frequencies
-                chroma = librosa.feature.chroma_cqt(
-                    y=key_audio,
-                    sr=sr,
-                    hop_length=2048,      # Default: 512, 4x larger = ~4x faster, still sufficient for key detection
-                    fmin=65.41,            # C2 - reasonable lower bound for musical key detection
-                    n_octaves=5,           # Default: 6, reduced by 1 octave = faster, still covers full musical range
-                    bins_per_octave=12     # Default: 12, keep for accuracy
-                )
-                key, scale, key_confidence = extract_key_from_chroma(chroma)
-                telemetry["key_end"] = time.time()
-                telemetry["key_duration"] = telemetry["key_end"] - telemetry["key_start"]
-                print(f"[TELEMETRY] Key processing: {telemetry['key_duration']:.2f}s", flush=True)
-            except Exception as e:
-                # CRITICAL: Cannot raise HTTPException here - it's not picklable and breaks ProcessPoolExecutor
-                # Return error dict instead, parent process will handle it
-                telemetry["total_duration"] = time.time() - overall_start
-                return {
-                    "error": True,
-                    "error_type": "key_processing_failed",
-                    "error_message": f"Key processing failed: {str(e)[:200]}",
-                    "bpm_normalized": bpm_normalized,
-                    "bpm_raw": round(bpm_raw, 2) if bpm_raw is not None else None,
-                    "confidence": round(confidence, 2) if confidence is not None else None,
-                    "key": None,
-                    "scale": None,
-                    "key_confidence": None,
-                    "telemetry": telemetry,
-                }
-    
-        # Calculate total duration (after all processing)
-        telemetry["total_duration"] = time.time() - overall_start
-        
-        # Log comprehensive telemetry
-        print(f"[TELEMETRY] Total processing time: {telemetry['total_duration']:.2f}s", flush=True)
-        print(f"[TELEMETRY] Breakdown:", flush=True)
-        if telemetry.get("librosa_import_duration"):
-            print(f"  - Librosa import: {telemetry['librosa_import_duration']:.2f}s ({telemetry['librosa_import_duration']/telemetry['total_duration']*100:.1f}%)", flush=True)
-        if telemetry.get("audio_load_duration"):
-            print(f"  - Audio load: {telemetry['audio_load_duration']:.2f}s ({telemetry['audio_load_duration']/telemetry['total_duration']*100:.1f}%)", flush=True)
-        if telemetry.get("hpss_duration"):
-            print(f"  - HPSS: {telemetry['hpss_duration']:.2f}s ({telemetry['hpss_duration']/telemetry['total_duration']*100:.1f}%)", flush=True)
-        if telemetry.get("bpm_duration"):
-            print(f"  - BPM processing: {telemetry['bpm_duration']:.2f}s ({telemetry['bpm_duration']/telemetry['total_duration']*100:.1f}%)", flush=True)
-        if telemetry.get("key_duration"):
-            print(f"  - Key processing: {telemetry['key_duration']:.2f}s ({telemetry['key_duration']/telemetry['total_duration']*100:.1f}%)", flush=True)
-    
-        # Return plain dict to reduce pickling overhead (Pydantic model built in parent process)
-        return {
-            "bpm_normalized": bpm_normalized,
-            "bpm_raw": round(bpm_raw, 2) if bpm_raw is not None else None,
-            "confidence": round(confidence, 2) if confidence is not None else None,
-            "key": key,
-            "scale": scale,
-            "key_confidence": round(key_confidence, 2) if key_confidence is not None else None,
-            "telemetry": telemetry,
-        }
+        return process_audio_array(audio, sr, process_bpm, process_key, telemetry, overall_start)
     except Exception as e:
         # Catch any unexpected errors anywhere in the function
         # CRITICAL: Cannot raise HTTPException here - it's not picklable and breaks ProcessPoolExecutor
@@ -434,6 +476,62 @@ def process_single_audio(
         error_details = f"{str(e)}\n{traceback.format_exc()}"
         telemetry["total_duration"] = time.time() - overall_start
         print(f"[ERROR] Unexpected error in process_single_audio: {error_details[:500]}", flush=True)
+        return {
+            "error": True,
+            "error_type": "unexpected_error",
+            "error_message": f"Unexpected error: {str(e)[:200]}",
+            "bpm_normalized": None,
+            "bpm_raw": None,
+            "confidence": None,
+            "key": None,
+            "scale": None,
+            "key_confidence": None,
+            "telemetry": telemetry,
+        }
+
+
+def process_single_audio_npy(
+    npy_bytes: bytes,
+    sample_rate: int,
+    process_bpm: bool,
+    process_key: bool
+) -> dict:
+    """Process a single audio payload from a numpy .npy buffer."""
+    overall_start = time.time()
+    telemetry = {
+        "librosa_import_start": None,
+        "librosa_import_end": None,
+        "librosa_import_duration": None,
+        "audio_load_start": None,
+        "audio_load_end": None,
+        "audio_load_duration": None,
+        "hpss_start": None,
+        "hpss_end": None,
+        "hpss_duration": None,
+        "bpm_start": None,
+        "bpm_end": None,
+        "bpm_duration": None,
+        "key_start": None,
+        "key_end": None,
+        "key_duration": None,
+        "total_duration": None,
+        "payload_type": "pcm_npy"
+    }
+    
+    try:
+        telemetry["audio_load_start"] = time.time()
+        import numpy as np
+        audio = np.load(io.BytesIO(npy_bytes), allow_pickle=False)
+        telemetry["audio_load_end"] = time.time()
+        telemetry["audio_load_duration"] = telemetry["audio_load_end"] - telemetry["audio_load_start"]
+        print(f"[TELEMETRY] Audio load (PCM): {telemetry['audio_load_duration']:.2f}s ({len(audio)/sample_rate:.1f}s)", flush=True)
+        
+        return process_audio_array(audio, sample_rate, process_bpm, process_key, telemetry, overall_start)
+    except Exception as e:
+        import traceback
+        error_details = f"{str(e)}\n{traceback.format_exc()}"
+        telemetry["total_duration"] = time.time() - overall_start
+        print(f"[ERROR] Unexpected error in process_single_audio_npy: {error_details[:500]}", flush=True)
         return {
             "error": True,
             "error_type": "unexpected_error",
@@ -469,14 +567,23 @@ async def process_batch(
     Returns:
         List of FallbackResponse, one per input file
     """
+    global _first_request
+    request_start = time.time()
+    cold_start = False
+    if _first_request:
+        cold_start = True
+        _first_request = False
+    log_telemetry(f"fallback_request_start cold_start={str(cold_start).lower()}")
     temp_files = {}  # Track temp files for cleanup: {index: path}
     try:
         # Get form data
         form = await request.form()
         
-        # Extract audio files - FastAPI handles multiple files with same name
+        # Extract audio files and optional PCM payloads
         # Use multi_items() to get all items including duplicates
         audio_files = []
+        pcm_files = {}
+        sample_rates = {}
         form_items = list(form.multi_items())
         
         # Debug: log what we received
@@ -484,23 +591,39 @@ async def process_batch(
         for key, value in form_items:
             if key == "audio_files":
                 print(f"DEBUG: Found audio_files, type: {type(value)}")
-                # value should be an UploadFile object
-                if hasattr(value, 'read'):  # It's an UploadFile
+                if hasattr(value, 'read'):
                     audio_files.append(value)
                 elif isinstance(value, list):
                     audio_files.extend(value)
                 else:
                     audio_files.append(value)
+            elif key.startswith("pcm_npy_"):
+                print(f"DEBUG: Found pcm_npy, key={key}, type={type(value)}")
+                try:
+                    idx = int(key.split("_")[-1])
+                    if hasattr(value, 'read'):
+                        pcm_files[idx] = value
+                except Exception:
+                    print(f"WARNING: Invalid pcm_npy key: {key}", flush=True)
+            elif key.startswith("sample_rate_"):
+                try:
+                    idx = int(key.split("_")[-1])
+                    sample_rates[idx] = int(value)
+                except Exception:
+                    print(f"WARNING: Invalid sample_rate value for {key}: {value}", flush=True)
             else:
                 print(f"DEBUG: Form key: {key}, type: {type(value)}")
         
         print(f"DEBUG: Total audio_files extracted: {len(audio_files)}")
+        print(f"DEBUG: Total pcm_npy extracted: {len(pcm_files)}")
+        log_telemetry(
+            f"fallback_request_inputs audio_files={len(audio_files)} pcm_npy={len(pcm_files)}"
+        )
         
-        # Validate that we have at least one audio file
-        if not audio_files:
+        if not audio_files and not pcm_files:
             raise HTTPException(
                 status_code=400,
-                detail="No audio files provided in request"
+                detail="No audio files or PCM payloads provided in request"
             )
         
         # Extract processing flags
@@ -577,42 +700,74 @@ async def process_batch(
                 print(traceback.format_exc())
                 raise
         
-        # Stream all files concurrently
+        async def read_pcm_npy(pcm_file, index, process_bpm, process_key):
+            """Read PCM numpy payload into memory and return bytes."""
+            try:
+                payload = await pcm_file.read()
+                if not payload:
+                    raise ValueError(f"PCM payload for index {index} is empty")
+                sr = sample_rates.get(index, 44100)
+                print(f"[TELEMETRY] PCM payload for index {index}: {len(payload)} bytes (sr={sr})", flush=True)
+                return (index, payload, sr, process_bpm, process_key)
+            except Exception as e:
+                import traceback
+                print(f"ERROR: read_pcm_npy failed for index {index}: {str(e)}")
+                print(traceback.format_exc())
+                raise
+        
+        # Stream all inputs concurrently
         stream_tasks = []
+        pcm_tasks = []
         for i, audio_file in enumerate(audio_files):
+            if i in pcm_files:
+                continue
             flags = process_flags.get(i, {})
             process_bpm = flags.get("bpm", True)
             process_key = flags.get("key", True)
             
-            # Validate that at least one processing option is requested
             if not process_bpm and not process_key:
-                # Empty response marker - create completed future
                 future = asyncio.Future()
                 future.set_result((i, None, False, False))
                 stream_tasks.append(future)
             else:
                 stream_tasks.append(stream_to_temp(audio_file, i, process_bpm, process_key))
         
+        for i, pcm_file in pcm_files.items():
+            flags = process_flags.get(i, {})
+            process_bpm = flags.get("bpm", True)
+            process_key = flags.get("key", True)
+            
+            if not process_bpm and not process_key:
+                future = asyncio.Future()
+                future.set_result((i, None, None, False, False))
+                pcm_tasks.append(future)
+            else:
+                pcm_tasks.append(read_pcm_npy(pcm_file, i, process_bpm, process_key))
+        
         # Wait for all streaming to complete
         streamed_files = await asyncio.gather(*stream_tasks, return_exceptions=True)
+        pcm_items = await asyncio.gather(*pcm_tasks, return_exceptions=True)
         
         # Process files concurrently using ProcessPoolExecutor (CPU-bound work)
-        # This bypasses the GIL and allows true parallelism on multiple CPU cores
         process_pool = get_process_pool()
         loop = asyncio.get_event_loop()
         
         # Initialize results array with empty FallbackResponse objects upfront
-        # This ensures every index has a valid response, even if processing fails
-        results = [FallbackResponse() for _ in range(len(audio_files))]
+        indices = set(process_flags.keys())
+        indices.update(pcm_files.keys())
+        if audio_files:
+            indices.update(range(len(audio_files)))
+        total_count = max(indices) + 1 if indices else len(audio_files)
+        results = [FallbackResponse() for _ in range(total_count)]
         
         # Use dict to track processing tasks - maintains explicit index-to-future mapping
         # This prevents index misalignment that can occur with separate lists
         processing_tasks = {}
         
-        for idx, item in enumerate(streamed_files):
+        for item in streamed_files:
             if isinstance(item, Exception):
                 # Streaming failed - keep empty response (already initialized)
-                print(f"[ERROR] Streaming failed for index {idx}: {str(item)[:200]}", flush=True)
+                print(f"[ERROR] Streaming failed: {str(item)[:200]}", flush=True)
                 continue
                 
             if isinstance(item, tuple):
@@ -635,6 +790,24 @@ async def process_batch(
                     # Map index to future explicitly
                     processing_tasks[i] = future
         
+        for item in pcm_items:
+            if isinstance(item, Exception):
+                print(f"[ERROR] PCM read failed: {str(item)[:200]}", flush=True)
+                continue
+            if isinstance(item, tuple):
+                i, payload, sr, process_bpm, process_key = item
+                if payload is None:
+                    continue
+                future = loop.run_in_executor(
+                    process_pool,
+                    process_single_audio_npy,
+                    payload,
+                    sr,
+                    process_bpm,
+                    process_key
+                )
+                processing_tasks[i] = future
+        
         # Wait for all tasks to complete concurrently, handling errors per item
         if processing_tasks:
             # Create list of futures and track their indices
@@ -647,7 +820,10 @@ async def process_batch(
                 if isinstance(result, Exception):
                     # Exception from process pool - log and keep empty response
                     import traceback
-                    error_details = f"Process pool error: {str(result)}\n{traceback.format_exc()}"
+                    tb = ""
+                    if getattr(result, "__traceback__", None):
+                        tb = "".join(traceback.format_exception(type(result), result, result.__traceback__))
+                    error_details = f"Process pool error: {str(result)}\n{tb}"
                     print(f"[ERROR] Process pool exception for index {idx}: {error_details[:500]}", flush=True)
                     # Keep empty response (already initialized)
                 elif result is None:
@@ -707,5 +883,9 @@ async def process_batch(
                     os.unlink(temp_path)
             except Exception:
                 pass  # Ignore cleanup errors
+        request_s = time.time() - request_start
+        log_telemetry(
+            f"fallback_request_done_s={request_s:.2f} rss_kb={get_rss_kb()}"
+        )
     
     return results

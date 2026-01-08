@@ -25,6 +25,7 @@ A Google Cloud Run microservice that computes BPM (beats per minute) and musical
 - **SSRF Protection**: HTTPS-only requirement with redirect validation
 - **High Concurrency**: Worker service handles 200 parallel tasks (20 instances × 10 concurrency)
 - **Real-time Results**: Results stream as they complete via NDJSON format
+- **Partial Results (BPM-first)**: Optional early BPM-only results, followed by a final update with key/fallback fields
 - **Persistent Storage**: Results stored in Firestore, can reconnect to stream anytime
 
 ## Architecture
@@ -138,6 +139,12 @@ The fallback service configuration is in `deploy_fallback.sh`:
 - `PROJECT_ID`: Your GCP project ID (same as primary service)
 - `REGION`: Cloud Run region (default: `europe-west3`)
 - `SERVICE_NAME`: Fallback service name (default: `bpm-fallback-service`)
+
+### Worker Service Configuration
+
+Worker behavior can be tuned via environment variables:
+
+- `STREAM_PARTIAL_BPM_ONLY`: When `true` (default), workers emit a partial result after BPM is ready and update later with key/fallback fields.
 - `ARTIFACT_REPO`: Artifact Registry repository name (default: `bpm-repo`)
 
 ### Primary Service Fallback Settings
@@ -362,13 +369,14 @@ The test script will:
 
 **Expected Flow:**
 1. Batch submission returns `batch_id` in <500ms
-2. First result arrives in 5-10 seconds
-3. Results stream every 2-3 seconds as they complete
+2. First partial result arrives in 5-10 seconds (BPM-only if enabled)
+3. Final results stream as key/fallback completes
 4. Final "complete" message when all URLs are processed
 
 **Streaming Results Format (NDJSON):**
 - `{"type":"status","status":"processing","total":5,"processed":0}`
-- `{"type":"result","index":0,"bpm_essentia":128,"key_essentia":"C",...}`
+- `{"type":"result","index":0,"status":"partial","bpm_essentia":128,"key_essentia":null,...}`
+- `{"type":"result","index":0,"status":"final","bpm_essentia":128,"key_essentia":"C",...}`
 - `{"type":"progress","processed":2,"total":5}`
 - `{"type":"complete","batch_id":"...","total":5}`
 
@@ -568,6 +576,7 @@ Stream batch results as NDJSON (Newline Delimited JSON). Polls Firestore every 5
 {
   "type": "result",
   "index": 0,
+  "status": "final",
   "url": "https://...",
   "bpm_essentia": 128,
   "bpm_raw_essentia": 128.0,
@@ -602,7 +611,8 @@ Stream batch results as NDJSON (Newline Delimited JSON). Polls Firestore every 5
 
 **Usage:**
 - Connect to stream endpoint and read NDJSON lines
-- Results arrive as they complete (typically 5-10s for first result, then every 2-3s)
+- Partial results may arrive before final results for the same index
+- Results arrive as they complete (typically 5-10s for first result)
 - Stream closes when batch is complete
 - Can reconnect anytime using the same `batch_id`
 
@@ -708,6 +718,7 @@ For reference, the old synchronous response format (array of results):
 **Response Interpretation:**
 - **Essentia fields** (`bpm_essentia`, `key_essentia`, etc.): Always populated from the primary service analysis
 - **Librosa fields** (`bpm_librosa`, `key_librosa`, etc.): Only populated when fallback service was called (null otherwise)
+- **Partial vs Final**: When `status` is `partial`, key fields may be null until the final update for that index
 - **When to use which result**: 
   - If `bpm_librosa` is not null, the fallback service provided a higher-confidence BPM result (use `bpm_librosa` for BPM)
   - If `key_librosa` is not null, the fallback service provided a higher-confidence key result (use `key_librosa` for key)
@@ -717,6 +728,7 @@ For reference, the old synchronous response format (array of results):
 - URLs are processed **concurrently** by independent worker tasks via Pub/Sub
 - Audio is analyzed for **first 35 seconds only** (latency/cost optimization)
 - Each worker task calls fallback service independently when Essentia confidence is below threshold
+- When partial streaming is enabled, workers emit BPM-only results early and update the same index with a final result
 - Results are written to Firestore as they complete and streamed to clients in real-time
 
 **Performance Recommendations:**

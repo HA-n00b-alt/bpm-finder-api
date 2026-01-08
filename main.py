@@ -482,13 +482,15 @@ async def stream_batch_results(batch_id: str):
     Polls Firestore every 500ms and yields results as they become available.
     """
     batch_ref = db.collection('batches').document(batch_id)
-    sent_indices = set()
+    sent_status = {}
     
     async def generate_stream():
         loop = asyncio.get_event_loop()
         start_time = time.time()
         last_keepalive = start_time
         max_stream_time = 600  # 10 minutes max stream time
+        last_processed = -1
+        last_progress = -1
         
         while True:
             try:
@@ -530,8 +532,8 @@ async def stream_batch_results(batch_id: str):
                 
                 # Send status update (only if status changed or every 10 seconds)
                 should_send_status = (
-                    len(sent_indices) == 0 or  # First status
-                    processed > len(sent_indices) or  # New results available
+                    len(sent_status) == 0 or  # First status
+                    processed != last_processed or  # Processed count changed
                     int(elapsed) % 10 == 0  # Every 10 seconds
                 )
                 
@@ -543,17 +545,20 @@ async def stream_batch_results(batch_id: str):
                         "processed": processed,
                         "elapsed": int(elapsed)
                     }) + "\n"
+                    last_processed = processed
                 
                 # Send new results
                 for index_str, result in results.items():
                     index = int(index_str)
-                    if index not in sent_indices:
-                        sent_indices.add(index)
+                    result_status = result.get("status", "final")
+                    if sent_status.get(index) != result_status:
+                        sent_status[index] = result_status
                         # Format result for streaming
                         stream_result = {
                             "type": "result",
                             "index": index,
                             "url": result.get("url"),
+                            "status": result_status,
                             "bpm_essentia": result.get("bpm_essentia"),
                             "bpm_raw_essentia": result.get("bpm_raw_essentia"),
                             "bpm_confidence_essentia": result.get("bpm_confidence_essentia"),
@@ -572,12 +577,13 @@ async def stream_batch_results(batch_id: str):
                         yield json.dumps(stream_result) + "\n"
                 
                 # Send progress update only when processed count changes
-                if processed > 0 and processed != len(sent_indices):
+                if processed > 0 and processed != last_progress:
                     yield json.dumps({
                         "type": "progress",
                         "processed": processed,
                         "total": total_urls
                     }) + "\n"
+                    last_progress = processed
                 
                 # Check if complete
                 if status == "completed":

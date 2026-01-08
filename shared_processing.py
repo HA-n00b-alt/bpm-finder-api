@@ -173,91 +173,21 @@ def normalize_bpm(bpm: float) -> float:
     return normalized
 
 
-def analyze_audio(audio_path: str, max_confidence: float) -> Tuple:
-    """Analyze audio file: compute BPM and key."""
+def analyze_key_from_audio(audio, max_confidence: float) -> Tuple[str, str, float, float, bool, List[str]]:
+    """Analyze key from a pre-loaded audio array."""
     import sys
-    import time
-    start_time = time.time()
-    print(f"[ANALYZE] Starting analysis of {audio_path} at {start_time}", file=sys.stderr, flush=True)
-    
-    # Check if Essentia is available (should be pre-imported at module level)
-    if not ESSENTIA_AVAILABLE or es is None:
-        error_msg = "Essentia not available (import failed at module level)"
-        print(f"[ANALYZE] ERROR: {error_msg}", file=sys.stderr, flush=True)
-        return None, None, None, None, "error", "unknown", "unknown", 0.0, 0.0, True, True, error_msg
-    
-    print(f"[ANALYZE] Essentia available (pre-imported)", file=sys.stderr, flush=True)
-    
     debug_lines = []
-    
-    try:
-        print(f"[ANALYZE] Creating MonoLoader...", file=sys.stderr, flush=True)
-        loader = es.MonoLoader(filename=audio_path, sampleRate=44100)
-        print(f"[ANALYZE] Loading audio file...", file=sys.stderr, flush=True)
-        audio = loader()
-        print(f"[ANALYZE] Audio loaded: {len(audio)} samples", file=sys.stderr, flush=True)
-        
-        max_samples = int(MAX_AUDIO_DURATION * 44100)
-        if len(audio) > max_samples:
-            audio = audio[:max_samples]
-            debug_lines.append(f"Audio loaded: {len(audio)/44100:.1f}s (trimmed, capped at {MAX_AUDIO_DURATION}s)")
-        else:
-            debug_lines.append(f"Audio loaded: {len(audio)/44100:.1f}s")
-        print(f"[ANALYZE] Audio prepared: {len(audio)} samples ({len(audio)/44100:.1f}s)", file=sys.stderr, flush=True)
-    except Exception as e:
-        error_msg = f"Essentia audio loading error: {str(e)}"
-        print(f"[ANALYZE] ERROR loading audio: {error_msg}", file=sys.stderr, flush=True)
-        import traceback
-        print(f"[ANALYZE] Traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
-        debug_lines.append(error_msg)
-        return None, None, None, None, "error", "unknown", "unknown", 0.0, 0.0, True, True, "\n".join(debug_lines)
-    
-    # BPM extraction
-    bpm_normalized = None
-    bpm_raw = None
-    bpm_confidence_normalized = None
-    bpm_quality = None
-    bpm_method = "multifeature"
-    need_fallback_bpm = False
-    
-    try:
-        print(f"[ANALYZE] Creating RhythmExtractor2013...", file=sys.stderr, flush=True)
-        rhythm_extractor = es.RhythmExtractor2013(method="multifeature")
-        print(f"[ANALYZE] Extracting BPM...", file=sys.stderr, flush=True)
-        bpm_raw, beats, confidence_raw, _, beats_intervals = rhythm_extractor(audio)
-        print(f"[ANALYZE] BPM extracted: {bpm_raw:.2f}, confidence: {confidence_raw:.3f}", file=sys.stderr, flush=True)
-        
-        bpm_confidence_normalized, bpm_quality = normalize_confidence(float(confidence_raw))
-        bpm_normalized = normalize_bpm(float(bpm_raw))
-        
-        debug_lines.append(f"BPM={bpm_raw:.2f} (normalized={round(bpm_normalized, 1):.1f})")
-        debug_lines.append(f"Confidence: raw={confidence_raw:.3f}, normalized={bpm_confidence_normalized:.3f}, quality={bpm_quality}")
-        
-        if bpm_confidence_normalized >= max_confidence:
-            debug_lines.append(f"BPM confidence ({bpm_confidence_normalized:.3f}) >= threshold ({max_confidence:.2f})")
-        else:
-            need_fallback_bpm = True
-            debug_lines.append(f"BPM confidence ({bpm_confidence_normalized:.3f}) < threshold ({max_confidence:.2f}) - fallback needed")
-    except Exception as e:
-        error_msg = f"BPM extraction error: {str(e)}"
-        print(f"[ANALYZE] ERROR in BPM extraction: {error_msg}", file=sys.stderr, flush=True)
-        import traceback
-        print(f"[ANALYZE] BPM Traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
-        debug_lines.append(error_msg)
-        need_fallback_bpm = True
-    
-    # Key extraction
     key = "unknown"
     scale = "unknown"
     key_strength_raw = 0.0
     key_confidence_normalized = 0.0
     need_fallback_key = False
-    
+
     try:
         print(f"[ANALYZE] Starting key extraction...", file=sys.stderr, flush=True)
         key_profiles = ['temperley', 'krumhansl', 'edma', 'edmm']
         results = []
-        
+
         for profile in key_profiles:
             try:
                 print(f"[ANALYZE] Trying key profile: {profile}", file=sys.stderr, flush=True)
@@ -269,7 +199,7 @@ def analyze_audio(audio_path: str, max_confidence: float) -> Tuple:
             except Exception as e:
                 print(f"[ANALYZE] Profile {profile} failed: {str(e)}", file=sys.stderr, flush=True)
                 continue
-        
+
         if results:
             results.sort(key=lambda x: x[2], reverse=True)
             key, scale, key_strength_raw, winning_profile = results[0]
@@ -291,7 +221,7 @@ def analyze_audio(audio_path: str, max_confidence: float) -> Tuple:
                 print(f"[ANALYZE] KeyExtractor Traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
                 debug_lines.append(error_msg)
                 need_fallback_key = True
-        
+
         if key_confidence_normalized >= max_confidence:
             debug_lines.append(f"Key strength ({key_confidence_normalized:.3f}) >= threshold")
         else:
@@ -304,8 +234,156 @@ def analyze_audio(audio_path: str, max_confidence: float) -> Tuple:
         print(f"[ANALYZE] Key computation Traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
         debug_lines.append(error_msg)
         need_fallback_key = True
+
+    return key, scale, key_strength_raw, key_confidence_normalized, need_fallback_key, debug_lines
+
+
+def analyze_audio(
+    audio_path: str,
+    max_confidence: float,
+    return_audio: bool = False,
+    compute_key: bool = True
+) -> Tuple:
+    """Analyze audio file: compute BPM and key.
+
+    If return_audio is True, append (audio, sample_rate) to the result tuple.
+    """
+    import sys
+    import time
+    import resource
+    start_time = time.time()
+    load_start = None
+    load_duration = None
+    bpm_start = None
+    bpm_duration = None
+    key_start = None
+    key_duration = None
+    print(f"[ANALYZE] Starting analysis of {audio_path} at {start_time}", file=sys.stderr, flush=True)
+    
+    def _with_audio(result_tuple, audio_data, sample_rate):
+        if return_audio:
+            return result_tuple + (audio_data, sample_rate)
+        return result_tuple
+
+    # Check if Essentia is available (should be pre-imported at module level)
+    if not ESSENTIA_AVAILABLE or es is None:
+        error_msg = "Essentia not available (import failed at module level)"
+        print(f"[ANALYZE] ERROR: {error_msg}", file=sys.stderr, flush=True)
+        return _with_audio(
+            (None, None, None, None, "error", "unknown", "unknown", 0.0, 0.0, True, True, error_msg),
+            None,
+            None,
+        )
+    
+    print(f"[ANALYZE] Essentia available (pre-imported)", file=sys.stderr, flush=True)
+    
+    debug_lines = []
+    
+    try:
+        print(f"[ANALYZE] Creating MonoLoader...", file=sys.stderr, flush=True)
+        load_start = time.time()
+        sample_rate = 44100
+        loader = es.MonoLoader(filename=audio_path, sampleRate=sample_rate)
+        print(f"[ANALYZE] Loading audio file...", file=sys.stderr, flush=True)
+        audio = loader()
+        load_duration = time.time() - load_start
+        print(f"[ANALYZE] Audio loaded: {len(audio)} samples", file=sys.stderr, flush=True)
+        
+        max_samples = int(MAX_AUDIO_DURATION * 44100)
+        if len(audio) > max_samples:
+            audio = audio[:max_samples]
+            debug_lines.append(f"Audio loaded: {len(audio)/sample_rate:.1f}s (trimmed, capped at {MAX_AUDIO_DURATION}s)")
+        else:
+            debug_lines.append(f"Audio loaded: {len(audio)/sample_rate:.1f}s")
+        print(f"[ANALYZE] Audio prepared: {len(audio)} samples ({len(audio)/sample_rate:.1f}s)", file=sys.stderr, flush=True)
+    except Exception as e:
+        error_msg = f"Essentia audio loading error: {str(e)}"
+        print(f"[ANALYZE] ERROR loading audio: {error_msg}", file=sys.stderr, flush=True)
+        import traceback
+        print(f"[ANALYZE] Traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
+        debug_lines.append(error_msg)
+        return _with_audio(
+            (None, None, None, None, "error", "unknown", "unknown", 0.0, 0.0, True, True, "\n".join(debug_lines)),
+            None,
+            None,
+        )
+    
+    # BPM extraction
+    bpm_normalized = None
+    bpm_raw = None
+    bpm_confidence_normalized = None
+    bpm_quality = None
+    bpm_method = "multifeature"
+    need_fallback_bpm = False
+    
+    try:
+        bpm_start = time.time()
+        print(f"[ANALYZE] Creating RhythmExtractor2013...", file=sys.stderr, flush=True)
+        rhythm_extractor = es.RhythmExtractor2013(method="multifeature")
+        print(f"[ANALYZE] Extracting BPM...", file=sys.stderr, flush=True)
+        bpm_raw, beats, confidence_raw, _, beats_intervals = rhythm_extractor(audio)
+        bpm_duration = time.time() - bpm_start
+        print(f"[ANALYZE] BPM extracted: {bpm_raw:.2f}, confidence: {confidence_raw:.3f}", file=sys.stderr, flush=True)
+        
+        bpm_confidence_normalized, bpm_quality = normalize_confidence(float(confidence_raw))
+        bpm_normalized = normalize_bpm(float(bpm_raw))
+        
+        debug_lines.append(f"BPM={bpm_raw:.2f} (normalized={round(bpm_normalized, 1):.1f})")
+        debug_lines.append(f"Confidence: raw={confidence_raw:.3f}, normalized={bpm_confidence_normalized:.3f}, quality={bpm_quality}")
+        
+        if bpm_confidence_normalized >= max_confidence:
+            debug_lines.append(f"BPM confidence ({bpm_confidence_normalized:.3f}) >= threshold ({max_confidence:.2f})")
+        else:
+            need_fallback_bpm = True
+            debug_lines.append(f"BPM confidence ({bpm_confidence_normalized:.3f}) < threshold ({max_confidence:.2f}) - fallback needed")
+    except Exception as e:
+        error_msg = f"BPM extraction error: {str(e)}"
+        print(f"[ANALYZE] ERROR in BPM extraction: {error_msg}", file=sys.stderr, flush=True)
+        import traceback
+        print(f"[ANALYZE] BPM Traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
+        debug_lines.append(error_msg)
+        need_fallback_bpm = True
+    
+    # Key extraction (optional)
+    key = "unknown"
+    scale = "unknown"
+    key_strength_raw = 0.0
+    key_confidence_normalized = 0.0
+    need_fallback_key = False
+    key_start = None
+    key_duration = None
+    
+    if compute_key:
+        key_start = time.time()
+        (
+            key,
+            scale,
+            key_strength_raw,
+            key_confidence_normalized,
+            need_fallback_key,
+            key_debug_lines
+        ) = analyze_key_from_audio(audio, max_confidence)
+        key_duration = time.time() - key_start
+        debug_lines.extend(key_debug_lines)
+    else:
+        debug_lines.append("Key skipped (partial)")
+        need_fallback_key = False
     
     total_time = time.time() - start_time
+    try:
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except Exception:
+        rss_kb = None
+    print(
+        "[TELEMETRY] shared_processing "
+        f"audio_load_s={load_duration if load_duration is not None else 'na'} "
+        f"bpm_s={bpm_duration if bpm_duration is not None else 'na'} "
+        f"key_s={key_duration if key_duration is not None else 'na'} "
+        f"total_s={total_time:.2f} "
+        f"samples={len(audio) if 'audio' in locals() else 'na'} "
+        f"rss_kb={rss_kb if rss_kb is not None else 'na'}",
+        flush=True
+    )
     print(f"[ANALYZE] Analysis complete: BPM={bpm_normalized}, Key={key} {scale} (total time: {total_time:.2f}s)", file=sys.stderr, flush=True)
     
     result = (
@@ -315,7 +393,7 @@ def analyze_audio(audio_path: str, max_confidence: float) -> Tuple:
         "\n".join(debug_lines)
     )
     print(f"[ANALYZE] Returning result tuple (length: {len(result)})", file=sys.stderr, flush=True)
-    return result
+    return _with_audio(result, audio, sample_rate)
 
 
 async def get_auth_headers(audience: str) -> dict:

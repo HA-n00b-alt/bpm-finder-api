@@ -4,10 +4,12 @@ BPM Worker Service - Processes Pub/Sub messages and writes results to Firestore
 import os
 import json
 import base64
+import io
 import asyncio
 import tempfile
 import httpx
 import time
+import resource
 from typing import Optional
 from urllib.parse import urlparse
 from fastapi import FastAPI, Request, HTTPException
@@ -26,6 +28,7 @@ from tenacity import (
 from shared_processing import (
     download_audio_async,
     analyze_audio,
+    analyze_key_from_audio,
     get_auth_headers,
     generate_debug_output,
     FallbackCircuitBreaker,
@@ -37,8 +40,14 @@ from shared_processing import (
     FALLBACK_RETRY_DELAY,
 )
 
+# Numpy is used for PCM serialization when calling the fallback service
+import numpy as np
+
 app = FastAPI(title="BPM Worker Service")
 db = firestore.Client()
+PROCESS_START = time.time()
+_first_request = True
+STREAM_PARTIAL_BPM_ONLY = os.getenv("STREAM_PARTIAL_BPM_ONLY", "true").lower() == "true"
 
 # Global HTTP client with connection pooling
 _http_client: Optional[httpx.AsyncClient] = None
@@ -77,6 +86,23 @@ def get_essentia_executor() -> ThreadPoolExecutor:
         max_workers = int(os.getenv("ESSENTIA_MAX_CONCURRENCY", max(1, os.cpu_count() or 1)))
         _essentia_executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="essentia")
     return _essentia_executor
+
+
+def log_telemetry(message: str) -> None:
+    print(f"[TELEMETRY] {message}", flush=True)
+
+
+def get_rss_kb() -> Optional[int]:
+    try:
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except Exception:
+        return None
+
+
+@app.on_event("startup")
+async def startup_event():
+    startup_s = time.time() - PROCESS_START
+    log_telemetry(f"worker_startup_s={startup_s:.2f}")
 
 
 @app.on_event("startup")
@@ -156,6 +182,12 @@ async def process_single_url_task(
             await download_audio_async(url, input_path, client)
             timing["download_end"] = time.time()
             timing["download_duration"] = timing["download_end"] - timing["download_start"]
+            download_bytes = os.path.getsize(input_path) if os.path.exists(input_path) else 0
+            log_telemetry(
+                f"worker_download_s={timing['download_duration']:.2f} "
+                f"bytes={download_bytes} "
+                f"batch_id={batch_id} index={index}"
+            )
             debug_info_parts.append(f"URL fetch: SUCCESS ({url[:50]}...)")
             print(f"[{batch_id}:{index}] Download complete ({timing['download_duration']:.2f}s)")
         except Exception as e:
@@ -179,14 +211,18 @@ async def process_single_url_task(
                     executor,
                     analyze_audio,
                     input_path,
-                    max_confidence
+                    max_confidence,
+                    True,
+                    not STREAM_PARTIAL_BPM_ONLY
                 )
                 print(f"[{batch_id}:{index}] Executor returned, unpacking result...", flush=True)
                 (
                     bpm_normalized, bpm_raw, bpm_confidence_normalized, bpm_quality, bpm_method,
                     key, scale, key_strength_raw, key_confidence_normalized,
                     need_fallback_bpm, need_fallback_key,
-                    analysis_debug
+                    analysis_debug,
+                    audio_pcm,
+                    sample_rate
                 ) = result
                 print(f"[{batch_id}:{index}] Result unpacked: BPM={bpm_normalized}, Key={key}", flush=True)
             except Exception as e:
@@ -198,6 +234,10 @@ async def process_single_url_task(
             print(f"[{batch_id}:{index}] Executor returned successfully", flush=True)
             timing["essentia_end"] = time.time()
             timing["essentia_duration"] = timing["essentia_end"] - timing["essentia_start"]
+            log_telemetry(
+                f"worker_essentia_s={timing['essentia_duration']:.2f} "
+                f"batch_id={batch_id} index={index}"
+            )
             
             debug_info_parts.append(f"Max confidence threshold: {max_confidence:.2f}")
             debug_info_parts.append("=== Analysis (Essentia) ===")
@@ -216,6 +256,14 @@ async def process_single_url_task(
             raise
         
         # Prepare result
+        key_value = key if not STREAM_PARTIAL_BPM_ONLY else None
+        scale_value = scale if not STREAM_PARTIAL_BPM_ONLY else None
+        key_conf_value = (
+            round(key_confidence_normalized, 2) if key_confidence_normalized is not None else 0.0
+        )
+        if STREAM_PARTIAL_BPM_ONLY:
+            key_conf_value = None
+
         firestore_result = {
             "index": index,
             "url": url,
@@ -225,14 +273,91 @@ async def process_single_url_task(
             "bpm_librosa": None,
             "bpm_raw_librosa": None,
             "bpm_confidence_librosa": None,
-            "key_essentia": key if key else "unknown",
-            "scale_essentia": scale if scale else "unknown",
-            "keyscale_confidence_essentia": round(key_confidence_normalized, 2) if key_confidence_normalized is not None else 0.0,
+            "key_essentia": key_value,
+            "scale_essentia": scale_value,
+            "keyscale_confidence_essentia": key_conf_value,
             "key_librosa": None,
             "scale_librosa": None,
             "keyscale_confidence_librosa": None,
+            "status": "final"
         }
+
+        # Stream partial result early if enabled or fallback is needed
+        should_stream_partial = STREAM_PARTIAL_BPM_ONLY or need_fallback_bpm or need_fallback_key
+        if should_stream_partial:
+            firestore_result["status"] = "partial"
+            partial_debug_info = list(debug_info_parts)
+            if STREAM_PARTIAL_BPM_ONLY:
+                partial_debug_info.append("Key pending (partial)")
+            if need_fallback_bpm or need_fallback_key:
+                partial_debug_info.append("Fallback pending")
+            partial_debug_txt = generate_debug_output(
+                partial_debug_info,
+                timing,
+                None,
+                debug_level
+            )
+            firestore_result["debug_txt"] = partial_debug_txt if partial_debug_txt else None
+
+            @retry(
+                stop=stop_after_attempt(5),
+                wait=wait_exponential(multiplier=1, min=1, max=30),
+                retry=retry_if_exception_type((Exception,)),
+                reraise=True
+            )
+            def update_partial_result():
+                """Write partial result without incrementing processed (idempotent)."""
+                transaction = db.transaction()
+
+                @firestore.transactional
+                def update_in_transaction(transaction):
+                    batch_doc = batch_ref.get(transaction=transaction)
+                    if not batch_doc.exists:
+                        raise Exception(f"Batch {batch_id} not found")
+
+                    batch_data = batch_doc.to_dict()
+                    results = batch_data.get('results', {})
+                    existing = results.get(str(index))
+                    if existing and existing.get("status") in ("final", "error"):
+                        return False
+
+                    transaction.update(batch_ref, {
+                        f'results.{index}': firestore_result
+                    })
+                    return True
+
+                return update_in_transaction(transaction)
+
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, update_partial_result)
         
+        # Compute key after partial (to improve time-to-first-result)
+        if STREAM_PARTIAL_BPM_ONLY:
+            if audio_pcm is None:
+                debug_info_parts.append("Key skipped (no audio)")
+                need_fallback_key = False
+            else:
+                key_result = await loop.run_in_executor(
+                    executor,
+                    analyze_key_from_audio,
+                    audio_pcm,
+                    max_confidence
+                )
+                (
+                    key,
+                    scale,
+                    key_strength_raw,
+                    key_confidence_normalized,
+                    need_fallback_key,
+                    key_debug_lines
+                ) = key_result
+                debug_info_parts.extend(key_debug_lines)
+                firestore_result["key_essentia"] = key if key else "unknown"
+                firestore_result["scale_essentia"] = scale if scale else "unknown"
+                firestore_result["keyscale_confidence_essentia"] = (
+                    round(key_confidence_normalized, 2) if key_confidence_normalized is not None else 0.0
+                )
+
         # Handle fallback if needed
         fallback_timing = None
         if need_fallback_bpm or need_fallback_key:
@@ -244,7 +369,9 @@ async def process_single_url_task(
                 need_fallback_bpm,
                 need_fallback_key,
                 max_confidence,
-                debug_level
+                debug_level,
+                audio_pcm,
+                sample_rate
             )
             fallback_end = time.time()
             fallback_duration = fallback_end - fallback_start
@@ -264,7 +391,7 @@ async def process_single_url_task(
             else:
                 print(f"[{batch_id}:{index}] Fallback failed or skipped ({fallback_duration:.2f}s)")
         
-        # Generate debug output
+        # Generate debug output for final result
         debug_txt = generate_debug_output(
             debug_info_parts,
             timing,
@@ -272,6 +399,7 @@ async def process_single_url_task(
             debug_level
         )
         firestore_result["debug_txt"] = debug_txt if debug_txt else None
+        firestore_result["status"] = "final"
         
         # Write result to Firestore with idempotency check (using transaction)
         print(f"[{batch_id}:{index}] Writing to Firestore...", flush=True)
@@ -305,10 +433,11 @@ async def process_single_url_task(
                     batch_data = batch_doc.to_dict()
                     results = batch_data.get('results', {})
                     
-                    # Check if this index was already processed (idempotency check)
-                    if str(index) in results:
-                        print(f"[{batch_id}:{index}] [FIRESTORE] Index {index} already processed, skipping increment", flush=True)
-                        return False  # Already processed
+                    # Check if this index was already finalized (idempotency check)
+                    existing = results.get(str(index))
+                    if existing and existing.get("status") in ("final", "error"):
+                        print(f"[{batch_id}:{index}] [FIRESTORE] Index {index} already finalized, skipping increment", flush=True)
+                        return False  # Already finalized
                     
                     # Update with transaction
                     transaction.update(batch_ref, {
@@ -369,7 +498,8 @@ async def process_single_url_task(
         error_result = {
             "index": index,
             "url": url,
-            "error": error_details[:500]
+            "error": error_details[:500],
+            "status": "error"
         }
         
         @retry(
@@ -431,10 +561,12 @@ async def call_fallback_service(
     need_fallback_bpm: bool,
     need_fallback_key: bool,
     max_confidence: float,
-    debug_level: str
+    debug_level: str,
+    audio_pcm,
+    sample_rate
 ):
     """Call fallback service for a single item."""
-    if not file_path or not os.path.exists(file_path):
+    if (audio_pcm is None or not sample_rate) and (not file_path or not os.path.exists(file_path)):
         return None
     
     file_handle = None
@@ -447,17 +579,36 @@ async def call_fallback_service(
             print(f"Circuit breaker open, skipping fallback")
             return None
         
-        # Open file
+        files = []
+        payload_type = None
+        payload_bytes = None
         loop = asyncio.get_event_loop()
-        file_handle = await loop.run_in_executor(None, open, file_path, "rb")
-        
-        # Prepare request
-        files = [("audio_files", (f"audio.tmp", file_handle, "audio/mpeg"))]
+        if audio_pcm is not None and sample_rate:
+            # Send pre-decoded PCM to avoid reloading in fallback service
+            pcm_array = np.asarray(audio_pcm, dtype=np.float32)
+            buffer = io.BytesIO()
+            np.save(buffer, pcm_array, allow_pickle=False)
+            buffer.seek(0)
+            pcm_bytes = buffer.read()
+            payload_type = "pcm_npy"
+            payload_bytes = len(pcm_bytes)
+            files.append(("pcm_npy_0", ("audio.npy", pcm_bytes, "application/octet-stream")))
+        else:
+            # Fall back to sending the original file
+            file_handle = await loop.run_in_executor(None, open, file_path, "rb")
+            payload_type = "file"
+            payload_bytes = os.path.getsize(file_path) if os.path.exists(file_path) else None
+            files.append(("audio_files", ("audio.tmp", file_handle, "audio/mpeg")))
         data = {
             "process_bpm_0": str(need_fallback_bpm).lower(),
             "process_key_0": str(need_fallback_key).lower(),
-            "url_0": url
+            "url_0": url,
+            "sample_rate_0": str(int(sample_rate)) if sample_rate else "44100"
         }
+        log_telemetry(
+            f"worker_fallback_payload type={payload_type} bytes={payload_bytes} "
+            f"sr={int(sample_rate) if sample_rate else 44100}"
+        )
         
         # Retry logic
         client = get_http_client()
@@ -473,6 +624,7 @@ async def call_fallback_service(
                     pool=5.0
                 )
                 
+                attempt_start = time.time()
                 print(f"Fallback attempt {attempt + 1}/{FALLBACK_MAX_RETRIES}")
                 response = await client.post(
                     f"{FALLBACK_SERVICE_URL}/process_batch",
@@ -480,6 +632,11 @@ async def call_fallback_service(
                     data=data,
                     headers=auth_headers,
                     timeout=timeout
+                )
+                attempt_s = time.time() - attempt_start
+                log_telemetry(
+                    f"worker_fallback_attempt_s={attempt_s:.2f} "
+                    f"status={response.status_code} attempt={attempt + 1}"
                 )
                 
                 if response.status_code == 200:
@@ -533,6 +690,13 @@ async def process_pubsub_message(request: Request):
     2. Pub/Sub can retry if we return non-2xx
     3. No message loss if container is killed during processing
     """
+    global _first_request
+    request_start = time.time()
+    cold_start = False
+    if _first_request:
+        cold_start = True
+        _first_request = False
+    log_telemetry(f"worker_request_start cold_start={str(cold_start).lower()}")
     try:
         envelope = await request.json()
         
@@ -574,6 +738,11 @@ async def process_pubsub_message(request: Request):
             )
             # At this point, Firestore write is complete
             print(f"[{batch_id}:{index}] Processing completed successfully, Firestore write confirmed")
+            request_s = time.time() - request_start
+            log_telemetry(
+                f"worker_request_done_s={request_s:.2f} "
+                f"batch_id={batch_id} index={index} rss_kb={get_rss_kb()}"
+            )
             # Return 204 (No Content) - Pub/Sub interprets this as successful ACK
             # We return 204 (not 200) to signal success without a body
             from fastapi import Response
@@ -582,6 +751,11 @@ async def process_pubsub_message(request: Request):
             import traceback
             error_details = f"Processing failed: {str(e)}\n{traceback.format_exc()}"
             print(f"[{batch_id}:{index}] Processing failed: {error_details[:500]}")
+            request_s = time.time() - request_start
+            log_telemetry(
+                f"worker_request_done_s={request_s:.2f} "
+                f"batch_id={batch_id} index={index} status=error rss_kb={get_rss_kb()}"
+            )
             # Return 500 so Pub/Sub will retry the message
             raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
         
