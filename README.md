@@ -14,6 +14,7 @@ A Google Cloud Run microservice that computes BPM (beats per minute) and musical
   - Key fallback: Triggered when key strength < `max_confidence` threshold
   - Can call fallback for BPM only, key only, both, or neither
   - **Per-worker fallback calls**: Each worker task calls fallback service independently when needed
+- **Fallback Safety Controls**: Circuit breaker + retries to avoid cascading failures
 - **Configurable Confidence Threshold**: `max_confidence` parameter (default 0.65) controls when fallback is triggered
 - **Configurable Debug Output**: `debug_level` parameter (`minimal`, `normal`, `detailed`) controls debug information verbosity
 - **Musical Key Detection**: Multiple Essentia key profile types with automatic selection of best result
@@ -39,11 +40,6 @@ The system uses an **async event-driven architecture** with three main component
 ### Primary Service (`bpm-service`)
 
 - **Runtime**: Python 3 + FastAPI + Uvicorn
-- **Audio Processing**: Essentia (RhythmExtractor2013 for BPM, KeyExtractor for key detection)
-  - Direct MP3/AAC decoding (no ffmpeg conversion step)
-  - Analyzes first 35 seconds only
-- **BPM Method**: Single method:
-  - `multifeature`: RhythmExtractor2013 with multifeature method (confidence range: 0-5.32)
 - **Container**: MTG Essentia base image (`ghcr.io/mtg/essentia:latest`) with ffmpeg for codec support
 - **Performance Optimizations**:
   - Lazy loading of heavy libraries (essentia loads only when needed, reducing cold start time)
@@ -59,7 +55,7 @@ The system uses an **async event-driven architecture** with three main component
   - `POST /analyze/batch`: Submit batch, returns `batch_id` immediately
   - `GET /stream/{batch_id}`: Stream results as NDJSON (real-time)
   - `GET /batch/{batch_id}`: Get batch status and all results
-- **Integration**: Publishes tasks to Pub/Sub, reads results from Firestore
+- **Integration**: Publishes tasks to Pub/Sub, reads results from Firestore (no audio processing in this service)
 
 ### Worker Service (`bpm-worker`)
 
@@ -76,7 +72,8 @@ The system uses an **async event-driven architecture** with three main component
 - **Integration**: 
   - Receives Pub/Sub push messages via `/pubsub/process`
   - Writes results to Firestore as they complete
-  - Calls fallback service when needed (same logic as primary service)
+  - Calls fallback service when needed (per item)
+  - Sends pre-decoded PCM (`.npy`) to fallback when available to reduce duplicate decoding
 
 ### Pub/Sub & Firestore
 
@@ -89,8 +86,8 @@ The system uses an **async event-driven architecture** with three main component
 
 - **Runtime**: Python 3 + FastAPI + Uvicorn
 - **Audio Processing**: Librosa (HPSS, beat tracking, chroma features)
-  - Processes audio from memory (BytesIO) - no disk I/O
-  - Direct MP3/AAC decoding from memory
+  - Accepts either uploaded audio files (streamed to `/tmp`) or pre-decoded PCM (`.npy`)
+  - Uses Essentia MonoLoader when available for fast decoding before Librosa
 - **BPM Method**: Harmonic-Percussive Source Separation (HPSS) with percussive component beat tracking
 - **Key Method**: Krumhansl-Schmuckler algorithm on harmonic component (improved with chroma_cqt and low-energy frame dropping)
 - **Container**: Python 3.11-slim with librosa, numpy, scipy, ffmpeg
@@ -146,17 +143,24 @@ Worker behavior can be tuned via environment variables:
 
 - `STREAM_PARTIAL_BPM_ONLY`: When `true` (default), workers emit a partial result after BPM is ready and update later with key/fallback fields.
 - `ARTIFACT_REPO`: Artifact Registry repository name (default: `bpm-repo`)
+- `ESSENTIA_MAX_CONCURRENCY`: Max thread pool workers for Essentia analysis (defaults to CPU count)
 
 ### Primary Service Fallback Settings
 
-The primary service fallback configuration is in `main.py`:
+Fallback configuration shared by the worker and primary services is in `shared_processing.py`:
 
 - `FALLBACK_SERVICE_URL`: URL of the fallback service (must be updated after fallback deployment)
 - `FALLBACK_SERVICE_AUDIENCE`: OIDC audience for service-to-service authentication (same as `FALLBACK_SERVICE_URL`)
+- `FALLBACK_REQUEST_TIMEOUT_COLD_START`: First-attempt timeout (seconds)
+- `FALLBACK_REQUEST_TIMEOUT_WARM`: Subsequent-attempt timeout (seconds)
+- `FALLBACK_MAX_RETRIES`: Maximum fallback retry attempts
+- `FALLBACK_RETRY_DELAY`: Base retry delay (seconds)
+- `FALLBACK_FAILURE_THRESHOLD`: Consecutive failures before circuit opens
+- `FALLBACK_RECOVERY_TIMEOUT`: Seconds before half-open retry is allowed
 
 **Note**: The confidence threshold is now configurable per-request via the `max_confidence` parameter (default: 0.65). This allows clients to control when fallback is triggered.
 
-**Important**: After deploying the fallback service, update `FALLBACK_SERVICE_URL` and `FALLBACK_SERVICE_AUDIENCE` in `main.py` with the actual fallback service URL, then redeploy the primary service.
+**Important**: After deploying the fallback service, update `FALLBACK_SERVICE_URL` and `FALLBACK_SERVICE_AUDIENCE` in `shared_processing.py`, then redeploy the primary and worker services.
 
 ## One-Time Setup
 
@@ -383,13 +387,13 @@ The test script will:
 **Reconnect to Stream:**
 You can reconnect to a stream anytime using the batch_id:
 ```bash
-./test_stream.sh <batch_id>
+curl -s -N -H "Authorization: Bearer $TOKEN" \
+  "${SERVICE_URL}/stream/${BATCH_ID}"
 ```
 
 **Optional Debug Scripts:**
 
 For debugging purposes, optional test scripts are available:
-- `test_stream.sh`: Stream results for a specific batch_id
 - `test_fallback_direct.sh`: Test the fallback service directly (requires manual configuration)
 - `test_fallback_auth.sh`: Test fallback service authentication (requires manual configuration)
 
@@ -433,7 +437,8 @@ RESPONSE=$(curl -s -X POST \
         "https://audio-ssl.itunes.apple.com/..."
       ],
       "max_confidence": 0.65,
-      "debug_level": "normal"
+      "debug_level": "normal",
+      "fallback_override": "always"
     }' \
     "${SERVICE_URL}/analyze/batch")
 
@@ -541,6 +546,11 @@ Submit batch for async processing: publishes tasks to Pub/Sub and returns `batch
   - `"minimal"`: Only errors and final results
   - `"normal"`: All debug info + telemetry summary (default)
   - `"detailed"`: Full debug info + detailed timing with timestamps
+- `fallback_override` (optional, default: `null`): Overrides the default fallback logic.
+  - `"never"`: Never use the fallback service, even if confidence is below threshold.
+  - `"always"`: Always use the fallback service for both BPM and key.
+  - `"bpm_only"`: Force the use of the fallback service for BPM only.
+  - `"key_only"`: Force the use of the fallback service for key only.
 
 **Response:**
 Returns immediately with batch submission details:
@@ -716,7 +726,7 @@ For reference, the old synchronous response format (array of results):
   - Includes: URL fetch status, audio loading status, BPM and key analysis details, fallback service status (if triggered), error messages (if any), and telemetry
 
 **Response Interpretation:**
-- **Essentia fields** (`bpm_essentia`, `key_essentia`, etc.): Always populated from the primary service analysis
+- **Essentia fields** (`bpm_essentia`, `key_essentia`, etc.): Always populated from the worker's Essentia analysis
 - **Librosa fields** (`bpm_librosa`, `key_librosa`, etc.): Only populated when fallback service was called (null otherwise)
 - **Partial vs Final**: When `status` is `partial`, key fields may be null until the final update for that index
 - **When to use which result**: 
@@ -733,13 +743,7 @@ For reference, the old synchronous response format (array of results):
 
 **Performance Recommendations:**
 - **Recommended max batch size: 20 songs** for optimal performance and reliability
-- **For batches over 20 songs**: Consider switching from a single synchronous request to an asynchronous pattern:
-  - Call a job-creation endpoint (if available) to submit the batch
-  - Receive a Job ID
-  - Poll a separate results endpoint to retrieve results when ready
-  - This pattern removes the hard timeout limit imposed by the HTTP connection (currently 300 seconds)
-  - Allows processing of very large batches without connection timeouts
-- **Current synchronous batch endpoint**: Best suited for batches of 20 songs or fewer to avoid HTTP timeout issues
+- **For batches over 20 songs**: Use `/stream/{batch_id}` and fall back to `/batch/{batch_id}` if the stream expires (10-minute cap)
 
 **Error Responses:**
 - `400`: Invalid URL, non-HTTPS URL, file too large, redirect to non-HTTPS URL, or empty URLs array
@@ -750,31 +754,18 @@ For reference, the old synchronous response format (array of results):
 
 ### Recommended Batch Sizes
 
-- **Optimal batch size: ≤20 songs** for synchronous requests
-  - Provides best balance of performance and reliability
-  - Stays well within the 300-second HTTP timeout limit
-  - Allows for efficient concurrent processing
+- **Optimal batch size: ≤20 songs** for fast results and lower tail latency
+- Larger batches are supported, but expect longer stream duration and more fallback load
 
 ### Large Batch Processing (20+ songs)
 
-For batches **over 20 songs**, consider using an **asynchronous job pattern** instead of a single synchronous request:
+For larger batches, rely on the existing async flow:
 
-**Why use async pattern for large batches:**
-- Removes the hard timeout limit imposed by HTTP connections (currently 300 seconds)
-- Allows processing of very large batches (100+ songs) without connection timeouts
-- Better error handling and retry capabilities
-- More efficient resource utilization
+1. **Submit batch** with `POST /analyze/batch` (returns `batch_id` immediately)
+2. **Stream results** via `GET /stream/{batch_id}` (real-time)
+3. **Poll results** via `GET /batch/{batch_id}` if the stream times out (stream max is 10 minutes)
 
-**Recommended async pattern:**
-1. **Job Creation**: Call a job-creation endpoint (if available) to submit the batch
-   - Returns a Job ID immediately
-   - Job is queued for processing
-2. **Polling**: Poll a separate results endpoint using the Job ID
-   - Check job status periodically (e.g., every 5-10 seconds)
-   - Retrieve results when processing is complete
-3. **Error Handling**: Handle job failures and retries appropriately
-
-**Note**: The current `/analyze/batch` endpoint is synchronous and best suited for batches of 20 songs or fewer. For larger batches, an async job pattern is recommended to avoid HTTP timeout issues.
+This avoids HTTP request timeouts while still providing incremental results.
 
 ## SSRF Protection
 
@@ -956,7 +947,7 @@ The services implement several optimizations to reduce cold start time and impro
 
 ### Runtime Optimizations
 
-1. **Concurrent URL Processing**: Up to 20 URLs are downloaded concurrently per batch request (configurable via `BATCH_URL_CONCURRENCY` env var)
+1. **Worker Parallelism**: Cloud Run concurrency + `ESSENTIA_MAX_CONCURRENCY` (thread pool) controls CPU-bound analysis throughput
 
 2. **Efficient File I/O**: Uses `aiofiles` for async file operations with internal buffering (no manual buffering needed)
 
@@ -964,62 +955,38 @@ The services implement several optimizations to reduce cold start time and impro
 
 ## Processing Pipeline
 
-### Primary Service Flow (Batch Processing)
+### Worker Service Flow (Batch Processing)
 
-1. **Concurrent Download**: Fetch all audio URLs concurrently using `asyncio.gather()`:
-   - Stream downloads directly to disk with **async I/O** (using `aiofiles` with internal buffering)
-   - Up to 20 URLs downloaded concurrently per batch (configurable)
+1. **Download**: Fetch each audio URL and stream to `/tmp`
    - SSRF protection: HTTPS-only, redirect validation
    - Max file size: 10MB per file
-
-2. **Concurrent Analysis**: Process all downloaded files concurrently:
-   - **Direct Essentia Analysis**: Load compressed audio (MP3/AAC) directly with Essentia
-     - No ffmpeg conversion step (Essentia handles decoding)
-     - Duration cap: Analyze first 35 seconds only (`endTime=35.0`)
-   - **Single Audio Load**: Load audio once, compute both BPM and key from same array
-   - **BPM Analysis**:
-     - Use `RhythmExtractor2013(method="multifeature")` to extract BPM and confidence
-     - Confidence range: 0-5.32 (raw), normalized to 0-1
-     - Quality levels:
-       - [0, 1): very low confidence
-       - [1, 2): low confidence
-       - [2, 3): moderate confidence
-       - [3, 3.5): high confidence
-       - (3.5, 5.32]: excellent confidence
-     - Check if normalized confidence >= `max_confidence` threshold
-   - **Key Analysis**: Use Essentia `KeyExtractor` with multiple profile types (temperley, krumhansl, edma, edmm) and select best result
-     - Check if normalized strength >= `max_confidence` threshold
-
-3. **Per-Worker Fallback Calls** (if needed):
-   - Each worker task independently checks if Essentia confidence < `max_confidence` threshold
-   - If below threshold, worker calls fallback service for that specific item
-   - Fallback service processes one file per request (not batched across workers)
-
-4. **Update Results**: Worker writes results to Firestore, including fallback results if used
-
-6. **Normalize BPM**: Adjust for extreme outliers only:
-   - If BPM < 40: multiply by 2
-   - If BPM > 220: divide by 2
-   - Otherwise: return unchanged
-
-7. **Cleanup**: Delete temporary files
-
-8. **Return**: Array of JSON responses (one per input URL, maintains order)
+2. **Essentia Analysis**: Load audio once and compute BPM + key
+   - `RhythmExtractor2013(method="multifeature")` for BPM
+   - `KeyExtractor` with multiple profiles (temperley, krumhansl, edma, edmm)
+   - Duration cap: first 35 seconds only
+3. **Partial Result (optional)**: If `STREAM_PARTIAL_BPM_ONLY=true`, emit a BPM-only partial result early
+4. **Selective Fallback**:
+   - If BPM or key confidence < `max_confidence`, call fallback for that field
+   - Worker sends pre-decoded PCM (`.npy`) when available, otherwise the original file
+   - Circuit breaker can skip fallback if the service is unhealthy
+5. **Write Results**: Persist to Firestore; stream updates via `/stream/{batch_id}`
+6. **Cleanup**: Delete temp files
 
 ### Fallback Service Flow (Batch Processing)
 
-1. **Receive**: Batch request with multiple audio files (multipart upload)
+1. **Receive**: Batch request with audio files or PCM (`.npy`) payloads (multipart upload)
 
-2. **Process Sequentially** (librosa is CPU-heavy, limited concurrency):
+2. **Process Concurrently** (librosa is CPU-heavy, limited concurrency):
    - For each file:
-     - **Load from Memory**: Read file content into memory, use `BytesIO` for librosa
-     - **Direct Decoding**: librosa decodes MP3/AAC directly from memory (no disk I/O)
+     - **Load**:
+       - For audio files: stream to `/tmp`, decode via Essentia MonoLoader when available (fallback to librosa)
+       - For PCM payloads: load `.npy` bytes directly
      - **HPSS**: Apply Harmonic-Percussive Source Separation:
        - **Percussive component**: Used for BPM detection (if requested)
        - **Harmonic component**: Used for key detection (if requested)
      - **BPM Extraction** (if `process_bpm=True`):
        - Use `librosa.beat.beat_track()` on percussive component
-       - Calculate confidence from beat consistency (capped at 0.85)
+       - Calculate confidence from beat consistency (0.0-1.0 range)
      - **Key Extraction** (if `process_key=True`):
        - Use `librosa.feature.chroma_cqt()` on harmonic component (improved stability)
        - Apply Krumhansl-Schmuckler algorithm with low-energy frame dropping
@@ -1046,7 +1013,7 @@ The services implement several optimizations to reduce cold start time and impro
 ### Fallback Service (Librosa)
 
 **BPM Extraction:**
-- **librosa.beat.beat_track()**: No built-in confidence. Custom confidence calculated from beat consistency (coefficient of variation), capped at 0.85.
+- **librosa.beat.beat_track()**: No built-in confidence. Custom confidence calculated from beat consistency (coefficient of variation), 0.0-1.0 range.
 
 **Key Detection:**
 - **librosa.feature.chroma_cqt() + Krumhansl-Schmuckler**: Uses chroma_cqt for improved stability, drops low-energy frames, then applies Krumhansl-Schmuckler template matching. Correlation values (-1 to 1) normalized to 0-1 using `(corr + 1) / 2`.
@@ -1058,7 +1025,7 @@ The service normalizes confidence values from different algorithms to a consiste
 - **Essentia RhythmExtractor2013(method="multifeature")**: Confidence range 0-5.32, normalized by dividing by 5.32 (values > 5.32 clamped to 1.0)
   - Quality levels are determined from raw confidence before normalization
 - **Essentia KeyExtractor**: Strength values (typically 0-1 range), used as-is if already 0-1, otherwise clamped to [0, 1]
-- **Librosa beat_track**: Custom confidence calculation from beat consistency (already 0-1, capped at 0.85)
+- **Librosa beat_track**: Custom confidence calculation from beat consistency (already 0-1)
 - **Krumhansl-Schmuckler**: Uses chroma_cqt for improved stability, drops low-energy frames, then correlates with key templates. Correlation values (-1 to 1) normalized to 0-1 using `(corr + 1) / 2`
 
 ## Security Notes
@@ -1131,11 +1098,13 @@ For optimal batch processing performance:
 
 If the fallback service is not being triggered when expected:
 
-1. **Check confidence threshold**: The `max_confidence` parameter (default: 0.65) controls when fallback is triggered. Lower values trigger fallback more often.
-2. **Verify fallback URL**: Ensure `FALLBACK_SERVICE_URL` in `main.py` matches the deployed fallback service URL
-3. **Check authentication**: The primary service needs permission to call the fallback service. Ensure the primary service's default Cloud Run service account has `roles/run.invoker` permission on the fallback service
-4. **Check debug_info**: The `debug_info` field in the response will indicate if fallback was triggered and any errors encountered
-5. **Per-worker fallback**: Each worker task independently calls fallback service when needed (not batched across workers)
+1. **Check `fallback_override` parameter**: If `fallback_override` is set to `"never"`, the fallback service will not be triggered regardless of confidence levels.
+2. **Check confidence threshold**: The `max_confidence` parameter (default: 0.65) controls when fallback is triggered. Lower values trigger fallback more often.
+3. **Verify fallback URL**: Ensure `FALLBACK_SERVICE_URL` in `shared_processing.py` matches the deployed fallback service URL
+4. **Check authentication**: The worker service needs permission to call the fallback service. Ensure the worker's default Cloud Run service account has `roles/run.invoker` permission on the fallback service
+5. **Check debug_txt**: The `debug_txt` field in the response will indicate if fallback was triggered and any errors encountered
+6. **Circuit breaker**: If the fallback service is unhealthy, calls may be skipped until the breaker resets
+7. **Per-worker fallback**: Each worker task independently calls fallback service when needed (not batched across workers)
 
 ### Fallback service authentication errors
 
@@ -1144,11 +1113,11 @@ If you see authentication errors when the fallback is triggered:
 ```bash
 PROJECT_ID="your-project-id"
 REGION="your-region"
-PRIMARY_SERVICE="bpm-service"
+WORKER_SERVICE="bpm-worker"
 FALLBACK_SERVICE="bpm-fallback-service"
 
-# Get the primary service's service account
-PRIMARY_SA=$(gcloud run services describe ${PRIMARY_SERVICE} \
+# Get the worker service's service account
+WORKER_SA=$(gcloud run services describe ${WORKER_SERVICE} \
     --region=${REGION} \
     --format="value(spec.template.spec.serviceAccountName)" \
     --project=${PROJECT_ID})
@@ -1156,7 +1125,7 @@ PRIMARY_SA=$(gcloud run services describe ${PRIMARY_SERVICE} \
 # Grant invoker permission
 gcloud run services add-iam-policy-binding ${FALLBACK_SERVICE} \
     --region=${REGION} \
-    --member="serviceAccount:${PRIMARY_SA}" \
+    --member="serviceAccount:${WORKER_SA}" \
     --role="roles/run.invoker" \
     --project=${PROJECT_ID}
 ```

@@ -34,15 +34,32 @@ FALLBACK_REQUEST_TIMEOUT_WARM = 60.0
 FALLBACK_MAX_RETRIES = 3
 FALLBACK_RETRY_DELAY = 2.0
 
+# Essentia Configuration
+ESSENTIA_MAX_CONFIDENCE_RAW = 5.32
+
+# BPM Normalization thresholds
+BPM_LOWER_THRESHOLD = 40
+BPM_UPPER_THRESHOLD = 220
+
 
 class FallbackCircuitBreaker:
     """Simple circuit breaker for fallback service calls."""
     def __init__(self, failure_threshold=5, recovery_timeout=60):
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
+        """
+        Initializes the FallbackCircuitBreaker.
+        
+        Args:
+            failure_threshold (int): Number of consecutive failures before the circuit opens.
+                                     Can be overridden by FALLBACK_FAILURE_THRESHOLD environment variable.
+            recovery_timeout (int): Time in seconds before a half-open state is attempted.
+                                    Can be overridden by FALLBACK_RECOVERY_TIMEOUT environment variable.
+        """
+        self.failure_threshold = int(os.getenv("FALLBACK_FAILURE_THRESHOLD", failure_threshold))
+        self.recovery_timeout = int(os.getenv("FALLBACK_RECOVERY_TIMEOUT", recovery_timeout))
         self.failure_count = 0
         self.last_failure_time = None
         self.state = "closed"
+    
     
     def record_success(self):
         self.failure_count = 0
@@ -147,7 +164,6 @@ def normalize_confidence(confidence: float) -> Tuple[float, str]:
     if confidence < 0:
         return 0.0, "very low"
     
-    MAX_CONFIDENCE = 5.32
     if confidence < 1.0:
         quality = "very low"
     elif confidence < 2.0:
@@ -159,16 +175,16 @@ def normalize_confidence(confidence: float) -> Tuple[float, str]:
     else:
         quality = "excellent"
     
-    normalized = min(1.0, confidence / MAX_CONFIDENCE)
+    normalized = min(1.0, confidence / ESSENTIA_MAX_CONFIDENCE_RAW)
     return float(normalized), quality
 
 
 def normalize_bpm(bpm: float) -> float:
     """Normalize BPM by applying corrections for extreme outliers."""
     normalized = bpm
-    if normalized < 40:
+    if normalized < BPM_LOWER_THRESHOLD:
         normalized *= 2
-    elif normalized > 220:
+    elif normalized > BPM_UPPER_THRESHOLD:
         normalized /= 2
     return normalized
 

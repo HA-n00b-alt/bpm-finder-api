@@ -149,9 +149,23 @@ async def process_single_url_task(
     url: str,
     index: int,
     max_confidence: float,
-    debug_level: str
+    debug_level: str,
+    fallback_override: Optional[str],
 ):
-    """Process a single URL and write result to Firestore."""
+    """Process a single URL and write result to Firestore.
+    
+    Args:
+        batch_id (str): The ID of the batch this URL belongs to.
+        url (str): The URL of the audio file to process.
+        index (int): The index of the URL within the batch.
+        max_confidence (float): The confidence threshold for fallback.
+        debug_level (str): The verbosity level for debug output.
+        fallback_override (Optional[str]): Overrides fallback logic. Possible values:
+            "never": Never use the fallback service.
+            "always": Always use the fallback service for both BPM and key.
+            "bpm_only": Force BPM fallback.
+            "key_only": Force key fallback.
+    """
     batch_ref = db.collection('batches').document(batch_id)
     
     print(f"[{batch_id}:{index}] Starting processing: {url[:50]}...")
@@ -242,6 +256,20 @@ async def process_single_url_task(
             debug_info_parts.append(f"Max confidence threshold: {max_confidence:.2f}")
             debug_info_parts.append("=== Analysis (Essentia) ===")
             debug_info_parts.append(analysis_debug)
+
+            # Apply fallback override logic
+            if fallback_override:
+                debug_info_parts.append(f"Applying fallback override: {fallback_override}")
+                if fallback_override == "never":
+                    need_fallback_bpm = False
+                    need_fallback_key = False
+                elif fallback_override == "always":
+                    need_fallback_bpm = True
+                    need_fallback_key = True
+                elif fallback_override == "bpm_only":
+                    need_fallback_bpm = True
+                elif fallback_override == "key_only":
+                    need_fallback_key = True
             
             print(f"[{batch_id}:{index}] Analysis complete ({timing['essentia_duration']:.2f}s)")
             print(f"[{batch_id}:{index}] BPM: {bpm_normalized}, Key: {key} {scale}")
@@ -715,6 +743,7 @@ async def process_pubsub_message(request: Request):
         index = message_data.get('index')
         max_confidence = message_data.get('max_confidence', 0.65)
         debug_level = message_data.get('debug_level', 'normal')
+        fallback_override = message_data.get('fallback_override')
         
         if not all([batch_id, url, index is not None]):
             raise HTTPException(status_code=400, detail="Missing required fields")
@@ -734,7 +763,8 @@ async def process_pubsub_message(request: Request):
                 url,
                 index,
                 max_confidence,
-                debug_level
+                debug_level,
+                fallback_override,
             )
             # At this point, Firestore write is complete
             print(f"[{batch_id}:{index}] Processing completed successfully, Firestore write confirmed")

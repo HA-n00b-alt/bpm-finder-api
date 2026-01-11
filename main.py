@@ -153,6 +153,7 @@ class BatchBPMRequest(BaseModel):
     urls: List[HttpUrl]
     max_confidence: Optional[float] = 0.65
     debug_level: Optional[str] = "normal"  # "minimal", "normal", "detailed"
+    fallback_override: Optional[str] = None  # "never": no fallback; "always": force both BPM/key fallback; "bpm_only": force BPM fallback; "key_only": force key fallback
 
     @field_validator("urls")
     @classmethod
@@ -180,6 +181,16 @@ class BatchBPMRequest(BaseModel):
         """Validate debug_level is a valid option."""
         if v not in ["minimal", "normal", "detailed"]:
             raise ValueError("debug_level must be one of: minimal, normal, detailed")
+        return v
+    
+    @field_validator("fallback_override")
+    @classmethod
+    def validate_fallback_override(cls, v):
+        """Validate fallback_override is a valid option."""
+        if v and v not in ["never", "always", "bpm_only", "key_only"]:
+            raise ValueError(
+                "fallback_override must be one of: never, always, bpm_only, key_only"
+            )
         return v
 
 
@@ -425,6 +436,7 @@ async def analyze_batch(request: BatchBPMRequest):
     """
     max_confidence = request.max_confidence if request.max_confidence is not None else 0.65
     debug_level = request.debug_level if request.debug_level else "normal"
+    fallback_override = request.fallback_override
     
     # Generate batch_id
     batch_id = str(uuid.uuid4())
@@ -448,7 +460,8 @@ async def analyze_batch(request: BatchBPMRequest):
             'url': str(url),
             'index': index,
             'max_confidence': max_confidence,
-            'debug_level': debug_level
+            'debug_level': debug_level,
+            'fallback_override': fallback_override,
         }
         message_bytes = json.dumps(message_data).encode('utf-8')
         
