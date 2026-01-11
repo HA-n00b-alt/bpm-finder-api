@@ -535,7 +535,8 @@ Submit batch for async processing: publishes tasks to Pub/Sub and returns `batch
     "https://audio-ssl.itunes.apple.com/..."
   ],
   "max_confidence": 0.65,
-  "debug_level": "normal"
+  "debug_level": "normal",
+  "fallback_override": "bpm_only"
 }
 ```
 
