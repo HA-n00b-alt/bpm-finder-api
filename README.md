@@ -549,8 +549,8 @@ Submit batch for async processing: publishes tasks to Pub/Sub and returns `batch
 - `fallback_override` (optional, default: `null`): Overrides the default fallback logic.
   - `"never"`: Never use the fallback service, even if confidence is below threshold.
   - `"always"`: Always use the fallback service for both BPM and key.
-  - `"bpm_only"`: Force the use of the fallback service for BPM only.
-  - `"key_only"`: Force the use of the fallback service for key only.
+  - `"bpm_only"`: Force BPM fallback; key fallback still follows the confidence threshold.
+  - `"key_only"`: Force key fallback; BPM fallback still follows the confidence threshold.
 
 **Response:**
 Returns immediately with batch submission details:
@@ -969,6 +969,7 @@ The services implement several optimizations to reduce cold start time and impro
    - If BPM or key confidence < `max_confidence`, call fallback for that field
    - Worker sends pre-decoded PCM (`.npy`) when available, otherwise the original file
    - Circuit breaker can skip fallback if the service is unhealthy
+   - `fallback_override` can force BPM or key fallback regardless of confidence
 5. **Write Results**: Persist to Firestore; stream updates via `/stream/{batch_id}`
 6. **Cleanup**: Delete temp files
 
