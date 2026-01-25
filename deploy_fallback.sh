@@ -110,6 +110,7 @@ if ! gcloud run deploy "${SERVICE_NAME}" \
     --max-instances 10 \
     --concurrency 2 \
     --cpu-boost \
+    --set-env-vars "PROCESS_POOL_WORKERS=3" \
     --project "${PROJECT_ID}"; then
     echo ""
     echo "❌ Error: Cloud Run deployment failed. You may need additional permissions."
@@ -190,4 +191,3 @@ echo "To test locally, run:"
 echo "  TOKEN=\$(gcloud auth print-identity-token)"
 echo "  curl -H \"Authorization: Bearer \$TOKEN\" ${SERVICE_URL}/health"
 echo ""
-

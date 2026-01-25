@@ -21,6 +21,7 @@ A Google Cloud Run microservice that computes BPM (beats per minute) and musical
 - **Normalized Confidence Scores**: All confidence values normalized to 0-1 range for consistent interpretation
 - **Comprehensive Debug Information**: Detailed debug info including method comparisons, confidence analysis, error reporting, and telemetry
 - **Telemetry**: Timing information for download, Essentia analysis, and fallback service calls
+- **Structured Logging**: JSON logs with per-request context (`request_id` / `trace_id`) for easy Cloud Logging queries
 - **Separate Results**: Response includes both Essentia and Librosa results separately (Librosa fields are null if not used)
 - **Private Cloud Run Service**: IAM authentication required for access
 - **SSRF Protection**: HTTPS-only requirement with redirect validation
@@ -80,7 +81,7 @@ The system uses an **async event-driven architecture** with three main component
 - **Pub/Sub Topic**: `bpm-analysis-tasks` - Queues individual URL processing tasks
 - **Pub/Sub Subscription**: `bpm-analysis-worker-sub` - Push subscription to worker service
 - **Firestore Collection**: `batches/{batch_id}` - Stores batch status and results
-- **Message Format**: `{batch_id, url, index, max_confidence, debug_level}`
+- **Message Format**: `{batch_id, url, index, max_confidence, debug_level, trace_id}`
 
 ### Fallback Service (`bpm-fallback-service`)
 
@@ -136,6 +137,8 @@ The fallback service configuration is in `deploy_fallback.sh`:
 - `PROJECT_ID`: Your GCP project ID (same as primary service)
 - `REGION`: Cloud Run region (default: `europe-west3`)
 - `SERVICE_NAME`: Fallback service name (default: `bpm-fallback-service`)
+- `PROCESS_POOL_WORKERS`: Process pool size for CPU-bound librosa work
+- `LOG_LEVEL`: Log level for structured JSON logs (default: `INFO`)
 
 ### Worker Service Configuration
 
@@ -144,6 +147,7 @@ Worker behavior can be tuned via environment variables:
 - `STREAM_PARTIAL_BPM_ONLY`: When `true` (default), workers emit a partial result after BPM is ready and update later with key/fallback fields.
 - `ARTIFACT_REPO`: Artifact Registry repository name (default: `bpm-repo`)
 - `ESSENTIA_MAX_CONCURRENCY`: Max thread pool workers for Essentia analysis (defaults to CPU count)
+- `LOG_LEVEL`: Log level for structured JSON logs (default: `INFO`)
 
 ### Primary Service Fallback Settings
 
@@ -157,6 +161,12 @@ Fallback configuration shared by the worker and primary services is in `shared_p
 - `FALLBACK_RETRY_DELAY`: Base retry delay (seconds)
 - `FALLBACK_FAILURE_THRESHOLD`: Consecutive failures before circuit opens
 - `FALLBACK_RECOVERY_TIMEOUT`: Seconds before half-open retry is allowed
+
+### Logging & Tracing
+
+- All services emit **structured JSON logs**.
+- `LOG_LEVEL` controls verbosity (`INFO` default; `DEBUG` for detailed timings/breakdowns).
+- API requests get an `x-request-id`; Pub/Sub items include a `trace_id` that propagates to worker and fallback logs.
 
 **Note**: The confidence threshold is now configurable per-request via the `max_confidence` parameter (default: 0.65). This allows clients to control when fallback is triggered.
 
@@ -379,8 +389,8 @@ The test script will:
 
 **Streaming Results Format (NDJSON):**
 - `{"type":"status","status":"processing","total":5,"processed":0}`
-- `{"type":"result","index":0,"status":"partial","bpm_essentia":128,"key_essentia":null,...}`
-- `{"type":"result","index":0,"status":"final","bpm_essentia":128,"key_essentia":"C",...}`
+- `{"type":"result","index":0,"trace_id":"...","status":"partial","bpm_essentia":128,"key_essentia":null,...}`
+- `{"type":"result","index":0,"trace_id":"...","status":"final","bpm_essentia":128,"key_essentia":"C",...}`
 - `{"type":"progress","processed":2,"total":5}`
 - `{"type":"complete","batch_id":"...","total":5}`
 
@@ -1040,7 +1050,7 @@ The service normalizes confidence values from different algorithms to a consiste
 - SSRF protection through HTTPS-only requirement and redirect validation
 - Download size and timeout limits
 - No audio persistence (temp files deleted immediately)
-- Minimal logging (URLs with tokens are not logged)
+- URLs in logs are elided (query strings omitted) to avoid leaking tokens
 
 ## Troubleshooting
 

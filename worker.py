@@ -10,12 +10,14 @@ import tempfile
 import httpx
 import time
 import resource
+import logging
 from typing import Optional
 from urllib.parse import urlparse
 from fastapi import FastAPI, Request, HTTPException
 from google.cloud import firestore
 from google.cloud.firestore import Increment
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -25,6 +27,7 @@ from tenacity import (
 )
 
 # Import shared processing functions
+import shared_processing
 from shared_processing import (
     download_audio_async,
     analyze_audio,
@@ -44,6 +47,9 @@ from shared_processing import (
 import numpy as np
 
 app = FastAPI(title="BPM Worker Service")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(message)s")
+logger = logging.getLogger(__name__)
+request_id_var: ContextVar[Optional[str]] = ContextVar("request_id", default=None)
 db = firestore.Client()
 PROCESS_START = time.time()
 _first_request = True
@@ -78,6 +84,19 @@ def get_http_client() -> httpx.AsyncClient:
         )
     return _http_client
 
+def format_url_for_log(url: str, max_len: int = 80) -> str:
+    """Format URL for logs: show scheme/host/path and elide long strings."""
+    parsed = urlparse(url)
+    base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    if len(base) > max_len:
+        return base[: max_len - 3] + "..."
+    if parsed.query:
+        suffix = "?..."
+        if len(base) + len(suffix) > max_len:
+            return base[: max_len - 3] + "..."
+        return base + suffix
+    return base
+
 
 def get_essentia_executor() -> ThreadPoolExecutor:
     """Get or create the ThreadPoolExecutor for Essentia."""
@@ -88,8 +107,18 @@ def get_essentia_executor() -> ThreadPoolExecutor:
     return _essentia_executor
 
 
+def log_event(level: int, message: str, **fields) -> None:
+    record = {"message": message, **fields}
+    request_id = request_id_var.get()
+    if request_id:
+        record["request_id"] = request_id
+    logger.log(level, json.dumps(record, ensure_ascii=True))
+
 def log_telemetry(message: str) -> None:
-    print(f"[TELEMETRY] {message}", flush=True)
+    log_event(logging.INFO, message, event="telemetry")
+
+def log_task(level: int, batch_id: str, index: int, message: str, **fields) -> None:
+    log_event(level, message, batch_id=batch_id, index=index, **fields)
 
 
 def get_rss_kb() -> Optional[int]:
@@ -101,14 +130,17 @@ def get_rss_kb() -> Optional[int]:
 
 @app.on_event("startup")
 async def startup_event():
-    startup_s = time.time() - PROCESS_START
-    log_telemetry(f"worker_startup_s={startup_s:.2f}")
-
-
-@app.on_event("startup")
-async def startup_event():
     """Pre-import Essentia to avoid hanging on first use."""
-    print("[STARTUP] Pre-importing Essentia to avoid cold start delay...")
+    startup_s = time.time() - PROCESS_START
+    log_telemetry(f"worker_startup_s={startup_s:.3f}")
+    log_event(logging.INFO, "Config loaded", event="startup_config", stream_partial_bpm_only=STREAM_PARTIAL_BPM_ONLY)
+    log_event(
+        logging.INFO,
+        "Config loaded",
+        event="startup_config",
+        essentia_max_concurrency=os.getenv("ESSENTIA_MAX_CONCURRENCY", "default"),
+    )
+    log_event(logging.INFO, "Pre-importing Essentia to avoid cold start delay", event="startup_essentia_preimport")
     import sys
     import time
     start = time.time()
@@ -118,18 +150,37 @@ async def startup_event():
         def preimport_essentia():
             try:
                 import essentia.standard as es
-                print(f"[STARTUP] Essentia pre-imported successfully in {time.time() - start:.2f}s")
+                log_event(
+                    logging.INFO,
+                    "Essentia pre-imported successfully",
+                    event="startup_essentia_preimport_done",
+                    duration_s=time.time() - start,
+                )
             except Exception as e:
-                print(f"[STARTUP] WARNING: Essentia pre-import failed: {str(e)}")
+                log_event(
+                    logging.WARNING,
+                    "Essentia pre-import failed",
+                    event="startup_essentia_preimport_failed",
+                    error=str(e),
+                )
         
         thread = threading.Thread(target=preimport_essentia, daemon=True)
         thread.start()
         thread.join(timeout=60)  # Wait up to 60 seconds
         if thread.is_alive():
-            print("[STARTUP] WARNING: Essentia pre-import still running after 60s, continuing anyway...")
+            log_event(
+                logging.WARNING,
+                "Essentia pre-import still running after 60s, continuing",
+                event="startup_essentia_preimport_timeout",
+            )
     except Exception as e:
-        print(f"[STARTUP] ERROR during Essentia pre-import: {str(e)}")
-    print("[STARTUP] Startup complete")
+        log_event(
+            logging.ERROR,
+            "Error during Essentia pre-import",
+            event="startup_essentia_preimport_error",
+            error=str(e),
+        )
+    log_event(logging.INFO, "Startup complete", event="startup_complete")
 
 
 @app.on_event("shutdown")
@@ -151,6 +202,7 @@ async def process_single_url_task(
     max_confidence: float,
     debug_level: str,
     fallback_override: Optional[str],
+    trace_id: Optional[str],
 ):
     """Process a single URL and write result to Firestore.
 
@@ -170,8 +222,20 @@ async def process_single_url_task(
             "fallback_only_key": Skip Essentia key, use ONLY fallback for key (but run Essentia for BPM).
     """
     batch_ref = db.collection('batches').document(batch_id)
-    
-    print(f"[{batch_id}:{index}] Starting processing: {url[:50]}...")
+
+    trace_tag = trace_id or "unknown"
+    log_task(
+        logging.INFO,
+        batch_id,
+        index,
+        "Starting processing",
+        event="task_start",
+        trace_id=trace_tag,
+        url=format_url_for_log(url),
+        max_confidence=max_confidence,
+        debug_level=debug_level,
+        fallback_override=fallback_override,
+    )
     
     input_path = None
     debug_info_parts = []
@@ -193,7 +257,7 @@ async def process_single_url_task(
         
         # Download audio
         try:
-            print(f"[{batch_id}:{index}] Downloading...")
+            log_task(logging.INFO, batch_id, index, "Downloading", event="download_start", trace_id=trace_tag)
             timing["download_start"] = time.time()
             client = get_http_client()
             await download_audio_async(url, input_path, client)
@@ -201,16 +265,32 @@ async def process_single_url_task(
             timing["download_duration"] = timing["download_end"] - timing["download_start"]
             download_bytes = os.path.getsize(input_path) if os.path.exists(input_path) else 0
             log_telemetry(
-                f"worker_download_s={timing['download_duration']:.2f} "
+                f"worker_download_s={timing['download_duration']:.3f} "
                 f"bytes={download_bytes} "
-                f"batch_id={batch_id} index={index}"
+                f"batch_id={batch_id} index={index} trace_id={trace_tag}"
             )
-            debug_info_parts.append(f"URL fetch: SUCCESS ({url[:50]}...)")
-            print(f"[{batch_id}:{index}] Download complete ({timing['download_duration']:.2f}s)")
+            debug_info_parts.append(f"URL fetch: SUCCESS ({format_url_for_log(url)})")
+            log_task(
+                logging.INFO,
+                batch_id,
+                index,
+                "Download complete",
+                event="download_complete",
+                trace_id=trace_tag,
+                duration_s=timing["download_duration"],
+            )
         except Exception as e:
             error_msg = f"URL fetch error: {str(e)}"
             debug_info_parts.append(error_msg)
-            print(f"[{batch_id}:{index}] Download failed: {str(e)}")
+            log_task(
+                logging.ERROR,
+                batch_id,
+                index,
+                "Download failed",
+                event="download_failed",
+                trace_id=trace_tag,
+                error=str(e),
+            )
             raise
 
         # Check if we should skip Essentia entirely (fallback_only modes)
@@ -238,7 +318,17 @@ async def process_single_url_task(
 
         # Analyze audio (or skip if fallback_only)
         if skip_essentia:
-            print(f"[{batch_id}:{index}] Skipping Essentia analysis (fallback_only mode: {fallback_override})")
+            log_task(
+                logging.INFO,
+                batch_id,
+                index,
+                "Skipping Essentia",
+                event="essentia_skip",
+                trace_id=trace_tag,
+                fallback_override=fallback_override,
+                skip_bpm=skip_essentia_bpm,
+                skip_key=skip_essentia_key,
+            )
             debug_info_parts.append(f"Max confidence threshold: {max_confidence:.2f}")
             debug_info_parts.append(f"Fallback override: {fallback_override}")
             debug_info_parts.append("=== Essentia Analysis ===")
@@ -253,11 +343,29 @@ async def process_single_url_task(
                 debug_info_parts.append("Key: Will use fallback only")
         else:
             try:
-                print(f"[{batch_id}:{index}] Analyzing...")
-                print(f"[{batch_id}:{index}] Input file exists: {os.path.exists(input_path)}, size: {os.path.getsize(input_path) if os.path.exists(input_path) else 0} bytes")
+                log_task(logging.INFO, batch_id, index, "Analyzing", event="analysis_start", trace_id=trace_tag)
+                log_task(
+                    logging.DEBUG,
+                    batch_id,
+                    index,
+                    "Input file info",
+                    event="analysis_input_info",
+                    trace_id=trace_tag,
+                    exists=os.path.exists(input_path),
+                    size_bytes=os.path.getsize(input_path) if os.path.exists(input_path) else 0,
+                )
                 timing["essentia_start"] = time.time()
 
-                print(f"[{batch_id}:{index}] Submitting to executor (max_workers: {executor._max_workers if hasattr(executor, '_max_workers') else 'unknown'})...", flush=True)
+                log_task(
+                    logging.DEBUG,
+                    batch_id,
+                    index,
+                    "Submitting to executor",
+                    event="executor_submit",
+                    trace_id=trace_tag,
+                    max_workers=executor._max_workers,
+                    active_threads=len(getattr(executor, "_threads", [])) if hasattr(executor, "_threads") else "unknown",
+                )
 
                 try:
                     result = await loop.run_in_executor(
@@ -268,7 +376,7 @@ async def process_single_url_task(
                         True,
                         not STREAM_PARTIAL_BPM_ONLY
                     )
-                    print(f"[{batch_id}:{index}] Executor returned, unpacking result...", flush=True)
+                    log_task(logging.DEBUG, batch_id, index, "Executor returned", event="executor_return", trace_id=trace_tag)
                     (
                         bpm_normalized, bpm_raw, bpm_confidence_normalized, bpm_quality, bpm_method,
                         key, scale, key_strength_raw, key_confidence_normalized,
@@ -277,19 +385,36 @@ async def process_single_url_task(
                         audio_pcm,
                         sample_rate
                     ) = result
-                    print(f"[{batch_id}:{index}] Result unpacked: BPM={bpm_normalized}, Key={key}", flush=True)
+                    log_task(
+                        logging.DEBUG,
+                        batch_id,
+                        index,
+                        "Result unpacked",
+                        event="analysis_result_unpack",
+                        trace_id=trace_tag,
+                        bpm=bpm_normalized,
+                        key=key,
+                    )
                 except Exception as e:
                     import traceback
                     error_details = f"Executor error: {str(e)}\n{traceback.format_exc()}"
-                    print(f"[{batch_id}:{index}] ERROR in executor: {error_details}", flush=True)
+                    log_task(
+                        logging.ERROR,
+                        batch_id,
+                        index,
+                        "Executor error",
+                        event="executor_error",
+                        trace_id=trace_tag,
+                        error=error_details,
+                    )
                     raise
 
-                print(f"[{batch_id}:{index}] Executor returned successfully", flush=True)
+                log_task(logging.DEBUG, batch_id, index, "Executor completed", event="executor_done", trace_id=trace_tag)
                 timing["essentia_end"] = time.time()
                 timing["essentia_duration"] = timing["essentia_end"] - timing["essentia_start"]
                 log_telemetry(
-                    f"worker_essentia_s={timing['essentia_duration']:.2f} "
-                    f"batch_id={batch_id} index={index}"
+                    f"worker_essentia_s={timing['essentia_duration']:.3f} "
+                    f"batch_id={batch_id} index={index} trace_id={trace_tag}"
                 )
 
                 debug_info_parts.append(f"Max confidence threshold: {max_confidence:.2f}")
@@ -310,15 +435,34 @@ async def process_single_url_task(
                     elif fallback_override == "key_only":
                         need_fallback_key = True
 
-                print(f"[{batch_id}:{index}] Analysis complete ({timing['essentia_duration']:.2f}s)")
-                print(f"[{batch_id}:{index}] BPM: {bpm_normalized}, Key: {key} {scale}")
-                print(f"[{batch_id}:{index}] Fallback needed - BPM: {need_fallback_bpm}, Key: {need_fallback_key}")
+                log_task(
+                    logging.INFO,
+                    batch_id,
+                    index,
+                    "Analysis complete",
+                    event="analysis_complete",
+                    trace_id=trace_tag,
+                    duration_s=timing["essentia_duration"],
+                    bpm=bpm_normalized,
+                    key=key,
+                    scale=scale,
+                    need_fallback_bpm=need_fallback_bpm,
+                    need_fallback_key=need_fallback_key,
+                )
 
             except Exception as e:
                 error_msg = f"Analysis error: {str(e)}"
                 import traceback
                 full_error = f"{error_msg}\n{traceback.format_exc()}"
-                print(f"[{batch_id}:{index}] Analysis failed: {full_error}")
+                log_task(
+                    logging.ERROR,
+                    batch_id,
+                    index,
+                    "Analysis failed",
+                    event="analysis_failed",
+                    trace_id=trace_tag,
+                    error=full_error,
+                )
                 debug_info_parts.append(error_msg)
                 raise
         
@@ -334,6 +478,7 @@ async def process_single_url_task(
         firestore_result = {
             "index": index,
             "url": url,
+            "trace_id": trace_tag,
             "bpm_essentia": int(round(bpm_normalized)) if bpm_normalized is not None else None,
             "bpm_raw_essentia": round(bpm_raw, 2) if bpm_raw is not None else None,
             "bpm_confidence_essentia": round(bpm_confidence_normalized, 2) if bpm_confidence_normalized is not None else None,
@@ -365,6 +510,15 @@ async def process_single_url_task(
                 debug_level
             )
             firestore_result["debug_txt"] = partial_debug_txt if partial_debug_txt else None
+
+            log_task(
+                logging.INFO,
+                batch_id,
+                index,
+                "Writing partial result",
+                event="firestore_partial_write",
+                trace_id=trace_tag,
+            )
 
             @retry(
                 stop=stop_after_attempt(5),
@@ -401,7 +555,6 @@ async def process_single_url_task(
         if STREAM_PARTIAL_BPM_ONLY:
             if audio_pcm is None:
                 debug_info_parts.append("Key skipped (no audio)")
-                need_fallback_key = False
             else:
                 key_result = await loop.run_in_executor(
                     executor,
@@ -440,6 +593,15 @@ async def process_single_url_task(
                     )
                     firestore_result["debug_txt"] = key_partial_debug_txt if key_partial_debug_txt else None
 
+                    log_task(
+                        logging.INFO,
+                        batch_id,
+                        index,
+                        "Writing partial result",
+                        event="firestore_partial_write",
+                        trace_id=trace_tag,
+                    )
+
                     @retry(
                         stop=stop_after_attempt(5),
                         wait=wait_exponential(multiplier=1, min=1, max=30),
@@ -470,16 +632,36 @@ async def process_single_url_task(
                         return update_in_transaction(transaction)
 
                     await loop.run_in_executor(None, update_key_partial_result)
-                    print(f"[{batch_id}:{index}] Key partial result written (key ready, fallback pending)")
+                    log_task(
+                        logging.INFO,
+                        batch_id,
+                        index,
+                        "Key partial result written",
+                        event="firestore_key_partial_written",
+                        trace_id=trace_tag,
+                    )
 
         # Handle fallback if needed
         fallback_timing = None
         if need_fallback_bpm or need_fallback_key:
-            print(f"[{batch_id}:{index}] Calling fallback service...")
+            log_task(
+                logging.INFO,
+                batch_id,
+                index,
+                "Calling fallback service",
+                event="fallback_call",
+                trace_id=trace_tag,
+                need_bpm=need_fallback_bpm,
+                need_key=need_fallback_key,
+                audio_format="pcm_npy" if audio_pcm is not None else "file",
+            )
             fallback_start = time.time()
             fallback_result = await call_fallback_service(
                 input_path,
                 url,
+                batch_id,
+                index,
+                trace_tag,
                 need_fallback_bpm,
                 need_fallback_key,
                 max_confidence,
@@ -492,7 +674,15 @@ async def process_single_url_task(
             fallback_timing = {"duration": fallback_duration}
             
             if fallback_result:
-                print(f"[{batch_id}:{index}] Fallback complete ({fallback_duration:.2f}s)")
+                log_task(
+                    logging.INFO,
+                    batch_id,
+                    index,
+                    "Fallback complete",
+                    event="fallback_complete",
+                    trace_id=trace_tag,
+                    duration_s=fallback_duration,
+                )
                 if need_fallback_bpm and fallback_result.get("bpm_normalized") is not None:
                     firestore_result["bpm_librosa"] = int(round(fallback_result["bpm_normalized"]))
                     firestore_result["bpm_raw_librosa"] = round(fallback_result["bpm_raw"], 2) if fallback_result.get("bpm_raw") else None
@@ -503,7 +693,15 @@ async def process_single_url_task(
                     firestore_result["scale_librosa"] = fallback_result["scale"]
                     firestore_result["keyscale_confidence_librosa"] = round(fallback_result["key_confidence"], 2) if fallback_result.get("key_confidence") else None
             else:
-                print(f"[{batch_id}:{index}] Fallback failed or skipped ({fallback_duration:.2f}s)")
+                log_task(
+                    logging.WARNING,
+                    batch_id,
+                    index,
+                    "Fallback failed or skipped",
+                    event="fallback_failed",
+                    trace_id=trace_tag,
+                    duration_s=fallback_duration,
+                )
         
         # Generate debug output for final result
         debug_txt = generate_debug_output(
@@ -516,8 +714,16 @@ async def process_single_url_task(
         firestore_result["status"] = "final"
         
         # Write result to Firestore with idempotency check (using transaction)
-        print(f"[{batch_id}:{index}] Writing to Firestore...", flush=True)
-        print(f"[{batch_id}:{index}] Result data: BPM={firestore_result.get('bpm_essentia')}, Key={firestore_result.get('key_essentia')}", flush=True)
+        log_task(
+            logging.INFO,
+            batch_id,
+            index,
+            "Writing final result",
+            event="firestore_write_start",
+            trace_id=trace_tag,
+            bpm=firestore_result.get("bpm_essentia"),
+            key=firestore_result.get("key_essentia"),
+        )
         loop = asyncio.get_event_loop()
         
         @retry(
@@ -533,7 +739,14 @@ async def process_single_url_task(
             Retries up to 5 times with exponential backoff (1s, 2s, 4s, 8s, 16s, max 30s).
             """
             try:
-                print(f"[{batch_id}:{index}] [FIRESTORE] Starting idempotent update...", flush=True)
+                log_task(
+                    logging.DEBUG,
+                    batch_id,
+                    index,
+                    "Starting idempotent update",
+                    event="firestore_idempotent_update_start",
+                    trace_id=trace_tag,
+                )
                 
                 # Use a transaction to ensure idempotency
                 transaction = db.transaction()
@@ -550,7 +763,14 @@ async def process_single_url_task(
                     # Check if this index was already finalized (idempotency check)
                     existing = results.get(str(index))
                     if existing and existing.get("status") in ("final", "error"):
-                        print(f"[{batch_id}:{index}] [FIRESTORE] Index {index} already finalized, skipping increment", flush=True)
+                        log_task(
+                            logging.DEBUG,
+                            batch_id,
+                            index,
+                            "Index already finalized, skipping increment",
+                            event="firestore_idempotent_skip",
+                            trace_id=trace_tag,
+                        )
                         return False  # Already finalized
                     
                     # Update with transaction
@@ -561,18 +781,48 @@ async def process_single_url_task(
                     return True  # Newly processed
                 
                 was_new = update_in_transaction(transaction)
-                print(f"[{batch_id}:{index}] [FIRESTORE] Transaction completed (new: {was_new})", flush=True)
-                print(f"[{batch_id}:{index}] Firestore write successful", flush=True)
+                log_task(
+                    logging.INFO,
+                    batch_id,
+                    index,
+                    "Firestore transaction completed",
+                    event="firestore_transaction_complete",
+                    trace_id=trace_tag,
+                    is_new=was_new,
+                )
                 return was_new
             except Exception as e:
                 import traceback
                 error_details = f"{str(e)}\n{traceback.format_exc()}"
-                print(f"[{batch_id}:{index}] Firestore write error (will retry): {error_details}", flush=True)
+                log_task(
+                    logging.ERROR,
+                    batch_id,
+                    index,
+                    "Firestore write error (will retry)",
+                    event="firestore_write_error",
+                    trace_id=trace_tag,
+                    error=error_details,
+                )
                 raise
         
-        print(f"[{batch_id}:{index}] Submitting Firestore update to executor...", flush=True)
+        log_task(
+            logging.DEBUG,
+            batch_id,
+            index,
+            "Submitting Firestore update to executor",
+            event="firestore_executor_submit",
+            trace_id=trace_tag,
+        )
         was_new = await loop.run_in_executor(None, update_result_idempotent)
-        print(f"[{batch_id}:{index}] Firestore update executor returned (was_new: {was_new})", flush=True)
+        log_task(
+            logging.DEBUG,
+            batch_id,
+            index,
+            "Firestore update executor returned",
+            event="firestore_executor_return",
+            trace_id=trace_tag,
+            is_new=was_new,
+        )
         
         # Check if batch is complete (only if this was a new result)
         if was_new:
@@ -581,7 +831,14 @@ async def process_single_url_task(
                 batch_data = batch_doc.to_dict()
                 processed_count = batch_data.get('processed', 0)
                 total_urls = batch_data.get('total_urls', 0)
-                print(f"[{batch_id}] Progress: {processed_count}/{total_urls}")
+                log_event(
+                    logging.INFO,
+                    "Batch progress",
+                    event="batch_progress",
+                    batch_id=batch_id,
+                    processed=processed_count,
+                    total=total_urls,
+                )
                 
                 if processed_count >= total_urls:
                     @retry(
@@ -598,15 +855,23 @@ async def process_single_url_task(
                         """
                         batch_ref.update({'status': 'completed'})
                     await loop.run_in_executor(None, update_status)
-                    print(f"[{batch_id}] Batch completed!")
+                    log_event(logging.INFO, "Batch completed", event="batch_completed", batch_id=batch_id)
         
-        print(f"[{batch_id}:{index}] Task complete ✓")
+        log_task(logging.INFO, batch_id, index, "Task complete", event="task_complete", trace_id=trace_tag)
         
     except Exception as e:
         # Write error to Firestore
         import traceback
         error_details = f"{str(e)}\n{traceback.format_exc()}"
-        print(f"[{batch_id}:{index}] ERROR: {error_details[:500]}")
+        log_task(
+            logging.ERROR,
+            batch_id,
+            index,
+            "Task error",
+            event="task_error",
+            trace_id=trace_tag,
+            error=error_details,
+        )
         
         loop = asyncio.get_event_loop()
         error_result = {
@@ -634,7 +899,15 @@ async def process_single_url_task(
                     'processed': Increment(1)
                 })
             except Exception as update_err:
-                print(f"[{batch_id}:{index}] Failed to write error (will retry): {str(update_err)}")
+                log_task(
+                    logging.ERROR,
+                    batch_id,
+                    index,
+                    "Failed to write error (will retry)",
+                    event="firestore_error_write_failed",
+                    trace_id=trace_tag,
+                    error=str(update_err),
+                )
                 raise
         
         await loop.run_in_executor(None, update_error)
@@ -664,7 +937,14 @@ async def process_single_url_task(
         if input_path and os.path.exists(input_path):
             try:
                 os.unlink(input_path)
-                print(f"[{batch_id}:{index}] Temp file cleaned up")
+                log_task(
+                    logging.DEBUG,
+                    batch_id,
+                    index,
+                    "Temp file cleaned up",
+                    event="temp_cleanup",
+                    trace_id=trace_tag,
+                )
             except Exception:
                 pass
 
@@ -672,6 +952,9 @@ async def process_single_url_task(
 async def call_fallback_service(
     file_path: str,
     url: str,
+    batch_id: str,
+    index: int,
+    trace_id: str,
     need_fallback_bpm: bool,
     need_fallback_key: bool,
     max_confidence: float,
@@ -690,7 +973,23 @@ async def call_fallback_service(
         
         # Check circuit breaker
         if not fallback_circuit_breaker.can_attempt():
-            print(f"Circuit breaker open, skipping fallback")
+            last_failure_age = (
+                time.time() - fallback_circuit_breaker.last_failure_time
+                if fallback_circuit_breaker.last_failure_time
+                else None
+            )
+            last_failure_display = f"{last_failure_age:.1f}s ago" if last_failure_age is not None else "unknown"
+            log_task(
+                logging.WARNING,
+                batch_id,
+                index,
+                "Circuit breaker open - skipping fallback",
+                event="circuit_breaker_open",
+                trace_id=trace_id,
+                failures=fallback_circuit_breaker.failure_count,
+                failure_threshold=fallback_circuit_breaker.failure_threshold,
+                last_failure=last_failure_display,
+            )
             return None
         
         files = []
@@ -717,11 +1016,13 @@ async def call_fallback_service(
             "process_bpm_0": str(need_fallback_bpm).lower(),
             "process_key_0": str(need_fallback_key).lower(),
             "url_0": url,
+            "trace_id_0": trace_id,
             "sample_rate_0": str(int(sample_rate)) if sample_rate else "44100"
         }
         log_telemetry(
             f"worker_fallback_payload type={payload_type} bytes={payload_bytes} "
-            f"sr={int(sample_rate) if sample_rate else 44100}"
+            f"sr={int(sample_rate) if sample_rate else 44100} "
+            f"trace_id={trace_id}"
         )
         
         # Retry logic
@@ -739,7 +1040,18 @@ async def call_fallback_service(
                 )
                 
                 attempt_start = time.time()
-                print(f"Fallback attempt {attempt + 1}/{FALLBACK_MAX_RETRIES}")
+                log_task(
+                    logging.INFO,
+                    batch_id,
+                    index,
+                    "Fallback attempt",
+                    event="fallback_attempt",
+                    trace_id=trace_id,
+                    attempt=attempt + 1,
+                    max_attempts=FALLBACK_MAX_RETRIES,
+                    timeout_s=request_timeout,
+                    cold_start=attempt == 0,
+                )
                 response = await client.post(
                     f"{FALLBACK_SERVICE_URL}/process_batch",
                     files=files,
@@ -749,7 +1061,7 @@ async def call_fallback_service(
                 )
                 attempt_s = time.time() - attempt_start
                 log_telemetry(
-                    f"worker_fallback_attempt_s={attempt_s:.2f} "
+                    f"worker_fallback_attempt_s={attempt_s:.3f} "
                     f"status={response.status_code} attempt={attempt + 1}"
                 )
                 
@@ -759,26 +1071,58 @@ async def call_fallback_service(
                         fallback_circuit_breaker.record_success()
                         return fallback_results[0]
                 
-                print(f"Fallback failed with status {response.status_code}")
+                log_task(
+                    logging.WARNING,
+                    batch_id,
+                    index,
+                    "Fallback failed with status",
+                    event="fallback_http_error",
+                    trace_id=trace_id,
+                    status_code=response.status_code,
+                )
                 fallback_circuit_breaker.record_failure()
                 return None
                 
             except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as e:
-                print(f"Fallback network error: {str(e)}")
+                log_task(
+                    logging.ERROR,
+                    batch_id,
+                    index,
+                    "Fallback network error",
+                    event="fallback_network_error",
+                    trace_id=trace_id,
+                    error=str(e),
+                )
                 if attempt < FALLBACK_MAX_RETRIES - 1:
                     await asyncio.sleep(FALLBACK_RETRY_DELAY * (2 ** attempt))
                 else:
                     fallback_circuit_breaker.record_failure()
                     return None
             except Exception as e:
-                print(f"Fallback error: {str(e)}")
+                log_task(
+                    logging.ERROR,
+                    batch_id,
+                    index,
+                    "Fallback error",
+                    event="fallback_error",
+                    trace_id=trace_id,
+                    error=str(e),
+                )
                 fallback_circuit_breaker.record_failure()
                 return None
         
         return None
         
     except Exception as e:
-        print(f"Fallback service error: {str(e)}")
+        log_task(
+            logging.ERROR,
+            batch_id,
+            index,
+            "Fallback service error",
+            event="fallback_service_error",
+            trace_id=trace_id,
+            error=str(e),
+        )
         return None
     finally:
         if file_handle:
@@ -807,6 +1151,8 @@ async def process_pubsub_message(request: Request):
     global _first_request
     request_start = time.time()
     cold_start = False
+    request_token = None
+    shared_token = None
     if _first_request:
         cold_start = True
         _first_request = False
@@ -830,11 +1176,26 @@ async def process_pubsub_message(request: Request):
         max_confidence = message_data.get('max_confidence', 0.65)
         debug_level = message_data.get('debug_level', 'normal')
         fallback_override = message_data.get('fallback_override')
+        trace_id = message_data.get('trace_id')
         
         if not all([batch_id, url, index is not None]):
             raise HTTPException(status_code=400, detail="Missing required fields")
         
-        print(f"[{batch_id}:{index}] Received Pub/Sub message, processing SYNCHRONOUSLY (no background tasks)...")
+        trace_tag = trace_id or "unknown"
+        request_token = request_id_var.set(trace_tag)
+        shared_token = None
+        try:
+            shared_token = shared_processing.request_id_var.set(trace_tag)
+        except Exception:
+            shared_token = None
+        log_task(
+            logging.INFO,
+            batch_id,
+            index,
+            "Received Pub/Sub message, processing synchronously",
+            event="pubsub_received",
+            trace_id=trace_tag,
+        )
         
         # CRITICAL: Process synchronously - await completion before returning ANY status code
         # process_single_url_task waits for:
@@ -851,13 +1212,21 @@ async def process_pubsub_message(request: Request):
                 max_confidence,
                 debug_level,
                 fallback_override,
+                trace_id,
             )
             # At this point, Firestore write is complete
-            print(f"[{batch_id}:{index}] Processing completed successfully, Firestore write confirmed")
+            log_task(
+                logging.INFO,
+                batch_id,
+                index,
+                "Processing completed successfully",
+                event="pubsub_processed",
+                trace_id=trace_tag,
+            )
             request_s = time.time() - request_start
             log_telemetry(
-                f"worker_request_done_s={request_s:.2f} "
-                f"batch_id={batch_id} index={index} rss_kb={get_rss_kb()}"
+                f"worker_request_done_s={request_s:.3f} "
+                f"batch_id={batch_id} index={index} trace_id={trace_id} rss_kb={get_rss_kb()}"
             )
             # Return 204 (No Content) - Pub/Sub interprets this as successful ACK
             # We return 204 (not 200) to signal success without a body
@@ -866,11 +1235,19 @@ async def process_pubsub_message(request: Request):
         except Exception as e:
             import traceback
             error_details = f"Processing failed: {str(e)}\n{traceback.format_exc()}"
-            print(f"[{batch_id}:{index}] Processing failed: {error_details[:500]}")
+            log_task(
+                logging.ERROR,
+                batch_id,
+                index,
+                "Processing failed",
+                event="pubsub_processing_failed",
+                trace_id=trace_tag,
+                error=error_details,
+            )
             request_s = time.time() - request_start
             log_telemetry(
-                f"worker_request_done_s={request_s:.2f} "
-                f"batch_id={batch_id} index={index} status=error rss_kb={get_rss_kb()}"
+                f"worker_request_done_s={request_s:.3f} "
+                f"batch_id={batch_id} index={index} trace_id={trace_id} status=error rss_kb={get_rss_kb()}"
             )
             # Return 500 so Pub/Sub will retry the message
             raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
@@ -881,9 +1258,19 @@ async def process_pubsub_message(request: Request):
     except Exception as e:
         import traceback
         error_details = f"Error processing Pub/Sub: {str(e)}\n{traceback.format_exc()}"
-        print(f"Pub/Sub endpoint error: {error_details[:500]}")
+        log_event(logging.ERROR, "Pub/Sub endpoint error", event="pubsub_endpoint_error", error=error_details)
         # Return 500 so Pub/Sub will retry
         raise HTTPException(status_code=500, detail=f"Error processing message: {str(e)}")
+    finally:
+        try:
+            request_id_var.reset(request_token)
+        except Exception:
+            pass
+        if shared_token is not None:
+            try:
+                shared_processing.request_id_var.reset(shared_token)
+            except Exception:
+                pass
 
 
 @app.get("/health")

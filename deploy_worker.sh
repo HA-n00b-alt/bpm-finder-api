@@ -145,7 +145,7 @@ if ! gcloud run deploy "${SERVICE_NAME}" \
     --max-instances 20 \
     --concurrency 10 \
     --cpu-boost \
-    --set-env-vars "GOOGLE_CLOUD_PROJECT=${PROJECT_ID}" \
+    --set-env-vars "GOOGLE_CLOUD_PROJECT=${PROJECT_ID},ESSENTIA_MAX_CONCURRENCY=8" \
     --project "${PROJECT_ID}"; then
     echo ""
     echo "❌ Error: Cloud Run deployment failed. You may need additional permissions."
@@ -275,4 +275,3 @@ echo ""
 echo "Pub/Sub Topic: ${PUBSUB_TOPIC}"
 echo "Pub/Sub Subscription: ${PUBSUB_SUBSCRIPTION}"
 echo "Worker URL: ${WORKER_URL}"
-

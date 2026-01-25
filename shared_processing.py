@@ -6,6 +6,9 @@ import os
 import time
 import asyncio
 import tempfile
+import logging
+import json
+from contextvars import ContextVar
 from typing import Optional, Tuple, List
 from urllib.parse import urlparse
 import httpx
@@ -41,6 +44,16 @@ ESSENTIA_MAX_CONFIDENCE_RAW = 5.32
 BPM_LOWER_THRESHOLD = 40
 BPM_UPPER_THRESHOLD = 220
 
+logger = logging.getLogger(__name__)
+request_id_var: ContextVar[Optional[str]] = ContextVar("request_id", default=None)
+
+def log_event(level: int, message: str, **fields) -> None:
+    record = {"message": message, **fields}
+    request_id = request_id_var.get()
+    if request_id:
+        record["request_id"] = request_id
+    logger.log(level, json.dumps(record, ensure_ascii=True))
+
 
 class FallbackCircuitBreaker:
     """Simple circuit breaker for fallback service calls."""
@@ -62,14 +75,33 @@ class FallbackCircuitBreaker:
     
     
     def record_success(self):
+        prev_state = self.state
         self.failure_count = 0
         self.state = "closed"
+        if prev_state != "closed":
+            log_event(
+                logging.WARNING,
+                "Circuit breaker state changed",
+                event="circuit_breaker_state_change",
+                previous_state=prev_state,
+                state="closed",
+            )
     
     def record_failure(self):
+        prev_state = self.state
         self.failure_count += 1
         self.last_failure_time = time.time()
         if self.failure_count >= self.failure_threshold:
             self.state = "open"
+            if prev_state != "open":
+                log_event(
+                    logging.WARNING,
+                    "Circuit breaker state changed",
+                    event="circuit_breaker_state_change",
+                    previous_state=prev_state,
+                    state="open",
+                    failures=self.failure_count,
+                )
     
     def can_attempt(self) -> bool:
         if self.state == "closed":
@@ -121,6 +153,15 @@ async def download_audio_async(url: str, output_path: str, client: httpx.AsyncCl
             if not validate_redirect_url(redirect_url):
                 raise Exception("Redirect to non-HTTPS URL not allowed")
             
+            log_event(
+                logging.INFO,
+                "Following redirect",
+                event="download_redirect",
+                redirect_count=redirect_count + 1,
+                max_redirects=max_redirects,
+                from_url=current_url[:80],
+                to_url=redirect_url[:80],
+            )
             current_url = redirect_url
             redirect_count += 1
             continue
@@ -191,7 +232,6 @@ def normalize_bpm(bpm: float) -> float:
 
 def analyze_key_from_audio(audio, max_confidence: float) -> Tuple[str, str, float, float, bool, List[str]]:
     """Analyze key from a pre-loaded audio array."""
-    import sys
     debug_lines = []
     key = "unknown"
     scale = "unknown"
@@ -200,20 +240,34 @@ def analyze_key_from_audio(audio, max_confidence: float) -> Tuple[str, str, floa
     need_fallback_key = False
 
     try:
-        print(f"[ANALYZE] Starting key extraction...", file=sys.stderr, flush=True)
+        log_event(logging.DEBUG, "Starting key extraction", event="analyze_key_start")
         key_profiles = ['temperley', 'krumhansl', 'edma', 'edmm']
         results = []
 
         for profile in key_profiles:
             try:
-                print(f"[ANALYZE] Trying key profile: {profile}", file=sys.stderr, flush=True)
+                log_event(logging.DEBUG, "Trying key profile", event="analyze_key_profile_try", profile=profile)
                 key_extractor = es.KeyExtractor(profileType=profile)
                 key_result, scale_result, strength = key_extractor(audio)
                 results.append((str(key_result), str(scale_result), float(strength), profile))
                 debug_lines.append(f"key_profile={profile}: key={key_result} {scale_result}, strength={strength:.3f}")
-                print(f"[ANALYZE] Profile {profile}: {key_result} {scale_result}, strength={strength:.3f}", file=sys.stderr, flush=True)
+                log_event(
+                    logging.DEBUG,
+                    "Key profile result",
+                    event="analyze_key_profile_result",
+                    profile=profile,
+                    key=str(key_result),
+                    scale=str(scale_result),
+                    strength=float(strength),
+                )
             except Exception as e:
-                print(f"[ANALYZE] Profile {profile} failed: {str(e)}", file=sys.stderr, flush=True)
+                log_event(
+                    logging.WARNING,
+                    "Key profile failed",
+                    event="analyze_key_profile_failed",
+                    profile=profile,
+                    error=str(e),
+                )
                 continue
 
         if results:
@@ -221,20 +275,40 @@ def analyze_key_from_audio(audio, max_confidence: float) -> Tuple[str, str, floa
             key, scale, key_strength_raw, winning_profile = results[0]
             key_confidence_normalized = min(1.0, max(0.0, key_strength_raw))
             debug_lines.append(f"Winner: {winning_profile} (strength={key_strength_raw:.3f})")
-            print(f"[ANALYZE] Key winner: {winning_profile} - {key} {scale}, strength={key_strength_raw:.3f}", file=sys.stderr, flush=True)
+            log_event(
+                logging.DEBUG,
+                "Key winner",
+                event="analyze_key_winner",
+                profile=winning_profile,
+                key=key,
+                scale=scale,
+                strength=key_strength_raw,
+            )
         else:
             try:
-                print(f"[ANALYZE] No profile results, trying default KeyExtractor", file=sys.stderr, flush=True)
+                log_event(logging.DEBUG, "No profile results, trying default KeyExtractor", event="analyze_key_default_try")
                 key_extractor = es.KeyExtractor()
                 key, scale, key_strength_raw = key_extractor(audio)
                 key_confidence_normalized = min(1.0, max(0.0, key_strength_raw))
                 debug_lines.append(f"Fallback: default KeyExtractor")
-                print(f"[ANALYZE] Default KeyExtractor: {key} {scale}, strength={key_strength_raw:.3f}", file=sys.stderr, flush=True)
+                log_event(
+                    logging.DEBUG,
+                    "Default KeyExtractor result",
+                    event="analyze_key_default_result",
+                    key=key,
+                    scale=scale,
+                    strength=key_strength_raw,
+                )
             except Exception as e:
                 error_msg = f"KeyExtractor fallback error: {str(e)}"
-                print(f"[ANALYZE] ERROR in default KeyExtractor: {error_msg}", file=sys.stderr, flush=True)
                 import traceback
-                print(f"[ANALYZE] KeyExtractor Traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
+                log_event(
+                    logging.ERROR,
+                    "Default KeyExtractor error",
+                    event="analyze_key_default_error",
+                    error=error_msg,
+                    traceback=traceback.format_exc(),
+                )
                 debug_lines.append(error_msg)
                 need_fallback_key = True
 
@@ -245,9 +319,14 @@ def analyze_key_from_audio(audio, max_confidence: float) -> Tuple[str, str, floa
             debug_lines.append(f"Key strength ({key_confidence_normalized:.3f}) < threshold - fallback needed")
     except Exception as e:
         error_msg = f"Key computation error: {str(e)}"
-        print(f"[ANALYZE] ERROR in key computation: {error_msg}", file=sys.stderr, flush=True)
         import traceback
-        print(f"[ANALYZE] Key computation Traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
+        log_event(
+            logging.ERROR,
+            "Key computation error",
+            event="analyze_key_error",
+            error=error_msg,
+            traceback=traceback.format_exc(),
+        )
         debug_lines.append(error_msg)
         need_fallback_key = True
 
@@ -264,7 +343,6 @@ def analyze_audio(
 
     If return_audio is True, append (audio, sample_rate) to the result tuple.
     """
-    import sys
     import time
     import resource
     start_time = time.time()
@@ -274,7 +352,7 @@ def analyze_audio(
     bpm_duration = None
     key_start = None
     key_duration = None
-    print(f"[ANALYZE] Starting analysis of {audio_path} at {start_time}", file=sys.stderr, flush=True)
+    log_event(logging.DEBUG, "Starting analysis", event="analyze_start", audio_path=audio_path, start_time=start_time)
     
     def _with_audio(result_tuple, audio_data, sample_rate):
         if return_audio:
@@ -284,26 +362,26 @@ def analyze_audio(
     # Check if Essentia is available (should be pre-imported at module level)
     if not ESSENTIA_AVAILABLE or es is None:
         error_msg = "Essentia not available (import failed at module level)"
-        print(f"[ANALYZE] ERROR: {error_msg}", file=sys.stderr, flush=True)
+        log_event(logging.ERROR, "Essentia unavailable", event="analyze_essentia_unavailable", error=error_msg)
         return _with_audio(
             (None, None, None, None, "error", "unknown", "unknown", 0.0, 0.0, True, True, error_msg),
             None,
             None,
         )
     
-    print(f"[ANALYZE] Essentia available (pre-imported)", file=sys.stderr, flush=True)
+    log_event(logging.DEBUG, "Essentia available (pre-imported)", event="analyze_essentia_available")
     
     debug_lines = []
     
     try:
-        print(f"[ANALYZE] Creating MonoLoader...", file=sys.stderr, flush=True)
+        log_event(logging.DEBUG, "Creating MonoLoader", event="analyze_loader_create")
         load_start = time.time()
         sample_rate = 44100
         loader = es.MonoLoader(filename=audio_path, sampleRate=sample_rate)
-        print(f"[ANALYZE] Loading audio file...", file=sys.stderr, flush=True)
+        log_event(logging.DEBUG, "Loading audio file", event="analyze_audio_load_start")
         audio = loader()
         load_duration = time.time() - load_start
-        print(f"[ANALYZE] Audio loaded: {len(audio)} samples", file=sys.stderr, flush=True)
+        log_event(logging.DEBUG, "Audio loaded", event="analyze_audio_loaded", samples=len(audio))
         
         max_samples = int(MAX_AUDIO_DURATION * 44100)
         if len(audio) > max_samples:
@@ -311,12 +389,23 @@ def analyze_audio(
             debug_lines.append(f"Audio loaded: {len(audio)/sample_rate:.1f}s (trimmed, capped at {MAX_AUDIO_DURATION}s)")
         else:
             debug_lines.append(f"Audio loaded: {len(audio)/sample_rate:.1f}s")
-        print(f"[ANALYZE] Audio prepared: {len(audio)} samples ({len(audio)/sample_rate:.1f}s)", file=sys.stderr, flush=True)
+        log_event(
+            logging.DEBUG,
+            "Audio prepared",
+            event="analyze_audio_prepared",
+            samples=len(audio),
+            seconds=len(audio) / sample_rate,
+        )
     except Exception as e:
         error_msg = f"Essentia audio loading error: {str(e)}"
-        print(f"[ANALYZE] ERROR loading audio: {error_msg}", file=sys.stderr, flush=True)
         import traceback
-        print(f"[ANALYZE] Traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
+        log_event(
+            logging.ERROR,
+            "Audio loading error",
+            event="analyze_audio_load_error",
+            error=error_msg,
+            traceback=traceback.format_exc(),
+        )
         debug_lines.append(error_msg)
         return _with_audio(
             (None, None, None, None, "error", "unknown", "unknown", 0.0, 0.0, True, True, "\n".join(debug_lines)),
@@ -334,12 +423,18 @@ def analyze_audio(
     
     try:
         bpm_start = time.time()
-        print(f"[ANALYZE] Creating RhythmExtractor2013...", file=sys.stderr, flush=True)
+        log_event(logging.DEBUG, "Creating RhythmExtractor2013", event="analyze_bpm_extractor_create")
         rhythm_extractor = es.RhythmExtractor2013(method="multifeature")
-        print(f"[ANALYZE] Extracting BPM...", file=sys.stderr, flush=True)
+        log_event(logging.DEBUG, "Extracting BPM", event="analyze_bpm_start")
         bpm_raw, beats, confidence_raw, _, beats_intervals = rhythm_extractor(audio)
         bpm_duration = time.time() - bpm_start
-        print(f"[ANALYZE] BPM extracted: {bpm_raw:.2f}, confidence: {confidence_raw:.3f}", file=sys.stderr, flush=True)
+        log_event(
+            logging.DEBUG,
+            "BPM extracted",
+            event="analyze_bpm_extracted",
+            bpm_raw=float(bpm_raw),
+            confidence_raw=float(confidence_raw),
+        )
         
         bpm_confidence_normalized, bpm_quality = normalize_confidence(float(confidence_raw))
         bpm_normalized = normalize_bpm(float(bpm_raw))
@@ -354,9 +449,14 @@ def analyze_audio(
             debug_lines.append(f"BPM confidence ({bpm_confidence_normalized:.3f}) < threshold ({max_confidence:.2f}) - fallback needed")
     except Exception as e:
         error_msg = f"BPM extraction error: {str(e)}"
-        print(f"[ANALYZE] ERROR in BPM extraction: {error_msg}", file=sys.stderr, flush=True)
         import traceback
-        print(f"[ANALYZE] BPM Traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
+        log_event(
+            logging.ERROR,
+            "BPM extraction error",
+            event="analyze_bpm_error",
+            error=error_msg,
+            traceback=traceback.format_exc(),
+        )
         debug_lines.append(error_msg)
         need_fallback_bpm = True
     
@@ -390,17 +490,29 @@ def analyze_audio(
         rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     except Exception:
         rss_kb = None
-    print(
-        "[TELEMETRY] shared_processing "
-        f"audio_load_s={load_duration if load_duration is not None else 'na'} "
-        f"bpm_s={bpm_duration if bpm_duration is not None else 'na'} "
-        f"key_s={key_duration if key_duration is not None else 'na'} "
-        f"total_s={total_time:.2f} "
-        f"samples={len(audio) if 'audio' in locals() else 'na'} "
-        f"rss_kb={rss_kb if rss_kb is not None else 'na'}",
-        flush=True
+    audio_load_s = f"{load_duration:.3f}" if load_duration is not None else "na"
+    bpm_s = f"{bpm_duration:.3f}" if bpm_duration is not None else "na"
+    key_s = f"{key_duration:.3f}" if key_duration is not None else "na"
+    log_event(
+        logging.DEBUG,
+        "Shared processing telemetry",
+        event="shared_processing_telemetry",
+        audio_load_s=audio_load_s,
+        bpm_s=bpm_s,
+        key_s=key_s,
+        total_s=f"{total_time:.3f}",
+        samples=len(audio) if "audio" in locals() else "na",
+        rss_kb=rss_kb if rss_kb is not None else "na",
     )
-    print(f"[ANALYZE] Analysis complete: BPM={bpm_normalized}, Key={key} {scale} (total time: {total_time:.2f}s)", file=sys.stderr, flush=True)
+    log_event(
+        logging.DEBUG,
+        "Analysis complete",
+        event="analyze_complete",
+        bpm=bpm_normalized,
+        key=key,
+        scale=scale,
+        total_s=total_time,
+    )
     
     result = (
         bpm_normalized, bpm_raw, bpm_confidence_normalized, bpm_quality, bpm_method,
@@ -408,7 +520,7 @@ def analyze_audio(
         need_fallback_bpm, need_fallback_key,
         "\n".join(debug_lines)
     )
-    print(f"[ANALYZE] Returning result tuple (length: {len(result)})", file=sys.stderr, flush=True)
+    log_event(logging.DEBUG, "Returning result tuple", event="analyze_return", length=len(result))
     return _with_audio(result, audio, sample_rate)
 
 

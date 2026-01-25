@@ -9,16 +9,19 @@ import io
 import time
 import uuid
 import json
+import logging
+from contextvars import ContextVar
 from typing import Optional, Tuple, List
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, HttpUrl, field_validator
 from google.cloud import pubsub_v1, firestore
 
 # Import shared processing functions
+import shared_processing
 from shared_processing import (
     download_audio_async as shared_download_audio_async,
     analyze_audio,
@@ -36,6 +39,16 @@ from shared_processing import (
 # Google Cloud authentication is handled by shared_processing.get_auth_headers
 
 app = FastAPI(title="BPM Finder API")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(message)s")
+logger = logging.getLogger(__name__)
+request_id_var: ContextVar[Optional[str]] = ContextVar("request_id", default=None)
+
+def log_event(level: int, message: str, **fields) -> None:
+    record = {"message": message, **fields}
+    request_id = request_id_var.get()
+    if request_id:
+        record["request_id"] = request_id
+    logger.log(level, json.dumps(record, ensure_ascii=True))
 
 # Google Cloud configuration
 PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT") or os.getenv("PROJECT_ID", "bpm-api-microservice")
@@ -62,6 +75,13 @@ def get_essentia_executor() -> ThreadPoolExecutor:
         # Use env var or default to CPU count
         max_workers = int(os.getenv("ESSENTIA_MAX_CONCURRENCY", max(1, os.cpu_count() or 1)))
         _essentia_executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="essentia")
+        log_event(
+            logging.INFO,
+            "Essentia executor configured",
+            event="executor_config",
+            max_workers=max_workers,
+            cpu_count=os.cpu_count(),
+        )
     return _essentia_executor
 
 def get_essentia_semaphore() -> asyncio.Semaphore:
@@ -95,11 +115,32 @@ def get_http_client() -> httpx.AsyncClient:
             ),
             follow_redirects=False,  # We handle redirects manually for security
         )
+        log_event(
+            logging.INFO,
+            "HTTP client initialized",
+            event="startup_http_client",
+            max_keepalive_connections=20,
+            max_connections=100,
+        )
     return _http_client
+
+def format_url_for_log(url: str, max_len: int = 80) -> str:
+    """Format URL for logs: show scheme/host/path and elide long strings."""
+    parsed = urlparse(url)
+    base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    if len(base) > max_len:
+        return base[: max_len - 3] + "..."
+    if parsed.query:
+        suffix = "?..."
+        if len(base) + len(suffix) > max_len:
+            return base[: max_len - 3] + "..."
+        return base + suffix
+    return base
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize HTTP client and check fallback service health at startup."""
+    log_event(logging.INFO, "Startup config", event="startup_config", project_id=PROJECT_ID, pubsub_topic=PUBSUB_TOPIC)
     # Pre-initialize the HTTP client with connection pooling
     get_http_client()
     
@@ -109,8 +150,17 @@ async def startup_event():
         try:
             auth_headers = await shared_get_auth_headers(FALLBACK_SERVICE_AUDIENCE)
         except Exception as e:
-            print(f"Warning: Fallback service auth check failed at startup: {str(e)[:200]}")
-            print("Fallback service calls will be skipped until auth is configured.")
+            log_event(
+                logging.ERROR,
+                "Fallback service auth check failed at startup",
+                event="startup_fallback_auth_failed",
+                error=str(e),
+            )
+            log_event(
+                logging.WARNING,
+                "Fallback service calls will be skipped until auth is configured",
+                event="startup_fallback_disabled",
+            )
             return
         
         # Try to reach the fallback service health endpoint using global client
@@ -123,19 +173,57 @@ async def startup_event():
                 timeout=timeout
             )
             if response.status_code == 200:
-                print("✅ Fallback service is reachable and healthy")
+                log_event(logging.INFO, "Fallback service is reachable", event="startup_fallback_health_ok")
                 fallback_circuit_breaker.record_success()
             else:
-                print(f"⚠️  Fallback service returned HTTP {response.status_code} at startup")
+                log_event(
+                    logging.WARNING,
+                    "Fallback service returned non-200 at startup",
+                    event="startup_fallback_health_non_200",
+                    status_code=response.status_code,
+                )
                 fallback_circuit_breaker.record_failure()
         except httpx.TimeoutException:
-            print("⚠️  Fallback service health check timed out at startup")
+            log_event(
+                logging.WARNING,
+                "Fallback service health check timed out at startup",
+                event="startup_fallback_health_timeout",
+            )
             fallback_circuit_breaker.record_failure()
         except Exception as e:
-            print(f"⚠️  Fallback service health check failed: {str(e)[:200]}")
+            log_event(
+                logging.ERROR,
+                "Fallback service health check failed at startup",
+                event="startup_fallback_health_error",
+                error=str(e),
+            )
             fallback_circuit_breaker.record_failure()
     except Exception as e:
-        print(f"Warning: Startup fallback service check failed: {str(e)[:200]}")
+        log_event(
+            logging.ERROR,
+            "Startup fallback service check failed",
+            event="startup_fallback_check_error",
+            error=str(e),
+        )
+
+
+@app.middleware("http")
+async def attach_request_id(request: Request, call_next):
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    token = request_id_var.set(request_id)
+    shared_token = None
+    try:
+        shared_token = shared_processing.request_id_var.set(request_id)
+    except Exception:
+        shared_token = None
+    try:
+        response = await call_next(request)
+    finally:
+        request_id_var.reset(token)
+        if shared_token is not None:
+            shared_processing.request_id_var.reset(shared_token)
+    response.headers["x-request-id"] = request_id
+    return response
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -298,7 +386,7 @@ async def process_single_url(
             await shared_download_audio_async(url_str, input_path, client)
             timing["download_end"] = time.time()
             timing["download_duration"] = timing["download_end"] - timing["download_start"]
-            debug_info_parts.append(f"URL fetch: SUCCESS ({url_str[:50]}...)")
+            debug_info_parts.append(f"URL fetch: SUCCESS ({format_url_for_log(url_str)})")
         except Exception as e:
             # Clean up temp file on download failure
             if input_path:
@@ -461,9 +549,17 @@ async def analyze_batch(request: BatchBPMRequest):
         'created_at': firestore.SERVER_TIMESTAMP,
         'results': {}
     })
+    log_event(
+        logging.INFO,
+        "Batch created",
+        event="batch_created",
+        batch_id=batch_id,
+        total_urls=total_urls,
+    )
     
     # Publish each URL as a separate message to Pub/Sub
     for index, url in enumerate(request.urls):
+        trace_id = str(uuid.uuid4())
         message_data = {
             'batch_id': batch_id,
             'url': str(url),
@@ -471,6 +567,7 @@ async def analyze_batch(request: BatchBPMRequest):
             'max_confidence': max_confidence,
             'debug_level': debug_level,
             'fallback_override': fallback_override,
+            'trace_id': trace_id,
         }
         message_bytes = json.dumps(message_data).encode('utf-8')
         
@@ -479,12 +576,21 @@ async def analyze_batch(request: BatchBPMRequest):
             future.result()  # Wait for publish to complete
         except Exception as e:
             # Log error but continue with other URLs
-            print(f"Error publishing message for URL {index}: {str(e)}")
+            log_event(
+                logging.ERROR,
+                "Failed to publish message to Pub/Sub",
+                event="pubsub_publish_error",
+                index=index,
+                batch_id=batch_id,
+                trace_id=trace_id,
+                error=str(e),
+            )
             # Update Firestore with error
             batch_ref.update({
                 f'results.{index}': {
                     'index': index,
                     'url': str(url),
+                    'trace_id': trace_id,
                     'error': f'Failed to publish to Pub/Sub: {str(e)}'
                 }
             })
@@ -503,6 +609,7 @@ async def stream_batch_results(batch_id: str):
     
     Polls Firestore every 500ms and yields results as they become available.
     """
+    log_event(logging.INFO, "Starting stream", event="stream_start", batch_id=batch_id)
     batch_ref = db.collection('batches').document(batch_id)
     sent_status = {}
     
@@ -580,6 +687,7 @@ async def stream_batch_results(batch_id: str):
                             "type": "result",
                             "index": index,
                             "url": result.get("url"),
+                            "trace_id": result.get("trace_id"),
                             "status": result_status,
                             "bpm_essentia": result.get("bpm_essentia"),
                             "bpm_raw_essentia": result.get("bpm_raw_essentia"),
@@ -623,6 +731,7 @@ async def stream_batch_results(batch_id: str):
             except Exception as e:
                 import traceback
                 error_msg = f"Error streaming batch: {str(e)}\n{traceback.format_exc()}"
+                log_event(logging.ERROR, "Stream error", event="stream_error", batch_id=batch_id, error=error_msg)
                 yield json.dumps({
                     "type": "error",
                     "message": error_msg[:500]  # Limit error message length
@@ -638,6 +747,7 @@ async def stream_batch_results(batch_id: str):
 @app.get("/batch/{batch_id}", response_model=BatchStatusResponse)
 async def get_batch_status(batch_id: str):
     """Get batch status and results from Firestore."""
+    log_event(logging.INFO, "Batch status requested", event="batch_status_query", batch_id=batch_id)
     batch_ref = db.collection('batches').document(batch_id)
     loop = asyncio.get_event_loop()
     batch_doc = await loop.run_in_executor(None, batch_ref.get)
