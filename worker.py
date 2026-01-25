@@ -142,8 +142,6 @@ async def startup_event():
         essentia_max_concurrency=os.getenv("ESSENTIA_MAX_CONCURRENCY", "default"),
     )
     log_event(logging.INFO, "Pre-importing Essentia to avoid cold start delay", event="startup_essentia_preimport")
-    import sys
-    import time
     start = time.time()
     try:
         # Pre-import Essentia in a thread to avoid blocking
