@@ -153,7 +153,7 @@ class BatchBPMRequest(BaseModel):
     urls: List[HttpUrl]
     max_confidence: Optional[float] = 0.65
     debug_level: Optional[str] = "normal"  # "minimal", "normal", "detailed"
-    fallback_override: Optional[str] = None  # "never": no fallback; "always": force both BPM/key fallback; "bpm_only": force BPM fallback; "key_only": force key fallback
+    fallback_override: Optional[str] = None  # "never": no fallback; "always": force both BPM/key fallback; "bpm_only": force BPM fallback; "key_only": force key fallback; "fallback_only*": skip Essentia for selected fields
 
     @field_validator("urls")
     @classmethod
@@ -187,9 +187,18 @@ class BatchBPMRequest(BaseModel):
     @classmethod
     def validate_fallback_override(cls, v):
         """Validate fallback_override is a valid option."""
-        if v and v not in ["never", "always", "bpm_only", "key_only"]:
+        if v and v not in [
+            "never",
+            "always",
+            "bpm_only",
+            "key_only",
+            "fallback_only",
+            "fallback_only_bpm",
+            "fallback_only_key",
+        ]:
             raise ValueError(
-                "fallback_override must be one of: never, always, bpm_only, key_only"
+                "fallback_override must be one of: never, always, bpm_only, key_only, "
+                "fallback_only, fallback_only_bpm, fallback_only_key"
             )
         return v
 
