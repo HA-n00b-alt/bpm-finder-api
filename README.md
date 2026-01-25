@@ -129,6 +129,7 @@ Before deployment, configure the following variables in `deploy.sh` or set them 
 - `SERVICE_NAME`: Cloud Run service name (default: `bpm-service`)
 - `ARTIFACT_REPO`: Artifact Registry repository name (default: `bpm-repo`)
 - `SERVICE_ACCOUNT`: Service account name for external callers (default: `vercel-bpm-invoker`)
+- `LOG_LEVEL`: Log level for structured JSON logs (default: `INFO`)
 
 ### Fallback Service Configuration
 
@@ -138,6 +139,7 @@ The fallback service configuration is in `deploy_fallback.sh`:
 - `REGION`: Cloud Run region (default: `europe-west3`)
 - `SERVICE_NAME`: Fallback service name (default: `bpm-fallback-service`)
 - `PROCESS_POOL_WORKERS`: Process pool size for CPU-bound librosa work
+- `FALLBACK_MAX_SECONDS`: Max audio duration (seconds) processed by librosa (default: 30)
 - `LOG_LEVEL`: Log level for structured JSON logs (default: `INFO`)
 
 ### Worker Service Configuration
@@ -148,6 +150,9 @@ Worker behavior can be tuned via environment variables:
 - `ARTIFACT_REPO`: Artifact Registry repository name (default: `bpm-repo`)
 - `ESSENTIA_MAX_CONCURRENCY`: Max thread pool workers for Essentia analysis (defaults to CPU count)
 - `LOG_LEVEL`: Log level for structured JSON logs (default: `INFO`)
+- `MAX_AUDIO_DURATION`: Maximum audio duration (seconds) processed by Essentia (default: 35; set to 180 in deploy script)
+- `FALLBACK_REQUEST_TIMEOUT_COLD_START`: Fallback timeout for first attempt (seconds)
+- `FALLBACK_REQUEST_TIMEOUT_WARM`: Fallback timeout for subsequent attempts (seconds)
 
 ### Primary Service Fallback Settings
 

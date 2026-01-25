@@ -110,7 +110,7 @@ if ! gcloud run deploy "${SERVICE_NAME}" \
     --max-instances 10 \
     --concurrency 2 \
     --cpu-boost \
-    --set-env-vars "PROCESS_POOL_WORKERS=3" \
+    --set-env-vars "PROCESS_POOL_WORKERS=3,FALLBACK_MAX_SECONDS=30,LOG_LEVEL=INFO" \
     --project "${PROJECT_ID}"; then
     echo ""
     echo "❌ Error: Cloud Run deployment failed. You may need additional permissions."

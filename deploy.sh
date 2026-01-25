@@ -109,9 +109,9 @@ if ! gcloud run deploy "${SERVICE_NAME}" \
     --cpu 2 \
     --timeout 300s \
     --max-instances 10 \
-    --concurrency 80 \
+    --concurrency 120 \
     --cpu-boost \
-    --set-env-vars "GOOGLE_CLOUD_PROJECT=${PROJECT_ID}" \
+    --set-env-vars "GOOGLE_CLOUD_PROJECT=${PROJECT_ID},LOG_LEVEL=INFO" \
     --project "${PROJECT_ID}"; then
     echo ""
     echo "❌ Error: Cloud Run deployment failed. You may need additional permissions."
@@ -201,4 +201,3 @@ echo "  TOKEN=\$(gcloud auth print-identity-token)"
 echo "  curl -H \"Authorization: Bearer \$TOKEN\" ${SERVICE_URL}/health"
 echo ""
 echo "Service account email: ${SERVICE_ACCOUNT}@${PROJECT_ID}.iam.gserviceaccount.com"
-

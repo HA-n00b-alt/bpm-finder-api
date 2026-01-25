@@ -143,9 +143,9 @@ if ! gcloud run deploy "${SERVICE_NAME}" \
     --cpu 4 \
     --timeout 600s \
     --max-instances 20 \
-    --concurrency 10 \
+    --concurrency 16 \
     --cpu-boost \
-    --set-env-vars "GOOGLE_CLOUD_PROJECT=${PROJECT_ID},ESSENTIA_MAX_CONCURRENCY=8" \
+    --set-env-vars "GOOGLE_CLOUD_PROJECT=${PROJECT_ID},ESSENTIA_MAX_CONCURRENCY=8,MAX_AUDIO_DURATION=180,FALLBACK_REQUEST_TIMEOUT_COLD_START=60,FALLBACK_REQUEST_TIMEOUT_WARM=30,LOG_LEVEL=INFO" \
     --project "${PROJECT_ID}"; then
     echo ""
     echo "❌ Error: Cloud Run deployment failed. You may need additional permissions."

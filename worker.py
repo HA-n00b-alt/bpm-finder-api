@@ -54,6 +54,7 @@ db = firestore.Client()
 PROCESS_START = time.time()
 _first_request = True
 STREAM_PARTIAL_BPM_ONLY = os.getenv("STREAM_PARTIAL_BPM_ONLY", "true").lower() == "true"
+SKIP_PARTIAL_WRITES = os.getenv("SKIP_PARTIAL_WRITES", "false").lower() == "true"
 
 # Global HTTP client with connection pooling
 _http_client: Optional[httpx.AsyncClient] = None
@@ -511,45 +512,55 @@ async def process_single_url_task(
             )
             firestore_result["debug_txt"] = partial_debug_txt if partial_debug_txt else None
 
-            log_task(
-                logging.INFO,
-                batch_id,
-                index,
-                "Writing partial result",
-                event="firestore_partial_write",
-                trace_id=trace_tag,
-            )
+            if not SKIP_PARTIAL_WRITES:
+                log_task(
+                    logging.INFO,
+                    batch_id,
+                    index,
+                    "Writing partial result",
+                    event="firestore_partial_write",
+                    trace_id=trace_tag,
+                )
 
-            @retry(
-                stop=stop_after_attempt(5),
-                wait=wait_exponential(multiplier=1, min=1, max=30),
-                retry=retry_if_exception_type((Exception,)),
-                reraise=True
-            )
-            def update_partial_result():
-                """Write partial result without incrementing processed (idempotent)."""
-                transaction = db.transaction()
+                @retry(
+                    stop=stop_after_attempt(5),
+                    wait=wait_exponential(multiplier=1, min=1, max=30),
+                    retry=retry_if_exception_type((Exception,)),
+                    reraise=True
+                )
+                def update_partial_result():
+                    """Write partial result without incrementing processed (idempotent)."""
+                    transaction = db.transaction()
 
-                @firestore.transactional
-                def update_in_transaction(transaction):
-                    batch_doc = batch_ref.get(transaction=transaction)
-                    if not batch_doc.exists:
-                        raise Exception(f"Batch {batch_id} not found")
+                    @firestore.transactional
+                    def update_in_transaction(transaction):
+                        batch_doc = batch_ref.get(transaction=transaction)
+                        if not batch_doc.exists:
+                            raise Exception(f"Batch {batch_id} not found")
 
-                    batch_data = batch_doc.to_dict()
-                    results = batch_data.get('results', {})
-                    existing = results.get(str(index))
-                    if existing and existing.get("status") in ("final", "error"):
-                        return False
+                        batch_data = batch_doc.to_dict()
+                        results = batch_data.get('results', {})
+                        existing = results.get(str(index))
+                        if existing and existing.get("status") in ("final", "error"):
+                            return False
 
-                    transaction.update(batch_ref, {
-                        f'results.{index}': firestore_result
-                    })
-                    return True
+                        transaction.update(batch_ref, {
+                            f'results.{index}': firestore_result
+                        })
+                        return True
 
-                return update_in_transaction(transaction)
+                    return update_in_transaction(transaction)
 
-            await loop.run_in_executor(None, update_partial_result)
+                await loop.run_in_executor(None, update_partial_result)
+            else:
+                log_task(
+                    logging.DEBUG,
+                    batch_id,
+                    index,
+                    "Skipping partial write (SKIP_PARTIAL_WRITES=true)",
+                    event="firestore_partial_skipped",
+                    trace_id=trace_tag,
+                )
         
         # Compute key after partial (to improve time-to-first-result)
         if STREAM_PARTIAL_BPM_ONLY:
@@ -579,7 +590,7 @@ async def process_single_url_task(
 
                 # Write another partial result with key included (before fallback)
                 # This gives users faster access to the key data
-                if need_fallback_bpm or need_fallback_key:
+                if (need_fallback_bpm or need_fallback_key) and not SKIP_PARTIAL_WRITES:
                     # Only write if fallback is needed (otherwise final result will be written soon)
                     firestore_result["status"] = "partial"
                     key_partial_debug_info = list(debug_info_parts)

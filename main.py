@@ -725,8 +725,8 @@ async def stream_batch_results(batch_id: str):
                     }) + "\n"
                     break
                 
-                # Wait before next poll
-                await asyncio.sleep(0.5)
+                # Wait before next poll (reduced for lower latency)
+                await asyncio.sleep(0.25)
                 
             except Exception as e:
                 import traceback
