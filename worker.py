@@ -153,7 +153,7 @@ async def process_single_url_task(
     fallback_override: Optional[str],
 ):
     """Process a single URL and write result to Firestore.
-    
+
     Args:
         batch_id (str): The ID of the batch this URL belongs to.
         url (str): The URL of the audio file to process.
@@ -162,9 +162,12 @@ async def process_single_url_task(
         debug_level (str): The verbosity level for debug output.
         fallback_override (Optional[str]): Overrides fallback logic. Possible values:
             "never": Never use the fallback service.
-            "always": Always use the fallback service for both BPM and key.
-            "bpm_only": Force BPM fallback.
-            "key_only": Force key fallback.
+            "always": Always use the fallback service for both BPM and key (but run Essentia first).
+            "bpm_only": Force BPM fallback (but run Essentia first).
+            "key_only": Force key fallback (but run Essentia first).
+            "fallback_only": Skip Essentia entirely, use ONLY fallback for both BPM and key.
+            "fallback_only_bpm": Skip Essentia BPM, use ONLY fallback for BPM (but run Essentia for key).
+            "fallback_only_key": Skip Essentia key, use ONLY fallback for key (but run Essentia for BPM).
     """
     batch_ref = db.collection('batches').document(batch_id)
     
@@ -209,79 +212,115 @@ async def process_single_url_task(
             debug_info_parts.append(error_msg)
             print(f"[{batch_id}:{index}] Download failed: {str(e)}")
             raise
-        
-        # Analyze audio
-        try:
-            print(f"[{batch_id}:{index}] Analyzing...")
-            print(f"[{batch_id}:{index}] Input file exists: {os.path.exists(input_path)}, size: {os.path.getsize(input_path) if os.path.exists(input_path) else 0} bytes")
-            timing["essentia_start"] = time.time()
-            executor = get_essentia_executor()
-            loop = asyncio.get_event_loop()
-            
-            print(f"[{batch_id}:{index}] Submitting to executor (max_workers: {executor._max_workers if hasattr(executor, '_max_workers') else 'unknown'})...", flush=True)
-            
-            try:
-                result = await loop.run_in_executor(
-                    executor,
-                    analyze_audio,
-                    input_path,
-                    max_confidence,
-                    True,
-                    not STREAM_PARTIAL_BPM_ONLY
-                )
-                print(f"[{batch_id}:{index}] Executor returned, unpacking result...", flush=True)
-                (
-                    bpm_normalized, bpm_raw, bpm_confidence_normalized, bpm_quality, bpm_method,
-                    key, scale, key_strength_raw, key_confidence_normalized,
-                    need_fallback_bpm, need_fallback_key,
-                    analysis_debug,
-                    audio_pcm,
-                    sample_rate
-                ) = result
-                print(f"[{batch_id}:{index}] Result unpacked: BPM={bpm_normalized}, Key={key}", flush=True)
-            except Exception as e:
-                import traceback
-                error_details = f"Executor error: {str(e)}\n{traceback.format_exc()}"
-                print(f"[{batch_id}:{index}] ERROR in executor: {error_details}", flush=True)
-                raise
-            
-            print(f"[{batch_id}:{index}] Executor returned successfully", flush=True)
-            timing["essentia_end"] = time.time()
-            timing["essentia_duration"] = timing["essentia_end"] - timing["essentia_start"]
-            log_telemetry(
-                f"worker_essentia_s={timing['essentia_duration']:.2f} "
-                f"batch_id={batch_id} index={index}"
-            )
-            
-            debug_info_parts.append(f"Max confidence threshold: {max_confidence:.2f}")
-            debug_info_parts.append("=== Analysis (Essentia) ===")
-            debug_info_parts.append(analysis_debug)
 
-            # Apply fallback override logic
-            if fallback_override:
-                debug_info_parts.append(f"Applying fallback override: {fallback_override}")
-                if fallback_override == "never":
-                    need_fallback_bpm = False
-                    need_fallback_key = False
-                elif fallback_override == "always":
-                    need_fallback_bpm = True
-                    need_fallback_key = True
-                elif fallback_override == "bpm_only":
-                    need_fallback_bpm = True
-                elif fallback_override == "key_only":
-                    need_fallback_key = True
-            
-            print(f"[{batch_id}:{index}] Analysis complete ({timing['essentia_duration']:.2f}s)")
-            print(f"[{batch_id}:{index}] BPM: {bpm_normalized}, Key: {key} {scale}")
-            print(f"[{batch_id}:{index}] Fallback needed - BPM: {need_fallback_bpm}, Key: {need_fallback_key}")
-            
-        except Exception as e:
-            error_msg = f"Analysis error: {str(e)}"
-            import traceback
-            full_error = f"{error_msg}\n{traceback.format_exc()}"
-            print(f"[{batch_id}:{index}] Analysis failed: {full_error}")
-            debug_info_parts.append(error_msg)
-            raise
+        # Check if we should skip Essentia entirely (fallback_only modes)
+        skip_essentia = fallback_override in ("fallback_only", "fallback_only_bpm", "fallback_only_key")
+        skip_essentia_bpm = fallback_override in ("fallback_only", "fallback_only_bpm")
+        skip_essentia_key = fallback_override in ("fallback_only", "fallback_only_key")
+
+        # Initialize variables
+        bpm_normalized = None
+        bpm_raw = None
+        bpm_confidence_normalized = None
+        bpm_quality = None
+        bpm_method = "multifeature"
+        key = "unknown"
+        scale = "unknown"
+        key_strength_raw = 0.0
+        key_confidence_normalized = 0.0
+        need_fallback_bpm = False
+        need_fallback_key = False
+        analysis_debug = ""
+        audio_pcm = None
+        sample_rate = 44100
+        loop = asyncio.get_event_loop()
+        executor = get_essentia_executor()
+
+        # Analyze audio (or skip if fallback_only)
+        if skip_essentia:
+            print(f"[{batch_id}:{index}] Skipping Essentia analysis (fallback_only mode: {fallback_override})")
+            debug_info_parts.append(f"Max confidence threshold: {max_confidence:.2f}")
+            debug_info_parts.append(f"Fallback override: {fallback_override}")
+            debug_info_parts.append("=== Essentia Analysis ===")
+            debug_info_parts.append("SKIPPED (fallback_only mode)")
+
+            # Force fallback based on mode
+            if skip_essentia_bpm:
+                need_fallback_bpm = True
+                debug_info_parts.append("BPM: Will use fallback only")
+            if skip_essentia_key:
+                need_fallback_key = True
+                debug_info_parts.append("Key: Will use fallback only")
+        else:
+            try:
+                print(f"[{batch_id}:{index}] Analyzing...")
+                print(f"[{batch_id}:{index}] Input file exists: {os.path.exists(input_path)}, size: {os.path.getsize(input_path) if os.path.exists(input_path) else 0} bytes")
+                timing["essentia_start"] = time.time()
+
+                print(f"[{batch_id}:{index}] Submitting to executor (max_workers: {executor._max_workers if hasattr(executor, '_max_workers') else 'unknown'})...", flush=True)
+
+                try:
+                    result = await loop.run_in_executor(
+                        executor,
+                        analyze_audio,
+                        input_path,
+                        max_confidence,
+                        True,
+                        not STREAM_PARTIAL_BPM_ONLY
+                    )
+                    print(f"[{batch_id}:{index}] Executor returned, unpacking result...", flush=True)
+                    (
+                        bpm_normalized, bpm_raw, bpm_confidence_normalized, bpm_quality, bpm_method,
+                        key, scale, key_strength_raw, key_confidence_normalized,
+                        need_fallback_bpm, need_fallback_key,
+                        analysis_debug,
+                        audio_pcm,
+                        sample_rate
+                    ) = result
+                    print(f"[{batch_id}:{index}] Result unpacked: BPM={bpm_normalized}, Key={key}", flush=True)
+                except Exception as e:
+                    import traceback
+                    error_details = f"Executor error: {str(e)}\n{traceback.format_exc()}"
+                    print(f"[{batch_id}:{index}] ERROR in executor: {error_details}", flush=True)
+                    raise
+
+                print(f"[{batch_id}:{index}] Executor returned successfully", flush=True)
+                timing["essentia_end"] = time.time()
+                timing["essentia_duration"] = timing["essentia_end"] - timing["essentia_start"]
+                log_telemetry(
+                    f"worker_essentia_s={timing['essentia_duration']:.2f} "
+                    f"batch_id={batch_id} index={index}"
+                )
+
+                debug_info_parts.append(f"Max confidence threshold: {max_confidence:.2f}")
+                debug_info_parts.append("=== Analysis (Essentia) ===")
+                debug_info_parts.append(analysis_debug)
+
+                # Apply fallback override logic (for non-fallback_only modes)
+                if fallback_override:
+                    debug_info_parts.append(f"Applying fallback override: {fallback_override}")
+                    if fallback_override == "never":
+                        need_fallback_bpm = False
+                        need_fallback_key = False
+                    elif fallback_override == "always":
+                        need_fallback_bpm = True
+                        need_fallback_key = True
+                    elif fallback_override == "bpm_only":
+                        need_fallback_bpm = True
+                    elif fallback_override == "key_only":
+                        need_fallback_key = True
+
+                print(f"[{batch_id}:{index}] Analysis complete ({timing['essentia_duration']:.2f}s)")
+                print(f"[{batch_id}:{index}] BPM: {bpm_normalized}, Key: {key} {scale}")
+                print(f"[{batch_id}:{index}] Fallback needed - BPM: {need_fallback_bpm}, Key: {need_fallback_key}")
+
+            except Exception as e:
+                error_msg = f"Analysis error: {str(e)}"
+                import traceback
+                full_error = f"{error_msg}\n{traceback.format_exc()}"
+                print(f"[{batch_id}:{index}] Analysis failed: {full_error}")
+                debug_info_parts.append(error_msg)
+                raise
         
         # Prepare result
         key_value = key if not STREAM_PARTIAL_BPM_ONLY else None
@@ -356,7 +395,6 @@ async def process_single_url_task(
 
                 return update_in_transaction(transaction)
 
-            loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, update_partial_result)
         
         # Compute key after partial (to improve time-to-first-result)

@@ -549,9 +549,12 @@ Submit batch for async processing: publishes tasks to Pub/Sub and returns `batch
   - `"detailed"`: Full debug info + detailed timing with timestamps
 - `fallback_override` (optional, default: `null`): Overrides the default fallback logic.
   - `"never"`: Never use the fallback service, even if confidence is below threshold.
-  - `"always"`: Always use the fallback service for both BPM and key.
-  - `"bpm_only"`: Force BPM fallback; key fallback still follows the confidence threshold.
-  - `"key_only"`: Force key fallback; BPM fallback still follows the confidence threshold.
+  - `"always"`: Always use the fallback service for both BPM and key (but run Essentia first).
+  - `"bpm_only"`: Force BPM fallback; key fallback still follows the confidence threshold (but run Essentia first).
+  - `"key_only"`: Force key fallback; BPM fallback still follows the confidence threshold (but run Essentia first).
+  - `"fallback_only"`: Skip Essentia entirely, use ONLY fallback for both BPM and key.
+  - `"fallback_only_bpm"`: Skip Essentia BPM, use ONLY fallback for BPM (but run Essentia for key).
+  - `"fallback_only_key"`: Skip Essentia key, use ONLY fallback for key (but run Essentia for BPM).
 
 **Response:**
 Returns immediately with batch submission details:

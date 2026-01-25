@@ -7,7 +7,7 @@ set -euo pipefail
 #   max_confidence: Confidence threshold (0.0-1.0), default: 0.65
 #   debug_level: minimal, normal (default), detailed
 #   service_url: Override service URL (optional)
-#   fallback_override: never, always, bpm_only, key_only (optional)
+#   fallback_override: never, always, bpm_only, key_only, fallback_only, fallback_only_bpm, fallback_only_key (optional)
 #
 # The script tests the new async streaming architecture:
 # 1. Submits batch via POST /analyze/batch (returns batch_id immediately)
@@ -21,13 +21,14 @@ DEBUG_LEVEL="${2:-normal}"
 FALLBACK_OVERRIDE="${4:-}"
 PROJECT_ID="${PROJECT_ID:-bpm-api-microservice}"
 
-# Test URLs
+# Test URLs (mix of Deezer, Spotify, and iTunes previews)
 TEST_URLS=(
+    "https://cdnt-preview.dzcdn.net/api/1/1/0/1/3/0/01362a91c97d085494ad64b63b9d88f4.mp3?hdnea=exp=1767892549~acl=/api/1/1/0/1/3/0/01362a91c97d085494ad64b63b9d88f4.mp3*~data=user_id=0,application_id=42~hmac=0597d1d65a6463081580e0109d2e3218cdefd4c2cf3bb212e1fd66c51d24c80e"
+    "https://p.scdn.co/mp3-preview/1c57741674dbcee27add7e06b6086d71da0cff5e"
     "https://audio-ssl.itunes.apple.com/itunes-assets/AudioPreview211/v4/37/d8/c9/37d8c9f7-838e-a222-0fe7-141c39e9f51c/mzaf_9144538674023163935.plus.aac.p.m4a"
+    "https://p.scdn.co/mp3-preview/0b2426cba10cea8ffdd9d69b78f3f58073da6ab1?cid=18c612430a234d2da59d742217981da8"
     "https://audio-ssl.itunes.apple.com/itunes-assets/AudioPreview125/v4/6c/45/59/6c4559aa-e474-1366-66e7-9cd5279acd05/mzaf_11210908680488989277.plus.aac.p.m4a"
-    "https://audio-ssl.itunes.apple.com/itunes-assets/AudioPreview221/v4/26/7b/cf/267bcf9d-abeb-2703-1b63-05528298a273/mzaf_12137933217638002816.plus.aac.p.m4a"
-    "https://audio-ssl.itunes.apple.com/itunes-assets/AudioPreview122/v4/98/51/0b/98510b2f-0e16-e295-5527-b014e43ae3a5/mzaf_918609115701790643.plus.aac.p.m4a"
-    "https://audio-ssl.itunes.apple.com/itunes-assets/AudioPreview115/v4/60/04/f7/6004f766-8053-0ef6-36a5-0e19f2533d13/mzaf_10236136789037090616.plus.aac.p.m4a"
+    "https://cdnt-preview.dzcdn.net/api/1/1/e/3/a/0/e3a23182a2b65997a9f4f40321865f6f.mp3?hdnea=exp=1769264366~acl=/api/1/1/e/3/a/0/e3a23182a2b65997a9f4f40321865f6f.mp3*~data=user_id=0,application_id=42~hmac=12caca3810169841acce9f630d58532ec86030b1d8e98573db1e698278bdc96f"
 )
 
 echo "=========================================="
