@@ -386,6 +386,54 @@ async def process_single_url_task(
                     round(key_confidence_normalized, 2) if key_confidence_normalized is not None else 0.0
                 )
 
+                # Write another partial result with key included (before fallback)
+                # This gives users faster access to the key data
+                if need_fallback_bpm or need_fallback_key:
+                    # Only write if fallback is needed (otherwise final result will be written soon)
+                    firestore_result["status"] = "partial"
+                    key_partial_debug_info = list(debug_info_parts)
+                    if need_fallback_bpm or need_fallback_key:
+                        key_partial_debug_info.append("Fallback pending")
+                    key_partial_debug_txt = generate_debug_output(
+                        key_partial_debug_info,
+                        timing,
+                        None,
+                        debug_level
+                    )
+                    firestore_result["debug_txt"] = key_partial_debug_txt if key_partial_debug_txt else None
+
+                    @retry(
+                        stop=stop_after_attempt(5),
+                        wait=wait_exponential(multiplier=1, min=1, max=30),
+                        retry=retry_if_exception_type((Exception,)),
+                        reraise=True
+                    )
+                    def update_key_partial_result():
+                        """Write partial result with key included (before fallback)."""
+                        transaction = db.transaction()
+
+                        @firestore.transactional
+                        def update_in_transaction(transaction):
+                            batch_doc = batch_ref.get(transaction=transaction)
+                            if not batch_doc.exists:
+                                raise Exception(f"Batch {batch_id} not found")
+
+                            batch_data = batch_doc.to_dict()
+                            results = batch_data.get('results', {})
+                            existing = results.get(str(index))
+                            if existing and existing.get("status") in ("final", "error"):
+                                return False
+
+                            transaction.update(batch_ref, {
+                                f'results.{index}': firestore_result
+                            })
+                            return True
+
+                        return update_in_transaction(transaction)
+
+                    await loop.run_in_executor(None, update_key_partial_result)
+                    print(f"[{batch_id}:{index}] Key partial result written (key ready, fallback pending)")
+
         # Handle fallback if needed
         fallback_timing = None
         if need_fallback_bpm or need_fallback_key:

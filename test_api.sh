@@ -2,11 +2,12 @@
 set -euo pipefail
 
 # Test script for BPM Finder API (Async Streaming Architecture)
-# 
-# Usage: ./test_api.sh [max_confidence] [debug_level] [service_url]
+#
+# Usage: ./test_api.sh [max_confidence] [debug_level] [service_url] [fallback_override]
 #   max_confidence: Confidence threshold (0.0-1.0), default: 0.65
 #   debug_level: minimal, normal (default), detailed
 #   service_url: Override service URL (optional)
+#   fallback_override: never, always, bpm_only, key_only (optional)
 #
 # The script tests the new async streaming architecture:
 # 1. Submits batch via POST /analyze/batch (returns batch_id immediately)
@@ -17,6 +18,7 @@ set -euo pipefail
 SERVICE_URL="${3:-https://bpm-service-pgkjwjbhqq-ey.a.run.app}"
 MAX_CONFIDENCE="${1:-0.65}"
 DEBUG_LEVEL="${2:-normal}"
+FALLBACK_OVERRIDE="${4:-}"
 PROJECT_ID="${PROJECT_ID:-bpm-api-microservice}"
 
 # Test URLs
@@ -35,6 +37,9 @@ echo "Service URL: $SERVICE_URL"
 echo "Project ID: $PROJECT_ID"
 echo "Max Confidence Threshold: $MAX_CONFIDENCE"
 echo "Debug Level: $DEBUG_LEVEL"
+if [ -n "$FALLBACK_OVERRIDE" ]; then
+    echo "Fallback Override: $FALLBACK_OVERRIDE"
+fi
 echo "Number of URLs: ${#TEST_URLS[@]}"
 echo ""
 
@@ -67,7 +72,11 @@ for i in "${!TEST_URLS[@]}"; do
     fi
     JSON_PAYLOAD+="\"${TEST_URLS[$i]}\""
 done
-JSON_PAYLOAD+="], \"max_confidence\": $MAX_CONFIDENCE, \"debug_level\": \"$DEBUG_LEVEL\"}"
+JSON_PAYLOAD+="], \"max_confidence\": $MAX_CONFIDENCE, \"debug_level\": \"$DEBUG_LEVEL\""
+if [ -n "$FALLBACK_OVERRIDE" ]; then
+    JSON_PAYLOAD+=", \"fallback_override\": \"$FALLBACK_OVERRIDE\""
+fi
+JSON_PAYLOAD+="}"
 
 # Step 1: Submit batch and get batch_id
 echo "Step 1: Submitting batch..."
