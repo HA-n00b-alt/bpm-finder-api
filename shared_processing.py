@@ -30,7 +30,7 @@ MAX_SIZE = 10 * 1024 * 1024  # 10MB
 MAX_AUDIO_DURATION = 35.0
 
 # Fallback Service Configuration
-FALLBACK_SERVICE_URL = "https://bpm-fallback-service-340051416180.europe-west3.run.app"
+FALLBACK_SERVICE_URL = "https://bpm-fallback-service-7jlgdaerna-ey.a.run.app"
 FALLBACK_SERVICE_AUDIENCE = FALLBACK_SERVICE_URL
 FALLBACK_REQUEST_TIMEOUT_COLD_START = 120.0
 FALLBACK_REQUEST_TIMEOUT_WARM = 60.0
