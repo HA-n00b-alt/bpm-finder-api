@@ -3,7 +3,7 @@
 # Test the fallback service directly using gcloud identity token
 # This tests if the fallback service is working and accessible
 
-FALLBACK_SERVICE_URL="https://bpm-fallback-service-340051416180.europe-west3.run.app"
+FALLBACK_SERVICE_URL="https://bpm-fallback-service-7jlgdaerna-ey.a.run.app"
 
 echo "Testing Fallback Service Directly"
 echo "=================================="

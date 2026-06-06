@@ -3,8 +3,8 @@
 # Test script to verify fallback service authentication
 # This tests if we can generate an ID token and call the fallback service
 
-FALLBACK_SERVICE_URL="https://bpm-fallback-service-340051416180.europe-west3.run.app"
-PROJECT_ID="bpm-api-microservice"
+FALLBACK_SERVICE_URL="https://bpm-fallback-service-7jlgdaerna-ey.a.run.app"
+PROJECT_ID="${PROJECT_ID:-delman-site}"
 
 echo "Testing Fallback Service Authentication"
 echo "========================================"

@@ -51,7 +51,7 @@ def log_event(level: int, message: str, **fields) -> None:
     logger.log(level, json.dumps(record, ensure_ascii=True))
 
 # Google Cloud configuration
-PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT") or os.getenv("PROJECT_ID", "bpm-api-microservice")
+PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT") or os.getenv("PROJECT_ID", "delman-site")
 PUBSUB_TOPIC = f"projects/{PROJECT_ID}/topics/bpm-analysis-tasks"
 
 # Initialize Pub/Sub and Firestore clients

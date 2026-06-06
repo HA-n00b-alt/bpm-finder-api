@@ -13,6 +13,15 @@ ENV/
 *.json
 !package.json
 !package-lock.json
+!deploy.lock.json
+
+# Deployment secrets (never commit)
+.env.deploy
+.env.secrets
+.secret-*.tmp
+
+# Node
+node_modules/
 
 # IDE
 .vscode/

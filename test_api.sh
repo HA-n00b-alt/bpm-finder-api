@@ -15,20 +15,34 @@ set -euo pipefail
 # 3. Optionally checks final status via GET /batch/{batch_id}
 # 4. Provides detailed debugging information
 
-SERVICE_URL="${3:-https://bpm-service-pgkjwjbhqq-ey.a.run.app}"
+SERVICE_URL="${3:-https://bpm-service-7jlgdaerna-ey.a.run.app}"
 MAX_CONFIDENCE="${1:-0.65}"
 DEBUG_LEVEL="${2:-normal}"
 FALLBACK_OVERRIDE="${4:-}"
-PROJECT_ID="${PROJECT_ID:-bpm-api-microservice}"
+PROJECT_ID="${PROJECT_ID:-delman-site}"
+
+# Deezer preview URLs expire quickly (Akamai hdnea tokens). Resolve fresh URLs from track IDs.
+fetch_deezer_preview() {
+    local track_id="$1"
+    curl -s "https://api.deezer.com/track/${track_id}" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('preview') or '')"
+}
+
+DEEZER_TRACK_3135556=$(fetch_deezer_preview 3135556)   # Harder, Better, Faster, Stronger
+DEEZER_TRACK_3998538191=$(fetch_deezer_preview 3998538191)  # SWEAT
+
+if [ -z "$DEEZER_TRACK_3135556" ] || [ -z "$DEEZER_TRACK_3998538191" ]; then
+    echo "Error: Failed to fetch Deezer preview URLs (tracks 3135556, 3998538191)"
+    exit 1
+fi
 
 # Test URLs (mix of Deezer, Spotify, and iTunes previews)
 TEST_URLS=(
-    "https://cdnt-preview.dzcdn.net/api/1/1/0/1/3/0/01362a91c97d085494ad64b63b9d88f4.mp3?hdnea=exp=1767892549~acl=/api/1/1/0/1/3/0/01362a91c97d085494ad64b63b9d88f4.mp3*~data=user_id=0,application_id=42~hmac=0597d1d65a6463081580e0109d2e3218cdefd4c2cf3bb212e1fd66c51d24c80e"
+    "$DEEZER_TRACK_3135556"
     "https://p.scdn.co/mp3-preview/1c57741674dbcee27add7e06b6086d71da0cff5e"
     "https://audio-ssl.itunes.apple.com/itunes-assets/AudioPreview211/v4/37/d8/c9/37d8c9f7-838e-a222-0fe7-141c39e9f51c/mzaf_9144538674023163935.plus.aac.p.m4a"
     "https://p.scdn.co/mp3-preview/0b2426cba10cea8ffdd9d69b78f3f58073da6ab1?cid=18c612430a234d2da59d742217981da8"
     "https://audio-ssl.itunes.apple.com/itunes-assets/AudioPreview125/v4/6c/45/59/6c4559aa-e474-1366-66e7-9cd5279acd05/mzaf_11210908680488989277.plus.aac.p.m4a"
-    "https://cdnt-preview.dzcdn.net/api/1/1/e/3/a/0/e3a23182a2b65997a9f4f40321865f6f.mp3?hdnea=exp=1769264366~acl=/api/1/1/e/3/a/0/e3a23182a2b65997a9f4f40321865f6f.mp3*~data=user_id=0,application_id=42~hmac=12caca3810169841acce9f630d58532ec86030b1d8e98573db1e698278bdc96f"
+    "$DEEZER_TRACK_3998538191"
 )
 
 echo "=========================================="

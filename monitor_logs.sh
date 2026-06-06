@@ -5,7 +5,7 @@ set -euo pipefail
 # Usage: ./monitor_logs.sh [batch_id]
 # If batch_id is provided, filter logs for that specific batch
 
-PROJECT_ID="${PROJECT_ID:-bpm-api-microservice}"
+PROJECT_ID="${PROJECT_ID:-delman-site}"
 BATCH_ID="${1:-}"
 
 echo "=========================================="

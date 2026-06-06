@@ -124,7 +124,7 @@ The system uses an **async event-driven architecture** with three main component
 
 Before deployment, configure the following variables in `deploy.sh` or set them as environment variables:
 
-- `PROJECT_ID`: Your GCP project ID (default: `bpm-api-microservice`)
+- `PROJECT_ID`: Your GCP project ID (default: `delman-site`)
 - `REGION`: Cloud Run region (default: `europe-west3`)
 - `SERVICE_NAME`: Cloud Run service name (default: `bpm-service`)
 - `ARTIFACT_REPO`: Artifact Registry repository name (default: `bpm-repo`)
@@ -275,7 +275,49 @@ gcloud iam service-accounts keys create ${SERVICE_ACCOUNT}-key.json \
 
 **Security Note**: Store this JSON key securely. You'll need it to authenticate external applications calling the service.
 
+## CI/CD (Standards-Compliant Local Orchestrator)
+
+This repository follows [`PIPELINES-LOGGING-ANALYTICS-STANDARDS.md`](./PIPELINES-LOGGING-ANALYTICS-STANDARDS.md). Deployments are **local-only** (no GitHub Actions or remote CI runners). Production releases run through a single orchestrated command.
+
+### Verify (quality gate)
+
+```bash
+npm install
+npm run verify
+```
+
+`npm run verify` runs the required check targets: env contract, API routes, stdout logging rules, typecheck (`python3 -m compileall`), strict lint guards, and AST smoke tests. CSP checks are skipped for this GCP microservice (web-only rule).
+
+### Production deploy
+
+1. Ensure `gcloud auth login` and Cloud Build / Cloud Run permissions on `delman-site`.
+2. Optionally copy `.env.deploy.example` → `.env.deploy` to override `PROJECT_ID` / `REGION`.
+3. Deploy:
+
+```bash
+npm run deploy:production
+```
+
+The orchestrator (`scripts/deploy-production.js`) sequentially:
+
+1. Runs `npm run verify`
+2. Reads the deployment manifest from `deploy.lock.json` (optional Cloudflare R2 if configured)
+3. Skips Firestore migrations (schemaless)
+4. Uploads optional secrets from `.env.secrets` to GCP Secret Manager
+5. Deploys worker + fallback when content hashes changed
+6. Deploys the main `bpm-service`
+7. Writes `deploy.lock.json` (and R2 only when configured)
+8. Commits deployment tracking files automatically; prompts before push (`DEPLOY_SKIP_GIT_COMMIT=1` to skip)
+
+Force a full redeploy regardless of hashes: `DEPLOY_FORCE=1 npm run deploy:production`
+
+### Logging
+
+Services emit structured JSON to **stdout/stderr**; Cloud Run forwards these to Google Cloud Logging (20 GB/month free tier). No Sentry or PostHog in this repo.
+
 ## Deployment
+
+For manual or partial deploys, the shell scripts below remain available. **Production releases should use `npm run deploy:production`.**
 
 ### Deploy Primary Service
 

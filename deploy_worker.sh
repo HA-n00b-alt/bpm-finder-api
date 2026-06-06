@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Configuration
-PROJECT_ID="${PROJECT_ID:-bpm-api-microservice}"
+PROJECT_ID="${PROJECT_ID:-delman-site}"
 REGION="${REGION:-europe-west3}"
 SERVICE_NAME="bpm-worker"
 ARTIFACT_REPO="bpm-repo"
